@@ -27,12 +27,113 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+type Spark = (usize, usize, bool);
+
+const SPARK_BURSTS: [&[Spark]; 10] = [
+    &[
+        (0, 8, true),
+        (0, 10, true),
+        (0, 12, true),
+        (1, 6, false),
+        (1, 9, true),
+        (1, 11, true),
+        (1, 14, false),
+        (2, 15, false),
+    ],
+    &[
+        (0, 7, false),
+        (0, 11, true),
+        (0, 13, true),
+        (1, 5, false),
+        (1, 8, true),
+        (1, 12, true),
+        (1, 15, false),
+        (2, 5, true),
+    ],
+    &[
+        (0, 9, true),
+        (0, 12, false),
+        (1, 6, true),
+        (1, 10, true),
+        (1, 14, false),
+        (2, 5, false),
+        (2, 15, false),
+    ],
+    &[
+        (0, 8, true),
+        (0, 11, false),
+        (0, 14, true),
+        (1, 5, false),
+        (1, 9, true),
+        (1, 13, true),
+        (2, 15, false),
+    ],
+    &[
+        (0, 7, false),
+        (0, 10, true),
+        (0, 13, false),
+        (1, 6, true),
+        (1, 11, true),
+        (1, 14, false),
+        (2, 5, false),
+        (2, 15, true),
+    ],
+    &[
+        (0, 9, false),
+        (0, 11, true),
+        (0, 14, false),
+        (1, 5, false),
+        (1, 8, true),
+        (1, 12, true),
+        (1, 15, true),
+        (2, 16, false),
+    ],
+    &[
+        (0, 7, true),
+        (0, 12, false),
+        (1, 6, false),
+        (1, 9, true),
+        (1, 11, true),
+        (1, 14, true),
+        (2, 5, false),
+        (2, 15, false),
+    ],
+    &[
+        (0, 8, false),
+        (0, 10, true),
+        (0, 13, true),
+        (1, 5, true),
+        (1, 7, false),
+        (1, 12, true),
+        (1, 15, false),
+    ],
+    &[
+        (0, 9, true),
+        (0, 13, false),
+        (1, 6, false),
+        (1, 8, true),
+        (1, 11, true),
+        (1, 14, false),
+        (2, 15, false),
+    ],
+    &[
+        (0, 7, true),
+        (0, 10, false),
+        (0, 14, true),
+        (1, 5, false),
+        (1, 9, true),
+        (1, 12, true),
+        (1, 15, false),
+        (2, 5, false),
+    ],
+];
+
 #[derive(Debug, Default)]
 struct TuiState {
     recommendation_id: Option<i64>,
     actual_reps: u32,
     skip_check: bool,
-    hammer_down: bool,
+    animation_frame: usize,
     status_message: Option<String>,
     show_history: bool,
     show_next: bool,
@@ -90,16 +191,16 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
         demo: env.mode == RuntimeMode::Dev,
         ..TuiState::default()
     };
-    let mut last_strike = Instant::now();
+    let mut last_spark_toggle = Instant::now();
     let in_tmux = std::env::var_os("TMUX").is_some();
 
     let result: Result<()> = loop {
         if shutdown.load(Ordering::Acquire) {
             break Ok(());
         }
-        if last_strike.elapsed() >= Duration::from_secs(1) {
-            ui.hammer_down = !ui.hammer_down;
-            last_strike = Instant::now();
+        if last_spark_toggle.elapsed() >= Duration::from_secs(1) {
+            ui.animation_frame = (ui.animation_frame + 1) % (SPARK_BURSTS.len() * 2);
+            last_spark_toggle = Instant::now();
         }
 
         poll_queue_regeneration(&mut ui);
@@ -834,7 +935,7 @@ fn forge_lines(rec: &Recommendation, ui: &TuiState) -> Vec<Line<'static>> {
         Line::from(Span::styled(format!("{} reps", rec.reps), text_bold())),
         Line::from(""),
     ]);
-    lines.extend(animation_lines(ui.hammer_down));
+    lines.extend(animation_lines(ui.animation_frame));
     lines.extend([
         Line::from(""),
         Line::from(vec![
@@ -858,22 +959,43 @@ fn weight_label(weight: f32) -> String {
     }
 }
 
-fn animation_lines(hammer_down: bool) -> Vec<Line<'static>> {
-    if hammer_down {
-        vec![
-            Line::from(Span::styled("       \\\\", muted())),
-            Line::from(Span::styled("        ⚒   *  *", accent_bold())),
-            Line::from(Span::styled("     ___┬___  *", muted())),
-            Line::from(Span::styled("        ▔", accent())),
-        ]
-    } else {
-        vec![
-            Line::from(Span::styled("        ⚒", muted())),
-            Line::from(Span::styled("       /", muted())),
-            Line::from(Span::styled("     ___┬___", muted())),
-            Line::from(Span::styled("        ▔", accent())),
-        ]
+fn animation_lines(frame: usize) -> Vec<Line<'static>> {
+    let sparks = (frame % 2 == 1).then(|| SPARK_BURSTS[(frame / 2) % SPARK_BURSTS.len()]);
+    let mut rows = vec![vec![(' ', muted()); 21]; 5];
+
+    for (offset, character) in "___┬___".chars().enumerate() {
+        rows[2][7 + offset] = (character, muted());
     }
+    rows[3][10] = ('▔', muted());
+
+    let status_style = if sparks.is_some() {
+        accent_bold()
+    } else {
+        muted()
+    };
+    for (column, character) in "[FORGING IN PROGRESS]".chars().enumerate() {
+        rows[4][column] = (character, status_style);
+    }
+
+    if let Some(sparks) = sparks {
+        for &(row, column, amber) in sparks {
+            rows[row][column] = ('*', if amber { accent_bold() } else { muted() });
+        }
+    }
+
+    rows.into_iter()
+        .map(|mut cells| {
+            while cells.last().is_some_and(|(character, _)| *character == ' ') {
+                cells.pop();
+            }
+            Line::from(
+                cells
+                    .into_iter()
+                    .map(|(character, style)| Span::styled(character.to_string(), style))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect()
 }
 
 fn title_line(demo: bool) -> Line<'static> {
@@ -1617,7 +1739,7 @@ mod tests {
             recommendation_id: Some(1),
             actual_reps: 15,
             skip_check: false,
-            hammer_down: true,
+            animation_frame: 1,
             ..TuiState::default()
         };
         let text = forge_lines(&rec(), &ui)
@@ -1630,6 +1752,54 @@ mod tests {
         assert!(text.contains("12 kg"));
         assert!(text.contains("10 reps"));
         assert!(text.contains("15"));
+    }
+
+    #[test]
+    fn forge_animation_cycles_quiet_anvil_and_ten_mixed_spark_bursts() {
+        let render = |lines: &[Line<'_>]| {
+            lines
+                .iter()
+                .map(Line::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let quiet = animation_lines(0);
+        let bursts = (0..SPARK_BURSTS.len())
+            .map(|index| animation_lines(index * 2 + 1))
+            .collect::<Vec<_>>();
+        let rendered_bursts = bursts.iter().map(|lines| render(lines)).collect::<Vec<_>>();
+        let unique_bursts = rendered_bursts
+            .iter()
+            .collect::<std::collections::HashSet<_>>();
+
+        assert_eq!(quiet.len(), 5);
+        assert_eq!(
+            render(&quiet),
+            "\n\n       ___┬___\n          ▔\n[FORGING IN PROGRESS]"
+        );
+        assert_eq!(bursts.len(), 10);
+        assert_eq!(unique_bursts.len(), 10);
+        assert_eq!(
+            rendered_bursts[0],
+            "        * * *\n      *  * *  *\n       ___┬___ *\n          ▔\n[FORGING IN PROGRESS]"
+        );
+        for (index, burst) in bursts.iter().enumerate() {
+            assert_eq!(burst.len(), 5);
+            assert_eq!(render(&animation_lines(index * 2)), render(&quiet));
+
+            let spark_colors = burst
+                .iter()
+                .flat_map(|line| &line.spans)
+                .filter(|span| span.content == "*")
+                .filter_map(|span| span.style.fg)
+                .collect::<Vec<_>>();
+            assert!(spark_colors.contains(&colors::EMBER));
+            assert!(spark_colors.contains(&colors::MUTED));
+            assert!(!render(burst).contains(['⚒', '|', '/', '\\']));
+            assert_eq!(burst[4].spans[0].style.fg, Some(colors::EMBER));
+        }
+        assert_eq!(quiet[4].spans[0].style.fg, Some(colors::MUTED));
+        assert_eq!(render(&animation_lines(20)), render(&quiet));
     }
 
     #[test]
@@ -1712,7 +1882,7 @@ mod tests {
             recommendation_id: Some(1),
             actual_reps: 10,
             skip_check: true,
-            hammer_down: false,
+            animation_frame: 0,
             ..TuiState::default()
         };
         let text = forge_lines(&rec(), &ui)
