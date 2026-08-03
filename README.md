@@ -62,8 +62,9 @@ While waiting:
 
 | Key | Action |
 | --- | --- |
-| `f` | Show up to 10 latest forges, grouped by date |
+| `l` | Show up to 10 latest forges, grouped by date |
 | `n` | Preview the next forges |
+| `f` | Open the first safe queued forge |
 | `r` | Regenerate the queue from the next-forges view |
 | `←` / `→` | Change the recommender |
 

@@ -64,6 +64,13 @@ pub enum QueueRegenerationStart {
     Busy,
 }
 
+#[derive(Debug)]
+pub enum ForgeNowResult {
+    Started,
+    NoQueued,
+    NoSafe,
+}
+
 #[derive(Serialize)]
 pub struct EventResponse {
     pub recommended: bool,
@@ -331,6 +338,19 @@ pub fn regenerate_queue(env: &RuntimeEnv) -> QueueRegenerationStart {
     QueueRegenerationStart::Started(receiver)
 }
 
+pub fn forge_now(env: &RuntimeEnv) -> Result<ForgeNowResult> {
+    let store = Store::open(&env.paths.database_file)?;
+    if store.queued_recommendation_count()? == 0 {
+        return Ok(ForgeNowResult::NoQueued);
+    }
+    Ok(
+        match store.promote_next_queued_recommendation_preserving_metadata()? {
+            Some(_) => ForgeNowResult::Started,
+            None => ForgeNowResult::NoSafe,
+        },
+    )
+}
+
 fn begin_queue_job(flag: &AtomicBool) -> bool {
     flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
@@ -461,6 +481,50 @@ mod tests {
             store.queued_recommendations().unwrap()[0].movement_name,
             "old queued forge"
         );
+    }
+
+    #[test]
+    fn forge_now_promotes_the_first_safe_queued_recommendation() {
+        let env = test_env();
+        let store = Store::open(&env.paths.database_file).unwrap();
+        let rec = Recommendation {
+            id: None,
+            movement_id: "manual-movement".into(),
+            movement_name: "manual forge".into(),
+            primary_muscle: "manual-muscle".into(),
+            muscles: vec!["manual-muscle".into()],
+            reps: 8,
+            weight_kg: None,
+            estimated_seconds: 30,
+            agent: Agent::Claude,
+            project: Some("manual-project".into()),
+            created_at: chrono::Utc::now(),
+        };
+        store.insert_queued_recommendation(&rec).unwrap();
+        drop(store);
+
+        let result = forge_now(&env).unwrap();
+        let ForgeNowResult::Started = result else {
+            panic!("expected a queued forge to start");
+        };
+
+        let store = Store::open(&env.paths.database_file).unwrap();
+        assert_eq!(store.queued_recommendation_count().unwrap(), 0);
+        assert_eq!(
+            store.state().unwrap().kind,
+            crate::models::AppStateKind::Recommendation
+        );
+        let promoted = store.latest_open_recommendation().unwrap().unwrap();
+        assert_eq!(promoted.movement_name, "manual forge");
+        assert_eq!(promoted.agent, Agent::Claude);
+        assert_eq!(promoted.project.as_deref(), Some("manual-project"));
+    }
+
+    #[test]
+    fn forge_now_reports_an_empty_queue_without_starting_a_forge() {
+        let env = test_env();
+
+        assert!(matches!(forge_now(&env).unwrap(), ForgeNowResult::NoQueued));
     }
 
     fn codex_hook(event_name: &str, turn_id: Option<&str>) -> CodexHookEvent {

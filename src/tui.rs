@@ -1,6 +1,6 @@
 use crate::cli;
 use crate::config::{self, Paths, RecommenderBackend, RuntimeEnv, RuntimeMode};
-use crate::daemon::{self, QueueRegenerationResult, QueueRegenerationStart};
+use crate::daemon::{self, ForgeNowResult, QueueRegenerationResult, QueueRegenerationStart};
 use crate::models::{
     AppStateKind, ForgeActivitySummary, Recommendation, RecommenderTokenProvider,
     RecommenderTokenUsageByProvider, SetStatus,
@@ -165,6 +165,7 @@ struct TuiState {
     queue_regeneration: Option<Receiver<QueueRegenerationResult>>,
     queue_regeneration_started_at: Option<Instant>,
     queue_regeneration_feedback: Option<QueueRegenerationFeedback>,
+    forge_now_feedback: Option<String>,
     demo: bool,
 }
 
@@ -255,6 +256,33 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
                     }
                     continue;
                 }
+                if forge_now_requested(key.code, view.kind, ui.show_history) {
+                    ui.forge_now_feedback = None;
+                    if ui.queue_regeneration.is_none() {
+                        match daemon::forge_now(env) {
+                            Ok(ForgeNowResult::Started) => {}
+                            Ok(ForgeNowResult::NoQueued) => {
+                                ui.forge_now_feedback =
+                                    Some("No forges queued. Generating a fresh queue…".into());
+                                apply_queue_regeneration_start(
+                                    &mut ui,
+                                    daemon::regenerate_queue(env),
+                                );
+                            }
+                            Ok(ForgeNowResult::NoSafe) => {
+                                ui.forge_now_feedback = Some(
+                                    "No safe forges are available right now. Keeping current list."
+                                        .into(),
+                                );
+                            }
+                            Err(error) => {
+                                ui.forge_now_feedback =
+                                    Some(format!("Could not forge now: {error}"));
+                            }
+                        }
+                    }
+                    continue;
+                }
                 if let Some(panel) =
                     waiting_panel_for_key(key.code, view.kind, ui.show_history, ui.show_next)
                 {
@@ -325,6 +353,7 @@ fn apply_queue_regeneration_start(ui: &mut TuiState, start: QueueRegenerationSta
             ui.queue_regeneration = Some(receiver);
             ui.queue_regeneration_started_at = Some(Instant::now());
             ui.queue_regeneration_feedback = None;
+            ui.forge_now_feedback = None;
         }
         QueueRegenerationStart::Busy => {}
     }
@@ -484,6 +513,7 @@ fn view_lines(view: &ViewModel, ui: &TuiState) -> Vec<Line<'static>> {
             ui.demo,
             queue_regeneration_spinner(ui),
             ui.queue_regeneration_feedback.as_ref(),
+            ui.forge_now_feedback.as_deref(),
         );
     }
     match view.kind {
@@ -497,6 +527,9 @@ fn view_lines(view: &ViewModel, ui: &TuiState) -> Vec<Line<'static>> {
                     &view.activity,
                     &view.token_usage,
                     ui.status_message.as_deref(),
+                    queue_regeneration_spinner(ui),
+                    ui.queue_regeneration_feedback.as_ref(),
+                    ui.forge_now_feedback.as_deref(),
                     ui.demo,
                 )
             }),
@@ -505,6 +538,9 @@ fn view_lines(view: &ViewModel, ui: &TuiState) -> Vec<Line<'static>> {
             &view.activity,
             &view.token_usage,
             ui.status_message.as_deref(),
+            queue_regeneration_spinner(ui),
+            ui.queue_regeneration_feedback.as_ref(),
+            ui.forge_now_feedback.as_deref(),
             ui.demo,
         ),
         ViewKind::Idle => idle_lines(
@@ -512,6 +548,9 @@ fn view_lines(view: &ViewModel, ui: &TuiState) -> Vec<Line<'static>> {
             &view.activity,
             &view.token_usage,
             ui.status_message.as_deref(),
+            queue_regeneration_spinner(ui),
+            ui.queue_regeneration_feedback.as_ref(),
+            ui.forge_now_feedback.as_deref(),
             ui.demo,
         ),
     }
@@ -531,15 +570,25 @@ fn idle_lines(
     activity: &ForgeActivitySummary,
     token_usage: &RecommenderTokenUsageByProvider,
     status_message: Option<&str>,
+    queue_spinner: Option<&str>,
+    queue_feedback: Option<&QueueRegenerationFeedback>,
+    forge_now_feedback: Option<&str>,
     demo: bool,
 ) -> Vec<Line<'static>> {
     let mut lines = vec![
         title_line(demo),
         Line::from(""),
         Line::from(Span::styled("Waiting for the next forge.", muted())),
+        forge_now_control_line(),
         forge_list_controls_line(),
-        recommender_line(backend),
     ];
+    lines.extend(waiting_forge_now_lines(
+        queue_spinner,
+        queue_feedback,
+        forge_now_feedback,
+    ));
+    lines.push(Line::from(""));
+    lines.push(recommender_line(backend));
     lines.extend(activity_lines(activity));
     lines.extend(recommender_usage_lines(backend, token_usage));
     if backend.unavailable {
@@ -559,16 +608,28 @@ fn cooldown_lines(
     activity: &ForgeActivitySummary,
     token_usage: &RecommenderTokenUsageByProvider,
     status_message: Option<&str>,
+    queue_spinner: Option<&str>,
+    queue_feedback: Option<&QueueRegenerationFeedback>,
+    forge_now_feedback: Option<&str>,
     demo: bool,
 ) -> Vec<Line<'static>> {
     let mut lines = vec![
         title_line(demo),
         Line::from(""),
-        Line::from(Span::styled("Forged.", accent_bold())),
-        Line::from(Span::styled("Waiting for the next forge.", muted())),
+        Line::from(vec![
+            Span::styled("Forged. ", accent_bold()),
+            Span::styled("Waiting for the next forge.", muted()),
+        ]),
+        forge_now_control_line(),
         forge_list_controls_line(),
-        recommender_line(backend),
     ];
+    lines.extend(waiting_forge_now_lines(
+        queue_spinner,
+        queue_feedback,
+        forge_now_feedback,
+    ));
+    lines.push(Line::from(""));
+    lines.push(recommender_line(backend));
     lines.extend(activity_lines(activity));
     lines.extend(recommender_usage_lines(backend, token_usage));
     if backend.unavailable {
@@ -725,11 +786,17 @@ fn waiting_panel_for_key(
         return None;
     }
     match code {
-        KeyCode::Char('f') => Some(WaitingPanel::History),
+        KeyCode::Char('l') => Some(WaitingPanel::History),
         KeyCode::Char('n') => Some(WaitingPanel::Next),
         KeyCode::Esc if history_visible || next_visible => Some(WaitingPanel::Main),
         _ => None,
     }
+}
+
+fn forge_now_requested(code: KeyCode, kind: ViewKind, history_visible: bool) -> bool {
+    code == KeyCode::Char('f')
+        && !history_visible
+        && matches!(kind, ViewKind::Idle | ViewKind::Cooldown)
 }
 
 fn regenerate_queue_requested(code: KeyCode, kind: ViewKind, next_visible: bool) -> bool {
@@ -739,7 +806,53 @@ fn regenerate_queue_requested(code: KeyCode, kind: ViewKind, next_visible: bool)
 }
 
 fn forge_list_controls_line() -> Line<'static> {
-    Line::from(Span::styled("[f] Latest forges  [n] Next forges", muted()))
+    Line::from(Span::styled("[l] Latest forges  [n] Next forges", muted()))
+}
+
+fn forge_now_control_line() -> Line<'static> {
+    Line::from(Span::styled("[f] Forge now", muted()))
+}
+
+fn waiting_forge_now_lines(
+    queue_spinner: Option<&str>,
+    queue_feedback: Option<&QueueRegenerationFeedback>,
+    forge_now_feedback: Option<&str>,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    if let Some(spinner) = queue_spinner {
+        lines.push(Line::from(Span::styled(
+            format!("{spinner} Generating forges…"),
+            muted(),
+        )));
+        return lines;
+    }
+    if let Some(message) = forge_now_feedback {
+        lines.push(Line::from(Span::styled(message.to_string(), muted())));
+        return lines;
+    }
+    match queue_feedback {
+        Some(QueueRegenerationFeedback::Success { source, notice, .. }) => {
+            let message = if *source == QueueGenerationSource::LocalFallback {
+                "✓ Forges generated locally"
+            } else {
+                "✓ Forges generated"
+            };
+            lines.push(Line::from(Span::styled(message, muted())));
+            if let Some(notice) = notice {
+                lines.push(Line::from(Span::styled(notice.clone(), muted())));
+            }
+        }
+        Some(QueueRegenerationFeedback::Failure { no_safe_forges }) => {
+            let message = if *no_safe_forges {
+                "No safe forges are available right now."
+            } else {
+                "Could not generate forges."
+            };
+            lines.push(Line::from(Span::styled(message, muted())));
+        }
+        None => {}
+    }
+    lines
 }
 
 fn next_forge_lines(
@@ -747,6 +860,7 @@ fn next_forge_lines(
     demo: bool,
     regeneration_spinner: Option<&str>,
     feedback: Option<&QueueRegenerationFeedback>,
+    forge_now_feedback: Option<&str>,
 ) -> Vec<Line<'static>> {
     let mut lines = vec![
         title_line(demo),
@@ -780,6 +894,9 @@ fn next_forge_lines(
             muted(),
         )));
     } else {
+        if let Some(message) = forge_now_feedback {
+            lines.push(Line::from(Span::styled(message.to_string(), muted())));
+        }
         match feedback {
             Some(QueueRegenerationFeedback::Success { source, notice, .. }) => {
                 let message = if *source == QueueGenerationSource::LocalFallback {
@@ -802,7 +919,10 @@ fn next_forge_lines(
             }
             None => {}
         }
-        lines.push(Line::from(Span::styled("[r] Regenerate forges", muted())));
+        lines.push(Line::from(Span::styled(
+            "[f] Forge now  [r] Regenerate forges",
+            muted(),
+        )));
     }
     lines.push(Line::from(Span::styled("[esc] Back", muted())));
     lines
@@ -1124,6 +1244,9 @@ mod tests {
             &ForgeActivitySummary::default(),
             &RecommenderTokenUsageByProvider::default(),
             None,
+            None,
+            None,
+            None,
             false,
         )
         .into_iter()
@@ -1133,8 +1256,11 @@ mod tests {
 
         assert!(text.contains("Svarog"));
         assert!(text.contains("Waiting for the next forge."));
-        assert!(text.contains("[f] Latest forges"));
+        assert!(text.contains("[l] Latest forges"));
         assert!(text.contains("[n] Next forges"));
+        assert!(text.contains(
+            "[f] Forge now\n[l] Latest forges  [n] Next forges\n\nRecommender: [Codex]  ← →"
+        ));
         assert!(text.contains("Recommender: [Codex]  ← →"));
         assert!(!text.contains("[r] Change recommender"));
         assert!(text.contains("Completed:"));
@@ -1179,8 +1305,8 @@ mod tests {
         };
 
         for lines in [
-            idle_lines(&backend, &activity, &usage, None, false),
-            cooldown_lines(&backend, &activity, &usage, None, false),
+            idle_lines(&backend, &activity, &usage, None, None, None, None, false),
+            cooldown_lines(&backend, &activity, &usage, None, None, None, None, false),
         ] {
             let text = lines
                 .into_iter()
@@ -1188,7 +1314,7 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n");
             assert!(text.contains("Completed:"));
-            assert!(text.contains("[f] Latest forges"));
+            assert!(text.contains("[l] Latest forges"));
             assert!(text.contains("[n] Next forges"));
             assert!(text.contains("Today 3 forges / 42 reps"));
             assert!(text.contains("Week 12 forges / 180 reps"));
@@ -1201,6 +1327,38 @@ mod tests {
                     < text.find("Svarog Codex tokens (in/out)").unwrap()
             );
         }
+    }
+
+    #[test]
+    fn cooldown_status_combines_amber_forged_and_muted_waiting_text() {
+        let backend = BackendView {
+            label: "Codex".to_string(),
+            unavailable: false,
+            config_file: "/tmp/config.toml".to_string(),
+        };
+        let lines = cooldown_lines(
+            &backend,
+            &ForgeActivitySummary::default(),
+            &RecommenderTokenUsageByProvider::default(),
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        let status = lines
+            .iter()
+            .find(|line| line.to_string() == "Forged. Waiting for the next forge.")
+            .expect("combined cooldown status line");
+
+        assert_eq!(status.spans[0].style.fg, Some(colors::EMBER));
+        assert_eq!(status.spans[1].style.fg, Some(colors::MUTED));
+        assert!(lines.windows(4).any(|window| {
+            window[0].to_string() == "[f] Forge now"
+                && window[1].to_string() == "[l] Latest forges  [n] Next forges"
+                && window[2].to_string().is_empty()
+                && window[3].to_string().starts_with("Recommender:")
+        }));
     }
 
     #[test]
@@ -1247,7 +1405,7 @@ mod tests {
 
         assert!(!text.contains("Svarog Codex tokens"));
         assert!(!text.contains("Completed:"));
-        assert!(!text.contains("[f] Latest forges"));
+        assert!(!text.contains("[l] Latest forges"));
         assert!(!text.contains("[n] Next forges"));
         assert!(text.contains("LEFT CURL"));
     }
@@ -1313,7 +1471,7 @@ mod tests {
     #[test]
     fn forge_list_navigation_is_only_available_while_waiting() {
         assert_eq!(
-            waiting_panel_for_key(KeyCode::Char('f'), ViewKind::Idle, false, false),
+            waiting_panel_for_key(KeyCode::Char('l'), ViewKind::Idle, false, false),
             Some(WaitingPanel::History)
         );
         assert_eq!(
@@ -1332,6 +1490,30 @@ mod tests {
             waiting_panel_for_key(KeyCode::Char('n'), ViewKind::Forge, false, false),
             None
         );
+        assert_eq!(
+            waiting_panel_for_key(KeyCode::Char('f'), ViewKind::Idle, false, true),
+            None
+        );
+        assert!(forge_now_requested(
+            KeyCode::Char('f'),
+            ViewKind::Idle,
+            false
+        ));
+        assert!(forge_now_requested(
+            KeyCode::Char('f'),
+            ViewKind::Cooldown,
+            false
+        ));
+        assert!(!forge_now_requested(
+            KeyCode::Char('f'),
+            ViewKind::Idle,
+            true
+        ));
+        assert!(!forge_now_requested(
+            KeyCode::Char('f'),
+            ViewKind::Forge,
+            false
+        ));
     }
 
     #[test]
@@ -1345,7 +1527,7 @@ mod tests {
         second.reps = 10;
         second.weight_kg = Some(12.0);
 
-        let text = next_forge_lines(&[first, second], false, None, None)
+        let text = next_forge_lines(&[first, second], false, None, None, None)
             .into_iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
@@ -1354,13 +1536,13 @@ mod tests {
         assert!(text.contains("Next forges"));
         assert!(text.contains("1. 8 scapular squeezes"));
         assert!(text.contains("2. 10 left curls · 12 kg"));
-        assert!(text.contains("[r] Regenerate forges"));
+        assert!(text.contains("[f] Forge now  [r] Regenerate forges"));
         assert!(text.contains("[esc] Back"));
     }
 
     #[test]
     fn next_forge_lines_show_empty_queue() {
-        let text = next_forge_lines(&[], false, None, None)
+        let text = next_forge_lines(&[], false, None, None, None)
             .into_iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
@@ -1371,7 +1553,7 @@ mod tests {
 
     #[test]
     fn next_forge_lines_show_regeneration_states() {
-        let loading = next_forge_lines(&[rec()], false, Some("◐"), None)
+        let loading = next_forge_lines(&[rec()], false, Some("◐"), None, None)
             .into_iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
@@ -1386,7 +1568,7 @@ mod tests {
             llm_count: 0,
             local_count: 5,
         };
-        let success = next_forge_lines(&[], false, None, Some(&success_feedback))
+        let success = next_forge_lines(&[], false, None, Some(&success_feedback), None)
             .into_iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
@@ -1398,7 +1580,7 @@ mod tests {
         let failure_feedback = QueueRegenerationFeedback::Failure {
             no_safe_forges: false,
         };
-        let failure = next_forge_lines(&[], false, None, Some(&failure_feedback))
+        let failure = next_forge_lines(&[], false, None, Some(&failure_feedback), None)
             .into_iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
@@ -1409,12 +1591,50 @@ mod tests {
         let no_safe_feedback = QueueRegenerationFeedback::Failure {
             no_safe_forges: true,
         };
-        let no_safe = next_forge_lines(&[], false, None, Some(&no_safe_feedback))
+        let no_safe = next_forge_lines(&[], false, None, Some(&no_safe_feedback), None)
             .into_iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
             .join("\n");
         assert!(no_safe.contains("No safe forges are available right now. Keeping current list."));
+    }
+
+    #[test]
+    fn next_forge_lines_show_manual_forge_feedback() {
+        let text = next_forge_lines(
+            &[rec()],
+            false,
+            None,
+            None,
+            Some("No safe forges are available right now. Keeping current list."),
+        )
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+        assert!(text.contains("No safe forges are available right now. Keeping current list."));
+        assert!(text.contains("[f] Forge now  [r] Regenerate forges"));
+    }
+
+    #[test]
+    fn waiting_forge_now_lines_show_generation_progress_and_feedback() {
+        let render = |lines: Vec<Line<'_>>| {
+            lines
+                .into_iter()
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let loading = render(waiting_forge_now_lines(Some("◐"), None, None));
+        assert_eq!(loading, "◐ Generating forges…");
+
+        let no_safe = render(waiting_forge_now_lines(
+            None,
+            None,
+            Some("No safe forges are available right now. Keeping current list."),
+        ));
+        assert!(no_safe.contains("No safe forges are available right now."));
     }
 
     #[test]
@@ -1682,6 +1902,9 @@ mod tests {
             &ForgeActivitySummary::default(),
             &RecommenderTokenUsageByProvider::default(),
             None,
+            None,
+            None,
+            None,
             false,
         )
         .into_iter()
@@ -1755,6 +1978,9 @@ mod tests {
             &ForgeActivitySummary::default(),
             &RecommenderTokenUsageByProvider::default(),
             Some("Could not update recommender. Edit: /tmp/svarog/config.toml"),
+            None,
+            None,
+            None,
             false,
         )
         .into_iter()

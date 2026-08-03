@@ -698,6 +698,20 @@ impl Store {
         agent: Agent,
         project: Option<&str>,
     ) -> Result<Option<Recommendation>> {
+        self.promote_next_queued_recommendation_with_metadata(Some(agent), project)
+    }
+
+    pub fn promote_next_queued_recommendation_preserving_metadata(
+        &self,
+    ) -> Result<Option<Recommendation>> {
+        self.promote_next_queued_recommendation_with_metadata(None, None)
+    }
+
+    fn promote_next_queued_recommendation_with_metadata(
+        &self,
+        agent: Option<Agent>,
+        project: Option<&str>,
+    ) -> Result<Option<Recommendation>> {
         let mut statement = self.conn.prepare(
             "SELECT id, primary_muscle FROM recommendations WHERE status = 'queued' ORDER BY id ASC",
         )?;
@@ -720,10 +734,17 @@ impl Store {
         };
 
         let now = Utc::now().to_rfc3339();
-        self.conn.execute(
-            "UPDATE recommendations SET status = 'recommended', agent = ?1, project = ?2, created_at = ?3 WHERE id = ?4",
-            params![agent.as_str(), project, now, id],
-        )?;
+        if let Some(agent) = agent {
+            self.conn.execute(
+                "UPDATE recommendations SET status = 'recommended', agent = ?1, project = ?2, created_at = ?3 WHERE id = ?4",
+                params![agent.as_str(), project, now, id],
+            )?;
+        } else {
+            self.conn.execute(
+                "UPDATE recommendations SET status = 'recommended', created_at = ?1 WHERE id = ?2",
+                params![now, id],
+            )?;
+        }
         self.set_state(AppStateKind::Recommendation, Some(id), None, None)?;
         self.recommendation_by_id(id)
     }
@@ -1877,6 +1898,24 @@ mod tests {
         assert_eq!(store.queued_recommendation_count().unwrap(), 0);
         assert_eq!(store.state().unwrap().kind, AppStateKind::Recommendation);
         assert!(store.latest_open_recommendation().unwrap().is_some());
+    }
+
+    #[test]
+    fn manually_promoting_queued_recommendation_preserves_metadata() {
+        let store = store();
+        let mut rec = recommendation();
+        rec.agent = Agent::Claude;
+        rec.project = Some("manual-project".into());
+        store.insert_queued_recommendation(&rec).unwrap();
+
+        let promoted = store
+            .promote_next_queued_recommendation_preserving_metadata()
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(promoted.agent, Agent::Claude);
+        assert_eq!(promoted.project.as_deref(), Some("manual-project"));
+        assert_eq!(store.state().unwrap().kind, AppStateKind::Recommendation);
     }
 
     #[test]
