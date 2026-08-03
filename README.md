@@ -11,7 +11,7 @@ With Svarog, you can:
 - record completed reps, skips, fatigue, and pain;
 - preview or regenerate your next five forges;
 - use Codex, the OpenAI API, or the built-in local recommender;
-- track today’s and this week’s forges, reps, and recommender token use.
+- track today’s and the last seven days’ forges, reps, and recommender token use.
 
 ## Get started
 

@@ -5,7 +5,7 @@ use crate::models::{
     RecommenderTokenUsage, RecommenderTokenUsageSummary, SetStatus, TokenUsageTotals,
 };
 use anyhow::{Context, Result};
-use chrono::{DateTime, Datelike, Duration, Local, TimeZone, Utc};
+use chrono::{DateTime, Duration, Local, TimeZone, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use std::fs;
@@ -292,7 +292,15 @@ impl Store {
         &self,
         provider: RecommenderTokenProvider,
     ) -> Result<RecommenderTokenUsageSummary> {
-        let (today_start, week_start) = local_period_starts()?;
+        self.recommender_token_usage_summary_for_at(provider, Local::now())
+    }
+
+    fn recommender_token_usage_summary_for_at(
+        &self,
+        provider: RecommenderTokenProvider,
+        now: DateTime<Local>,
+    ) -> Result<RecommenderTokenUsageSummary> {
+        let (today_start, week_start) = local_period_starts_at(now)?;
         Ok(RecommenderTokenUsageSummary {
             today: self.recommender_token_usage_since(provider, today_start)?,
             week: self.recommender_token_usage_since(provider, week_start)?,
@@ -300,7 +308,11 @@ impl Store {
     }
 
     pub fn completed_forge_summary(&self) -> Result<ForgeActivitySummary> {
-        let (today_start, week_start) = local_period_starts()?;
+        self.completed_forge_summary_at(Local::now())
+    }
+
+    fn completed_forge_summary_at(&self, now: DateTime<Local>) -> Result<ForgeActivitySummary> {
+        let (today_start, week_start) = local_period_starts_at(now)?;
         Ok(ForgeActivitySummary {
             today: self.completed_forges_since(today_start)?,
             week: self.completed_forges_since(week_start)?,
@@ -1082,10 +1094,9 @@ impl Store {
     }
 }
 
-fn local_period_starts() -> Result<(DateTime<Utc>, DateTime<Utc>)> {
-    let now = Local::now();
+fn local_period_starts_at(now: DateTime<Local>) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
     let today = now.date_naive();
-    let week = today - Duration::days(i64::from(now.weekday().num_days_from_monday()));
+    let week = today - Duration::days(6);
     let today_start = Local
         .from_local_datetime(
             &today
@@ -1471,6 +1482,108 @@ mod tests {
             .unwrap();
         assert_eq!(openai.today.input_tokens, 500);
         assert_eq!(openai.today.output_tokens, 25);
+    }
+
+    #[test]
+    fn rolling_week_includes_sunday_usage_and_forges_on_monday() {
+        let store = store();
+        let monday = Local
+            .with_ymd_and_hms(2026, 8, 3, 12, 0, 0)
+            .single()
+            .unwrap();
+        let sunday = (monday - Duration::days(1)).with_timezone(&Utc);
+        let previous_monday = (monday - Duration::days(7)).with_timezone(&Utc);
+
+        store
+            .record_recommender_token_usage(
+                RecommenderTokenProvider::Codex,
+                &RecommenderTokenUsage {
+                    input_tokens: 100,
+                    output_tokens: 10,
+                    ..RecommenderTokenUsage::default()
+                },
+                sunday,
+            )
+            .unwrap();
+        store
+            .record_recommender_token_usage(
+                RecommenderTokenProvider::Codex,
+                &RecommenderTokenUsage {
+                    input_tokens: 1_000,
+                    output_tokens: 100,
+                    ..RecommenderTokenUsage::default()
+                },
+                previous_monday,
+            )
+            .unwrap();
+        store
+            .record_recommender_token_usage(
+                RecommenderTokenProvider::OpenAi,
+                &RecommenderTokenUsage {
+                    input_tokens: 500,
+                    output_tokens: 25,
+                    ..RecommenderTokenUsage::default()
+                },
+                monday.with_timezone(&Utc),
+            )
+            .unwrap();
+
+        let mut rec = recommendation();
+        rec.id = Some(store.insert_recommendation(&rec).unwrap());
+        store
+            .record_set_with_reps(&rec, SetStatus::Done, 15)
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE sets SET created_at = ?1 WHERE id = (SELECT MAX(id) FROM sets)",
+                [sunday.to_rfc3339()],
+            )
+            .unwrap();
+        store
+            .record_set_with_reps(&rec, SetStatus::Done, 20)
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE sets SET created_at = ?1 WHERE id = (SELECT MAX(id) FROM sets)",
+                [previous_monday.to_rfc3339()],
+            )
+            .unwrap();
+
+        let codex = store
+            .recommender_token_usage_summary_for_at(RecommenderTokenProvider::Codex, monday)
+            .unwrap();
+        assert_eq!(codex.today, TokenUsageTotals::default());
+        assert_eq!(
+            codex.week,
+            TokenUsageTotals {
+                input_tokens: 100,
+                output_tokens: 10,
+            }
+        );
+
+        let openai = store
+            .recommender_token_usage_summary_for_at(RecommenderTokenProvider::OpenAi, monday)
+            .unwrap();
+        assert_eq!(
+            openai.today,
+            TokenUsageTotals {
+                input_tokens: 500,
+                output_tokens: 25,
+            }
+        );
+        assert_eq!(openai.week, openai.today);
+
+        let activity = store.completed_forge_summary_at(monday).unwrap();
+        assert_eq!(activity.today, ForgeActivityTotals::default());
+        assert_eq!(
+            activity.week,
+            ForgeActivityTotals {
+                forges: 1,
+                reps: 15,
+            }
+        );
     }
 
     #[test]
