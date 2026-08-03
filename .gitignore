@@ -1,0 +1,17 @@
+/target/
+/.svarog-dev/
+.env
+.env.*
+!.env.example
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+*.db-journal
+*.db-shm
+*.db-wal
+*.log
+nohup.out
+.DS_Store
+/undepriving_app/
+/specifications/

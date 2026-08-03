@@ -1,0 +1,1728 @@
+use crate::cli;
+use crate::config::{self, Paths, RecommenderBackend, RuntimeEnv, RuntimeMode};
+use crate::daemon::{self, QueueRegenerationResult, QueueRegenerationStart};
+use crate::models::{
+    AppStateKind, ForgeActivitySummary, Recommendation, RecommenderTokenProvider,
+    RecommenderTokenUsageByProvider, SetStatus,
+};
+use crate::recommender::QueueGenerationSource;
+use crate::storage::{ForgeHistoryEntry, Store};
+use anyhow::Result;
+use chrono::{Datelike, Duration as ChronoDuration, Local};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::execute;
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::Alignment;
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::Paragraph;
+use ratatui::Terminal;
+use std::io;
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+#[derive(Debug, Default)]
+struct TuiState {
+    recommendation_id: Option<i64>,
+    actual_reps: u32,
+    skip_check: bool,
+    hammer_down: bool,
+    status_message: Option<String>,
+    show_history: bool,
+    show_next: bool,
+    queue_regeneration: Option<Receiver<QueueRegenerationResult>>,
+    queue_regeneration_started_at: Option<Instant>,
+    queue_regeneration_feedback: Option<QueueRegenerationFeedback>,
+    demo: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum QueueRegenerationFeedback {
+    Success {
+        source: QueueGenerationSource,
+        notice: Option<String>,
+        llm_count: usize,
+        local_count: usize,
+    },
+    Failure {
+        no_safe_forges: bool,
+    },
+}
+
+#[derive(Debug)]
+struct ViewModel {
+    kind: ViewKind,
+    recommendation: Option<Recommendation>,
+    backend: BackendView,
+    activity: ForgeActivitySummary,
+    token_usage: RecommenderTokenUsageByProvider,
+    history: Vec<ForgeHistoryEntry>,
+    next_forges: Vec<Recommendation>,
+}
+
+#[derive(Debug, Clone)]
+struct BackendView {
+    label: String,
+    unavailable: bool,
+    config_file: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViewKind {
+    Idle,
+    Forge,
+    Cooldown,
+}
+
+pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+    let mut ui = TuiState {
+        demo: env.mode == RuntimeMode::Dev,
+        ..TuiState::default()
+    };
+    let mut last_strike = Instant::now();
+    let in_tmux = std::env::var_os("TMUX").is_some();
+
+    let result: Result<()> = loop {
+        if shutdown.load(Ordering::Acquire) {
+            break Ok(());
+        }
+        if last_strike.elapsed() >= Duration::from_secs(1) {
+            ui.hammer_down = !ui.hammer_down;
+            last_strike = Instant::now();
+        }
+
+        poll_queue_regeneration(&mut ui);
+
+        let view = load_view(&env.paths);
+        if view.kind == ViewKind::Forge {
+            ui.show_history = false;
+            ui.show_next = false;
+        }
+        sync_reps(&mut ui, view.recommendation.as_ref());
+        terminal.draw(|frame| {
+            let lines = screen_lines(&view, &ui, in_tmux);
+            let paragraph = Paragraph::new(lines)
+                .style(Style::default().bg(colors::BG).fg(colors::TEXT))
+                .alignment(Alignment::Left);
+            frame.render_widget(paragraph, frame.area());
+        })?;
+
+        if event::poll(Duration::from_millis(200))? {
+            if let Event::Key(key) = event::read()? {
+                if quit_requested(key) {
+                    break Ok(());
+                }
+                if regenerate_queue_requested(key.code, view.kind, ui.show_next) {
+                    if ui.queue_regeneration.is_none() {
+                        apply_queue_regeneration_start(&mut ui, daemon::regenerate_queue(env));
+                    }
+                    continue;
+                }
+                if let Some(panel) =
+                    waiting_panel_for_key(key.code, view.kind, ui.show_history, ui.show_next)
+                {
+                    ui.show_history = panel == WaitingPanel::History;
+                    ui.show_next = panel == WaitingPanel::Next;
+                    continue;
+                }
+                match (key.code, view.kind, ui.skip_check) {
+                    (code, ViewKind::Idle | ViewKind::Cooldown, false)
+                        if !ui.show_history
+                            && !ui.show_next
+                            && recommender_cycle_direction(code).is_some() =>
+                    {
+                        let direction = recommender_cycle_direction(code).unwrap();
+                        ui.status_message = cycle_recommender_backend(&env.paths, direction)
+                            .err()
+                            .map(|_| {
+                                format!(
+                                    "Could not update recommender. Edit: {}",
+                                    env.paths.config_file.display()
+                                )
+                            });
+                    }
+                    (code, ViewKind::Forge, false) if increase_reps_requested(code) => {
+                        ui.actual_reps = ui.actual_reps.saturating_add(1).min(999);
+                    }
+                    (KeyCode::Char('-'), ViewKind::Forge, false) => {
+                        ui.actual_reps = ui.actual_reps.saturating_sub(1).max(1);
+                    }
+                    (KeyCode::Char('d') | KeyCode::Enter, ViewKind::Forge, false) => {
+                        let _ = cli::tui_action_with_reps(env, SetStatus::Done, ui.actual_reps);
+                        ui.skip_check = false;
+                    }
+                    (KeyCode::Char('s'), ViewKind::Forge, false) => {
+                        ui.skip_check = true;
+                    }
+                    (code, ViewKind::Forge, true) if skip_confirmation_action(code).is_some() => {
+                        match skip_confirmation_action(code).unwrap() {
+                            SkipConfirmationAction::Fatigued => {
+                                let _ = cli::tui_action_skip_fatigued(env);
+                            }
+                            SkipConfirmationAction::Normal => {
+                                let _ = cli::tui_action(env, SetStatus::Skipped);
+                            }
+                            SkipConfirmationAction::Cancel => {}
+                        }
+                        ui.skip_check = false;
+                    }
+                    (KeyCode::Char('p'), ViewKind::Forge, _) => {
+                        let _ = cli::tui_action(env, SetStatus::Pain);
+                        ui.skip_check = false;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    };
+
+    let _ = disable_raw_mode();
+    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+    let _ = terminal.show_cursor();
+    result
+}
+
+fn apply_queue_regeneration_start(ui: &mut TuiState, start: QueueRegenerationStart) {
+    match start {
+        QueueRegenerationStart::Started(receiver) => {
+            ui.queue_regeneration = Some(receiver);
+            ui.queue_regeneration_started_at = Some(Instant::now());
+            ui.queue_regeneration_feedback = None;
+        }
+        QueueRegenerationStart::Busy => {}
+    }
+}
+
+fn load_view(paths: &Paths) -> ViewModel {
+    let backend = recommender_backend_view(paths);
+    let Ok(store) = Store::open(&paths.database_file) else {
+        return ViewModel {
+            kind: ViewKind::Idle,
+            recommendation: None,
+            backend,
+            activity: ForgeActivitySummary::default(),
+            token_usage: RecommenderTokenUsageByProvider::default(),
+            history: Vec::new(),
+            next_forges: Vec::new(),
+        };
+    };
+    let state = store.state().ok();
+    let recommendation = store.latest_open_recommendation().ok().flatten();
+    let activity = store.completed_forge_summary().unwrap_or_default();
+    let token_usage = RecommenderTokenUsageByProvider {
+        codex: store
+            .recommender_token_usage_summary_for(RecommenderTokenProvider::Codex)
+            .unwrap_or_default(),
+        openai: store
+            .recommender_token_usage_summary_for(RecommenderTokenProvider::OpenAi)
+            .unwrap_or_default(),
+    };
+    let history = store.recent_forge_history(10).unwrap_or_default();
+    let next_forges = store.queued_recommendations().unwrap_or_default();
+    let kind = match (
+        state.as_ref().map(|state| state.kind),
+        recommendation.as_ref(),
+    ) {
+        (Some(AppStateKind::Recommendation | AppStateKind::Active), Some(_)) => ViewKind::Forge,
+        (Some(AppStateKind::Cooldown), _) => ViewKind::Cooldown,
+        _ => ViewKind::Idle,
+    };
+    ViewModel {
+        kind,
+        recommendation,
+        backend,
+        activity,
+        token_usage,
+        history,
+        next_forges,
+    }
+}
+
+fn recommender_backend_view(paths: &Paths) -> BackendView {
+    let config_file = paths.config_file.display().to_string();
+    if !paths.config_file.exists() {
+        return BackendView {
+            label: "unknown".to_string(),
+            unavailable: true,
+            config_file,
+        };
+    }
+    let Ok(config) = config::load_or_default(paths) else {
+        return BackendView {
+            label: "unknown".to_string(),
+            unavailable: true,
+            config_file,
+        };
+    };
+    BackendView {
+        label: config.recommender.backend.label().to_string(),
+        unavailable: !backend_available(&config),
+        config_file,
+    }
+}
+
+fn backend_available(config: &config::Config) -> bool {
+    match config.recommender.backend {
+        RecommenderBackend::Codex => command_available(&config.recommender.codex.command),
+        RecommenderBackend::Openai => std::env::var(&config.recommender.openai.api_key_env)
+            .is_ok_and(|value| !value.trim().is_empty()),
+        RecommenderBackend::Local | RecommenderBackend::Off => true,
+    }
+}
+
+fn command_available(command: &str) -> bool {
+    let command = command.trim();
+    if command.is_empty() {
+        return false;
+    }
+    if command.contains(std::path::MAIN_SEPARATOR) {
+        return Path::new(command).is_file();
+    }
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&paths).any(|path| path.join(command).is_file())
+}
+
+fn cycle_recommender_backend(paths: &Paths, direction: CycleDirection) -> Result<()> {
+    let mut config = config::load_or_default(paths)?;
+    config.recommender.backend = match direction {
+        CycleDirection::Forward => config.recommender.backend.next(),
+        CycleDirection::Backward => config.recommender.backend.previous(),
+    };
+    config::save(paths, &config)
+}
+
+fn sync_reps(ui: &mut TuiState, recommendation: Option<&Recommendation>) {
+    let rec_id = recommendation.and_then(|rec| rec.id);
+    if rec_id != ui.recommendation_id {
+        ui.recommendation_id = rec_id;
+        ui.actual_reps = recommendation.map(|rec| rec.reps).unwrap_or(0);
+        ui.skip_check = false;
+    }
+}
+
+fn poll_queue_regeneration(ui: &mut TuiState) {
+    let result = match ui.queue_regeneration.as_ref().map(Receiver::try_recv) {
+        Some(Ok(result)) => Some(result),
+        Some(Err(TryRecvError::Disconnected)) => Some(Err(String::new())),
+        Some(Err(TryRecvError::Empty)) | None => None,
+    };
+    let Some(result) = result else {
+        return;
+    };
+    ui.queue_regeneration = None;
+    ui.queue_regeneration_started_at = None;
+    ui.queue_regeneration_feedback = Some(match result {
+        Ok(outcome) => QueueRegenerationFeedback::Success {
+            source: outcome.source,
+            notice: outcome.notice,
+            llm_count: outcome.llm_count,
+            local_count: outcome.local_count,
+        },
+        Err(error) => QueueRegenerationFeedback::Failure {
+            no_safe_forges: error.contains(crate::daemon::NO_SAFE_FORGES_ERROR),
+        },
+    });
+}
+
+fn queue_regeneration_spinner(ui: &TuiState) -> Option<&'static str> {
+    ui.queue_regeneration.as_ref()?;
+    let elapsed = ui.queue_regeneration_started_at?.elapsed().as_millis();
+    Some(queue_regeneration_spinner_frame(elapsed))
+}
+
+fn queue_regeneration_spinner_frame(elapsed_ms: u128) -> &'static str {
+    const FRAMES: [&str; 4] = ["◐", "◓", "◑", "◒"];
+    FRAMES[(elapsed_ms / 200) as usize % FRAMES.len()]
+}
+
+fn view_lines(view: &ViewModel, ui: &TuiState) -> Vec<Line<'static>> {
+    if ui.show_history && matches!(view.kind, ViewKind::Idle | ViewKind::Cooldown) {
+        return history_lines(&view.history, ui.demo);
+    }
+    if ui.show_next && matches!(view.kind, ViewKind::Idle | ViewKind::Cooldown) {
+        return next_forge_lines(
+            &view.next_forges,
+            ui.demo,
+            queue_regeneration_spinner(ui),
+            ui.queue_regeneration_feedback.as_ref(),
+        );
+    }
+    match view.kind {
+        ViewKind::Forge => view
+            .recommendation
+            .as_ref()
+            .map(|rec| forge_lines(rec, ui))
+            .unwrap_or_else(|| {
+                idle_lines(
+                    &view.backend,
+                    &view.activity,
+                    &view.token_usage,
+                    ui.status_message.as_deref(),
+                    ui.demo,
+                )
+            }),
+        ViewKind::Cooldown => cooldown_lines(
+            &view.backend,
+            &view.activity,
+            &view.token_usage,
+            ui.status_message.as_deref(),
+            ui.demo,
+        ),
+        ViewKind::Idle => idle_lines(
+            &view.backend,
+            &view.activity,
+            &view.token_usage,
+            ui.status_message.as_deref(),
+            ui.demo,
+        ),
+    }
+}
+
+fn screen_lines(view: &ViewModel, ui: &TuiState, in_tmux: bool) -> Vec<Line<'static>> {
+    let mut lines = view_lines(view, ui);
+    if in_tmux {
+        lines.extend(tmux_control_lines());
+    }
+    lines.extend(quit_control_lines());
+    lines
+}
+
+fn idle_lines(
+    backend: &BackendView,
+    activity: &ForgeActivitySummary,
+    token_usage: &RecommenderTokenUsageByProvider,
+    status_message: Option<&str>,
+    demo: bool,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        title_line(demo),
+        Line::from(""),
+        Line::from(Span::styled("Waiting for the next forge.", muted())),
+        forge_list_controls_line(),
+        recommender_line(backend),
+    ];
+    lines.extend(activity_lines(activity));
+    lines.extend(recommender_usage_lines(backend, token_usage));
+    if backend.unavailable {
+        lines.push(Line::from(Span::styled(
+            format!("Unavailable. Edit: {}", backend.config_file),
+            muted(),
+        )));
+    }
+    if let Some(message) = status_message {
+        lines.push(Line::from(Span::styled(message.to_string(), muted())));
+    }
+    lines
+}
+
+fn cooldown_lines(
+    backend: &BackendView,
+    activity: &ForgeActivitySummary,
+    token_usage: &RecommenderTokenUsageByProvider,
+    status_message: Option<&str>,
+    demo: bool,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        title_line(demo),
+        Line::from(""),
+        Line::from(Span::styled("Forged.", accent_bold())),
+        Line::from(Span::styled("Waiting for the next forge.", muted())),
+        forge_list_controls_line(),
+        recommender_line(backend),
+    ];
+    lines.extend(activity_lines(activity));
+    lines.extend(recommender_usage_lines(backend, token_usage));
+    if backend.unavailable {
+        lines.push(Line::from(Span::styled(
+            format!("Unavailable. Edit: {}", backend.config_file),
+            muted(),
+        )));
+    }
+    if let Some(message) = status_message {
+        lines.push(Line::from(Span::styled(message.to_string(), muted())));
+    }
+    lines
+}
+
+fn activity_lines(activity: &ForgeActivitySummary) -> Vec<Line<'static>> {
+    vec![
+        Line::from(""),
+        Line::from(Span::styled("Completed:", muted())),
+        Line::from(vec![
+            Span::styled("Today ", muted()),
+            Span::styled(
+                format!(
+                    "{} forges / {} reps",
+                    activity.today.forges, activity.today.reps
+                ),
+                text(),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Week ", muted()),
+            Span::styled(
+                format!(
+                    "{} forges / {} reps",
+                    activity.week.forges, activity.week.reps
+                ),
+                text(),
+            ),
+        ]),
+    ]
+}
+
+fn recommender_usage_lines(
+    backend: &BackendView,
+    usage: &RecommenderTokenUsageByProvider,
+) -> Vec<Line<'static>> {
+    let (title, usage, show_api_hint) = if backend.label == RecommenderBackend::Codex.label() {
+        ("Svarog Codex tokens (in/out)", &usage.codex, true)
+    } else if backend.label == RecommenderBackend::Openai.label() {
+        ("Svarog OpenAI API tokens (in/out)", &usage.openai, false)
+    } else {
+        return Vec::new();
+    };
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(title, muted())),
+        Line::from(vec![
+            Span::styled("Today  ", muted()),
+            Span::styled(
+                format!(
+                    "{} / {}",
+                    compact_token_count(usage.today.input_tokens),
+                    compact_token_count(usage.today.output_tokens)
+                ),
+                text(),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Week   ", muted()),
+            Span::styled(
+                format!(
+                    "{} / {}",
+                    compact_token_count(usage.week.input_tokens),
+                    compact_token_count(usage.week.output_tokens)
+                ),
+                text(),
+            ),
+        ]),
+    ];
+    if show_api_hint {
+        lines.extend([
+            Line::from(""),
+            Line::from(Span::styled(
+                "Use fewer Codex tokens with an OpenAI API key (separate billing):",
+                muted(),
+            )),
+            Line::from(Span::styled("export OPENAI_API_KEY=\"...\"", muted())),
+            Line::from(Span::styled(
+                "Restart Svarog, then select [OpenAI API] with →.",
+                muted(),
+            )),
+        ]);
+    }
+    lines
+}
+
+fn compact_token_count(tokens: u64) -> String {
+    let (value, suffix) = if tokens >= 1_000_000 {
+        (tokens as f64 / 1_000_000.0, "M")
+    } else if tokens >= 1_000 {
+        (tokens as f64 / 1_000.0, "k")
+    } else {
+        return tokens.to_string();
+    };
+    let formatted = format!("{value:.1}");
+    format!("{}{suffix}", formatted.trim_end_matches(".0"))
+}
+
+fn recommender_line(backend: &BackendView) -> Line<'static> {
+    Line::from(vec![
+        Span::styled("Recommender: ", muted()),
+        Span::styled(format!("[{}]", backend.label), text()),
+        Span::styled("  ← →", muted()),
+    ])
+}
+
+fn tmux_control_lines() -> Vec<Line<'static>> {
+    vec![
+        Line::from(""),
+        Line::from(Span::styled("Click pane to focus.", muted())),
+        Line::from(Span::styled("Drag border to resize.", muted())),
+        Line::from(Span::styled("Ctrl-b + ←/→ switches panes.", muted())),
+    ]
+}
+
+fn quit_control_lines() -> Vec<Line<'static>> {
+    vec![
+        Line::from(""),
+        Line::from(Span::styled("[q] Quit", muted())),
+    ]
+}
+
+fn quit_requested(key: KeyEvent) -> bool {
+    key.code == KeyCode::Char('q') && key.modifiers == KeyModifiers::NONE
+}
+
+fn increase_reps_requested(code: KeyCode) -> bool {
+    matches!(code, KeyCode::Char('+') | KeyCode::Char('='))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaitingPanel {
+    Main,
+    History,
+    Next,
+}
+
+fn waiting_panel_for_key(
+    code: KeyCode,
+    kind: ViewKind,
+    history_visible: bool,
+    next_visible: bool,
+) -> Option<WaitingPanel> {
+    if !matches!(kind, ViewKind::Idle | ViewKind::Cooldown) {
+        return None;
+    }
+    match code {
+        KeyCode::Char('f') => Some(WaitingPanel::History),
+        KeyCode::Char('n') => Some(WaitingPanel::Next),
+        KeyCode::Esc if history_visible || next_visible => Some(WaitingPanel::Main),
+        _ => None,
+    }
+}
+
+fn regenerate_queue_requested(code: KeyCode, kind: ViewKind, next_visible: bool) -> bool {
+    code == KeyCode::Char('r')
+        && next_visible
+        && matches!(kind, ViewKind::Idle | ViewKind::Cooldown)
+}
+
+fn forge_list_controls_line() -> Line<'static> {
+    Line::from(Span::styled("[f] Latest forges  [n] Next forges", muted()))
+}
+
+fn next_forge_lines(
+    next_forges: &[Recommendation],
+    demo: bool,
+    regeneration_spinner: Option<&str>,
+    feedback: Option<&QueueRegenerationFeedback>,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        title_line(demo),
+        Line::from(""),
+        Line::from(Span::styled("Next forges", text_bold())),
+    ];
+    if next_forges.is_empty() {
+        lines.extend([
+            Line::from(""),
+            Line::from(Span::styled("No forges queued yet.", muted())),
+        ]);
+    } else {
+        lines.push(Line::from(""));
+        for (index, recommendation) in next_forges.iter().enumerate() {
+            let mut label = format!(
+                "{}. {} {}",
+                index + 1,
+                recommendation.reps,
+                recommendation.movement_name
+            );
+            if let Some(weight) = recommendation.weight_kg {
+                label.push_str(&format!(" · {}", weight_label(weight)));
+            }
+            lines.push(Line::from(Span::styled(label, text())));
+        }
+    }
+    lines.push(Line::from(""));
+    if let Some(spinner) = regeneration_spinner {
+        lines.push(Line::from(Span::styled(
+            format!("{spinner} Regenerating forges…"),
+            muted(),
+        )));
+    } else {
+        match feedback {
+            Some(QueueRegenerationFeedback::Success { source, notice, .. }) => {
+                let message = if *source == QueueGenerationSource::LocalFallback {
+                    "✓ Forges regenerated locally"
+                } else {
+                    "✓ Forges regenerated"
+                };
+                lines.push(Line::from(Span::styled(message, muted())));
+                if let Some(notice) = notice {
+                    lines.push(Line::from(Span::styled(notice.clone(), muted())));
+                }
+            }
+            Some(QueueRegenerationFeedback::Failure { no_safe_forges }) => {
+                let message = if *no_safe_forges {
+                    "No safe forges are available right now. Keeping current list."
+                } else {
+                    "Could not regenerate forges. Keeping current list."
+                };
+                lines.push(Line::from(Span::styled(message, muted())));
+            }
+            None => {}
+        }
+        lines.push(Line::from(Span::styled("[r] Regenerate forges", muted())));
+    }
+    lines.push(Line::from(Span::styled("[esc] Back", muted())));
+    lines
+}
+
+fn history_lines(history: &[ForgeHistoryEntry], demo: bool) -> Vec<Line<'static>> {
+    history_lines_for_date(history, demo, Local::now().date_naive())
+}
+
+fn history_lines_for_date(
+    history: &[ForgeHistoryEntry],
+    demo: bool,
+    today: chrono::NaiveDate,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        title_line(demo),
+        Line::from(""),
+        Line::from(Span::styled("Latest forges", text_bold())),
+    ];
+    if history.is_empty() {
+        lines.extend([
+            Line::from(""),
+            Line::from(Span::styled("No forges yet.", muted())),
+        ]);
+    } else {
+        let mut previous_date = None;
+        for entry in history {
+            let date = entry.created_at.with_timezone(&Local).date_naive();
+            if previous_date != Some(date) {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    history_date_label(date, today),
+                    muted(),
+                )));
+                previous_date = Some(date);
+            }
+            lines.push(history_entry_line(entry));
+        }
+    }
+    lines.extend([
+        Line::from(""),
+        Line::from(Span::styled("[esc] Back", muted())),
+    ]);
+    lines
+}
+
+fn history_date_label(date: chrono::NaiveDate, today: chrono::NaiveDate) -> String {
+    if date == today {
+        "Today".to_string()
+    } else if date == today - ChronoDuration::days(1) {
+        "Yesterday".to_string()
+    } else if date.year() == today.year() {
+        format!("{} {}", date.format("%b"), date.day())
+    } else {
+        format!("{} {}, {}", date.format("%b"), date.day(), date.year())
+    }
+}
+
+fn history_entry_line(entry: &ForgeHistoryEntry) -> Line<'static> {
+    match entry.status.as_str() {
+        "done" => {
+            let mut label = format!("{} {}", entry.reps, entry.movement_name);
+            if let Some(weight) = entry.weight_kg {
+                label.push_str(&format!(" · {}", weight_label(weight)));
+            }
+            Line::from(vec![
+                Span::styled("✓ ", accent_bold()),
+                Span::styled(label, text()),
+            ])
+        }
+        "skipped" => Line::from(vec![
+            Span::styled("– ", muted()),
+            Span::styled(format!("Skipped · {}", entry.movement_name), text()),
+        ]),
+        "pain" => Line::from(vec![
+            Span::styled("! ", accent_bold()),
+            Span::styled(format!("Pain · {}", entry.movement_name), text()),
+        ]),
+        status => Line::from(vec![
+            Span::styled("? ", muted()),
+            Span::styled(format!("{status} · {}", entry.movement_name), text()),
+        ]),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SkipConfirmationAction {
+    Fatigued,
+    Normal,
+    Cancel,
+}
+
+fn skip_confirmation_action(code: KeyCode) -> Option<SkipConfirmationAction> {
+    match code {
+        KeyCode::Char('y') => Some(SkipConfirmationAction::Fatigued),
+        KeyCode::Char('n') => Some(SkipConfirmationAction::Normal),
+        KeyCode::Esc => Some(SkipConfirmationAction::Cancel),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CycleDirection {
+    Forward,
+    Backward,
+}
+
+fn recommender_cycle_direction(code: KeyCode) -> Option<CycleDirection> {
+    match code {
+        KeyCode::Left => Some(CycleDirection::Backward),
+        KeyCode::Right
+        | KeyCode::Char('r')
+        | KeyCode::Char('R')
+        | KeyCode::Tab
+        | KeyCode::Char(' ') => Some(CycleDirection::Forward),
+        _ => None,
+    }
+}
+
+fn forge_lines(rec: &Recommendation, ui: &TuiState) -> Vec<Line<'static>> {
+    if ui.skip_check {
+        return vec![
+            title_line(ui.demo),
+            Line::from(""),
+            Line::from(Span::styled("Skip this forge?", accent_bold())),
+            Line::from(""),
+            Line::from(Span::styled("Are you fatigued?", text())),
+            Line::from(Span::styled(
+                "This skips the next 5 opportunities.",
+                muted(),
+            )),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("[y] Yes  ", accent_bold()),
+                Span::styled("[n] No", muted()),
+            ]),
+            Line::from(Span::styled("[esc] Cancel", muted())),
+        ];
+    }
+
+    let mut lines = vec![
+        title_line(ui.demo),
+        Line::from(""),
+        Line::from(Span::styled(
+            rec.movement_name.to_uppercase(),
+            accent_bold(),
+        )),
+    ];
+    if let Some(weight) = rec.weight_kg {
+        lines.push(Line::from(Span::styled(weight_label(weight), text())));
+    }
+    lines.extend([
+        Line::from(""),
+        Line::from(Span::styled("Target", muted())),
+        Line::from(Span::styled(format!("{} reps", rec.reps), text_bold())),
+        Line::from(""),
+    ]);
+    lines.extend(animation_lines(ui.hammer_down));
+    lines.extend([
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("[d] Done  ", muted()),
+            Span::styled("[s] Skip", muted()),
+        ]),
+        Line::from(vec![
+            Span::styled("Actual reps: ", muted()),
+            Span::styled(format!("{}", ui.actual_reps.max(1)), accent_bold()),
+            Span::styled("  [+/-]", muted()),
+        ]),
+    ]);
+    lines
+}
+
+fn weight_label(weight: f32) -> String {
+    if weight.fract() == 0.0 {
+        format!("{} kg", weight as u32)
+    } else {
+        format!("{weight:.1} kg")
+    }
+}
+
+fn animation_lines(hammer_down: bool) -> Vec<Line<'static>> {
+    if hammer_down {
+        vec![
+            Line::from(Span::styled("       \\\\", muted())),
+            Line::from(Span::styled("        ⚒   *  *", accent_bold())),
+            Line::from(Span::styled("     ___┬___  *", muted())),
+            Line::from(Span::styled("        ▔", accent())),
+        ]
+    } else {
+        vec![
+            Line::from(Span::styled("        ⚒", muted())),
+            Line::from(Span::styled("       /", muted())),
+            Line::from(Span::styled("     ___┬___", muted())),
+            Line::from(Span::styled("        ▔", accent())),
+        ]
+    }
+}
+
+fn title_line(demo: bool) -> Line<'static> {
+    let mut spans = vec![
+        Span::styled("⚒ ", accent_bold()),
+        Span::styled("Svarog", text_bold()),
+    ];
+    if demo {
+        spans.push(Span::styled("  [demo]", muted()));
+    }
+    Line::from(spans)
+}
+
+fn text() -> Style {
+    Style::default().fg(colors::TEXT)
+}
+
+fn text_bold() -> Style {
+    text().add_modifier(Modifier::BOLD)
+}
+
+fn muted() -> Style {
+    Style::default().fg(colors::MUTED)
+}
+
+fn accent() -> Style {
+    Style::default().fg(colors::EMBER)
+}
+
+fn accent_bold() -> Style {
+    accent().add_modifier(Modifier::BOLD)
+}
+
+mod colors {
+    use ratatui::style::Color;
+
+    pub const BG: Color = Color::Rgb(7, 8, 8);
+    pub const TEXT: Color = Color::Rgb(230, 230, 230);
+    pub const MUTED: Color = Color::Rgb(136, 136, 136);
+    pub const EMBER: Color = Color::Rgb(255, 140, 0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Config, Recommender, RecommenderBackend};
+    use crate::models::{
+        Agent, ForgeActivityTotals, RecommenderTokenUsageSummary, TokenUsageTotals,
+    };
+    use chrono::{TimeZone, Utc};
+    use tempfile::tempdir;
+
+    fn rec() -> Recommendation {
+        Recommendation {
+            id: Some(1),
+            movement_id: "left_curl".into(),
+            movement_name: "left curl".into(),
+            primary_muscle: "biceps".into(),
+            muscles: vec!["biceps".into()],
+            reps: 10,
+            weight_kg: Some(12.0),
+            estimated_seconds: 60,
+            agent: Agent::Codex,
+            project: None,
+            created_at: Utc::now(),
+        }
+    }
+
+    fn history_entry(
+        movement_name: &str,
+        status: &str,
+        reps: u32,
+        weight_kg: Option<f32>,
+        created_at: chrono::DateTime<Utc>,
+    ) -> ForgeHistoryEntry {
+        ForgeHistoryEntry {
+            movement_name: movement_name.to_string(),
+            status: status.to_string(),
+            reps,
+            weight_kg,
+            created_at,
+        }
+    }
+
+    #[test]
+    fn idle_lines_are_minimal() {
+        let backend = BackendView {
+            label: "Codex".to_string(),
+            unavailable: false,
+            config_file: "/tmp/config.toml".to_string(),
+        };
+        let text = idle_lines(
+            &backend,
+            &ForgeActivitySummary::default(),
+            &RecommenderTokenUsageByProvider::default(),
+            None,
+            false,
+        )
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+        assert!(text.contains("Svarog"));
+        assert!(text.contains("Waiting for the next forge."));
+        assert!(text.contains("[f] Latest forges"));
+        assert!(text.contains("[n] Next forges"));
+        assert!(text.contains("Recommender: [Codex]  ← →"));
+        assert!(!text.contains("[r] Change recommender"));
+        assert!(text.contains("Completed:"));
+        assert!(text.contains("Svarog Codex tokens (in/out)"));
+        assert!(text.contains("Today 0 forges / 0 reps"));
+        assert!(text.contains("Week 0 forges / 0 reps"));
+        assert!(text.contains("Use fewer Codex tokens with an OpenAI API key"));
+        assert!(text.contains("export OPENAI_API_KEY=\"...\""));
+        assert!(text.contains("Restart Svarog, then select [OpenAI API] with →."));
+        assert!(!text.contains("sets"));
+    }
+
+    #[test]
+    fn idle_and_cooldown_lines_show_compact_codex_usage() {
+        let backend = BackendView {
+            label: "Codex".to_string(),
+            unavailable: false,
+            config_file: "/tmp/config.toml".to_string(),
+        };
+        let usage = RecommenderTokenUsageByProvider {
+            codex: RecommenderTokenUsageSummary {
+                today: TokenUsageTotals {
+                    input_tokens: 12_400,
+                    output_tokens: 320,
+                },
+                week: TokenUsageTotals {
+                    input_tokens: 58_100,
+                    output_tokens: 1_400,
+                },
+            },
+            openai: RecommenderTokenUsageSummary::default(),
+        };
+        let activity = ForgeActivitySummary {
+            today: ForgeActivityTotals {
+                forges: 3,
+                reps: 42,
+            },
+            week: ForgeActivityTotals {
+                forges: 12,
+                reps: 180,
+            },
+        };
+
+        for lines in [
+            idle_lines(&backend, &activity, &usage, None, false),
+            cooldown_lines(&backend, &activity, &usage, None, false),
+        ] {
+            let text = lines
+                .into_iter()
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(text.contains("Completed:"));
+            assert!(text.contains("[f] Latest forges"));
+            assert!(text.contains("[n] Next forges"));
+            assert!(text.contains("Today 3 forges / 42 reps"));
+            assert!(text.contains("Week 12 forges / 180 reps"));
+            assert!(text.contains("Svarog Codex tokens (in/out)"));
+            assert!(text.contains("Today  12.4k / 320"));
+            assert!(text.contains("Week   58.1k / 1.4k"));
+            assert!(text.contains("Use fewer Codex tokens with an OpenAI API key"));
+            assert!(
+                text.find("Completed:").unwrap()
+                    < text.find("Svarog Codex tokens (in/out)").unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn active_forge_omits_codex_usage_summary() {
+        let view = ViewModel {
+            kind: ViewKind::Forge,
+            recommendation: Some(rec()),
+            backend: BackendView {
+                label: "Codex".to_string(),
+                unavailable: false,
+                config_file: "/tmp/config.toml".to_string(),
+            },
+            activity: ForgeActivitySummary {
+                today: ForgeActivityTotals {
+                    forges: 3,
+                    reps: 42,
+                },
+                week: ForgeActivityTotals::default(),
+            },
+            token_usage: RecommenderTokenUsageByProvider {
+                codex: RecommenderTokenUsageSummary {
+                    today: TokenUsageTotals {
+                        input_tokens: 12_400,
+                        output_tokens: 320,
+                    },
+                    week: TokenUsageTotals::default(),
+                },
+                openai: RecommenderTokenUsageSummary::default(),
+            },
+            history: Vec::new(),
+            next_forges: Vec::new(),
+        };
+        let text = view_lines(
+            &view,
+            &TuiState {
+                show_history: true,
+                ..TuiState::default()
+            },
+        )
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+        assert!(!text.contains("Svarog Codex tokens"));
+        assert!(!text.contains("Completed:"));
+        assert!(!text.contains("[f] Latest forges"));
+        assert!(!text.contains("[n] Next forges"));
+        assert!(text.contains("LEFT CURL"));
+    }
+
+    #[test]
+    fn history_lines_group_dates_and_format_outcomes() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 8, 2).unwrap();
+        let at_noon = |date: chrono::NaiveDate| {
+            Local
+                .from_local_datetime(&date.and_hms_opt(12, 0, 0).unwrap())
+                .single()
+                .unwrap()
+                .with_timezone(&Utc)
+        };
+        let history = vec![
+            history_entry("scapular squeezes", "done", 8, Some(12.0), at_noon(today)),
+            history_entry(
+                "left curls",
+                "skipped",
+                10,
+                Some(12.0),
+                at_noon(today - ChronoDuration::days(1)),
+            ),
+            history_entry(
+                "desk posture reset",
+                "pain",
+                4,
+                None,
+                at_noon(chrono::NaiveDate::from_ymd_opt(2025, 12, 30).unwrap()),
+            ),
+        ];
+
+        let text = history_lines_for_date(&history, false, today)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("Today\n✓ 8 scapular squeezes · 12 kg"));
+        assert!(text.contains("Yesterday\n– Skipped · left curls"));
+        assert!(!text.contains("Skipped · left curls · 12 kg"));
+        assert!(text.contains("Dec 30, 2025\n! Pain · desk posture reset"));
+        assert!(text.contains("[esc] Back"));
+    }
+
+    #[test]
+    fn history_lines_show_empty_state() {
+        let text = history_lines_for_date(
+            &[],
+            false,
+            chrono::NaiveDate::from_ymd_opt(2026, 8, 2).unwrap(),
+        )
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+        assert!(text.contains("Latest forges"));
+        assert!(text.contains("No forges yet."));
+        assert!(text.contains("[esc] Back"));
+    }
+
+    #[test]
+    fn forge_list_navigation_is_only_available_while_waiting() {
+        assert_eq!(
+            waiting_panel_for_key(KeyCode::Char('f'), ViewKind::Idle, false, false),
+            Some(WaitingPanel::History)
+        );
+        assert_eq!(
+            waiting_panel_for_key(KeyCode::Char('n'), ViewKind::Cooldown, false, false),
+            Some(WaitingPanel::Next)
+        );
+        assert_eq!(
+            waiting_panel_for_key(KeyCode::Esc, ViewKind::Idle, true, false),
+            Some(WaitingPanel::Main)
+        );
+        assert_eq!(
+            waiting_panel_for_key(KeyCode::Esc, ViewKind::Idle, false, false),
+            None
+        );
+        assert_eq!(
+            waiting_panel_for_key(KeyCode::Char('n'), ViewKind::Forge, false, false),
+            None
+        );
+    }
+
+    #[test]
+    fn next_forge_lines_show_queue_order_and_weight() {
+        let mut first = rec();
+        first.movement_name = "scapular squeezes".to_string();
+        first.reps = 8;
+        first.weight_kg = None;
+        let mut second = rec();
+        second.movement_name = "left curls".to_string();
+        second.reps = 10;
+        second.weight_kg = Some(12.0);
+
+        let text = next_forge_lines(&[first, second], false, None, None)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("Next forges"));
+        assert!(text.contains("1. 8 scapular squeezes"));
+        assert!(text.contains("2. 10 left curls · 12 kg"));
+        assert!(text.contains("[r] Regenerate forges"));
+        assert!(text.contains("[esc] Back"));
+    }
+
+    #[test]
+    fn next_forge_lines_show_empty_queue() {
+        let text = next_forge_lines(&[], false, None, None)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("No forges queued yet."));
+    }
+
+    #[test]
+    fn next_forge_lines_show_regeneration_states() {
+        let loading = next_forge_lines(&[rec()], false, Some("◐"), None)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(loading.contains("Regenerating forges…"));
+        assert!(loading.contains("◐"));
+        assert!(!loading.contains("[r] Regenerate forges"));
+
+        let success_feedback = QueueRegenerationFeedback::Success {
+            source: QueueGenerationSource::LocalFallback,
+            notice: Some("LLM unavailable; used local fallback.".into()),
+            llm_count: 0,
+            local_count: 5,
+        };
+        let success = next_forge_lines(&[], false, None, Some(&success_feedback))
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(success.contains("✓ Forges regenerated locally"));
+        assert!(success.contains("LLM unavailable; used local fallback."));
+        assert!(success.contains("[r] Regenerate forges"));
+
+        let failure_feedback = QueueRegenerationFeedback::Failure {
+            no_safe_forges: false,
+        };
+        let failure = next_forge_lines(&[], false, None, Some(&failure_feedback))
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(failure.contains("Could not regenerate forges. Keeping current list."));
+        assert!(failure.contains("[r] Regenerate forges"));
+
+        let no_safe_feedback = QueueRegenerationFeedback::Failure {
+            no_safe_forges: true,
+        };
+        let no_safe = next_forge_lines(&[], false, None, Some(&no_safe_feedback))
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(no_safe.contains("No safe forges are available right now. Keeping current list."));
+    }
+
+    #[test]
+    fn regeneration_worker_results_update_preview_status() {
+        let (success_sender, success_receiver) = std::sync::mpsc::channel();
+        let mut ui = TuiState {
+            queue_regeneration: Some(success_receiver),
+            ..TuiState::default()
+        };
+        success_sender
+            .send(Ok(crate::daemon::QueueRegenerationOutcome {
+                source: QueueGenerationSource::LocalFallback,
+                notice: Some("using local fallback".into()),
+                llm_count: 0,
+                local_count: 5,
+            }))
+            .unwrap();
+
+        poll_queue_regeneration(&mut ui);
+
+        assert!(ui.queue_regeneration.is_none());
+        assert_eq!(
+            ui.queue_regeneration_feedback,
+            Some(QueueRegenerationFeedback::Success {
+                source: QueueGenerationSource::LocalFallback,
+                notice: Some("using local fallback".into()),
+                llm_count: 0,
+                local_count: 5,
+            })
+        );
+
+        let (failure_sender, failure_receiver) = std::sync::mpsc::channel();
+        ui.queue_regeneration = Some(failure_receiver);
+        failure_sender.send(Err("failed".into())).unwrap();
+        poll_queue_regeneration(&mut ui);
+        assert_eq!(
+            ui.queue_regeneration_feedback,
+            Some(QueueRegenerationFeedback::Failure {
+                no_safe_forges: false
+            })
+        );
+    }
+
+    #[test]
+    fn busy_regeneration_request_is_a_true_noop() {
+        let feedback = QueueRegenerationFeedback::Success {
+            source: QueueGenerationSource::Codex,
+            notice: None,
+            llm_count: 5,
+            local_count: 0,
+        };
+        let mut ui = TuiState {
+            queue_regeneration_feedback: Some(feedback.clone()),
+            ..TuiState::default()
+        };
+
+        apply_queue_regeneration_start(&mut ui, QueueRegenerationStart::Busy);
+
+        assert!(ui.queue_regeneration.is_none());
+        assert!(ui.queue_regeneration_started_at.is_none());
+        assert_eq!(ui.queue_regeneration_feedback, Some(feedback));
+    }
+
+    #[test]
+    fn regeneration_spinner_advances_on_the_tui_refresh_clock() {
+        assert_eq!(queue_regeneration_spinner_frame(0), "◐");
+        assert_eq!(queue_regeneration_spinner_frame(200), "◓");
+        assert_eq!(queue_regeneration_spinner_frame(400), "◑");
+        assert_eq!(queue_regeneration_spinner_frame(600), "◒");
+        assert_eq!(queue_regeneration_spinner_frame(800), "◐");
+    }
+
+    #[test]
+    fn regeneration_shortcut_is_contextual_to_next_forges() {
+        assert!(regenerate_queue_requested(
+            KeyCode::Char('r'),
+            ViewKind::Idle,
+            true
+        ));
+        assert!(!regenerate_queue_requested(
+            KeyCode::Char('r'),
+            ViewKind::Idle,
+            false
+        ));
+        assert!(!regenerate_queue_requested(
+            KeyCode::Char('r'),
+            ViewKind::Forge,
+            true
+        ));
+    }
+
+    #[test]
+    fn compact_token_counts_use_readable_suffixes() {
+        assert_eq!(compact_token_count(999), "999");
+        assert_eq!(compact_token_count(1_000), "1k");
+        assert_eq!(compact_token_count(1_250), "1.2k");
+        assert_eq!(compact_token_count(1_000_000), "1M");
+        assert_eq!(compact_token_count(1_250_000), "1.2M");
+    }
+
+    #[test]
+    fn demo_title_is_visibly_marked() {
+        let title = title_line(true).to_string();
+
+        assert!(title.contains("Svarog"));
+        assert!(title.contains("[demo]"));
+        assert!(!title_line(false).to_string().contains("[demo]"));
+    }
+
+    #[test]
+    fn recommender_line_styles_backend_in_text_color() {
+        let backend = BackendView {
+            label: "Codex".to_string(),
+            unavailable: false,
+            config_file: "/tmp/config.toml".to_string(),
+        };
+        let line = recommender_line(&backend);
+
+        assert_eq!(line.spans[0].content.as_ref(), "Recommender: ");
+        assert_eq!(line.spans[0].style, muted());
+        assert_eq!(line.spans[1].content.as_ref(), "[Codex]");
+        assert_eq!(line.spans[1].style, text());
+        assert_eq!(line.spans[2].content.as_ref(), "  ← →");
+        assert_eq!(line.spans[2].style, muted());
+    }
+
+    #[test]
+    fn missing_config_uses_unknown_backend_label() {
+        let root = tempdir().unwrap().keep();
+        let paths = Paths::from_root(root);
+        let backend = recommender_backend_view(&paths);
+
+        assert_eq!(backend.label, "unknown");
+        assert!(backend.unavailable);
+    }
+
+    #[test]
+    fn backend_label_comes_from_config() {
+        let root = tempdir().unwrap().keep();
+        let paths = Paths::from_root(root);
+        let config = Config {
+            recommender: Recommender {
+                backend: RecommenderBackend::Local,
+                ..Recommender::default()
+            },
+            ..Config::default()
+        };
+        config::save(&paths, &config).unwrap();
+
+        let backend = recommender_backend_view(&paths);
+
+        assert_eq!(backend.label, "Local");
+        assert!(!backend.unavailable);
+    }
+
+    #[test]
+    fn backend_cycle_order_matches_tui_shortcut() {
+        assert_eq!(RecommenderBackend::Codex.next(), RecommenderBackend::Openai);
+        assert_eq!(RecommenderBackend::Openai.next(), RecommenderBackend::Local);
+        assert_eq!(RecommenderBackend::Local.next(), RecommenderBackend::Off);
+        assert_eq!(RecommenderBackend::Off.next(), RecommenderBackend::Codex);
+        assert_eq!(
+            RecommenderBackend::Codex.previous(),
+            RecommenderBackend::Off
+        );
+        assert_eq!(
+            RecommenderBackend::Openai.previous(),
+            RecommenderBackend::Codex
+        );
+        assert_eq!(
+            RecommenderBackend::Local.previous(),
+            RecommenderBackend::Openai
+        );
+        assert_eq!(
+            RecommenderBackend::Off.previous(),
+            RecommenderBackend::Local
+        );
+    }
+
+    #[test]
+    fn recommender_cycle_key_accepts_common_idle_controls() {
+        assert_eq!(
+            recommender_cycle_direction(KeyCode::Left),
+            Some(CycleDirection::Backward)
+        );
+        assert_eq!(
+            recommender_cycle_direction(KeyCode::Right),
+            Some(CycleDirection::Forward)
+        );
+        assert_eq!(
+            recommender_cycle_direction(KeyCode::Char('r')),
+            Some(CycleDirection::Forward)
+        );
+        assert_eq!(
+            recommender_cycle_direction(KeyCode::Char('R')),
+            Some(CycleDirection::Forward)
+        );
+        assert_eq!(
+            recommender_cycle_direction(KeyCode::Tab),
+            Some(CycleDirection::Forward)
+        );
+        assert_eq!(
+            recommender_cycle_direction(KeyCode::Char(' ')),
+            Some(CycleDirection::Forward)
+        );
+        assert_eq!(recommender_cycle_direction(KeyCode::Char('d')), None);
+    }
+
+    #[test]
+    fn cycling_recommender_backend_persists_to_config() {
+        let root = tempdir().unwrap().keep();
+        let paths = Paths::from_root(root);
+        let config = Config::default();
+        config::save(&paths, &config).unwrap();
+
+        cycle_recommender_backend(&paths, CycleDirection::Forward).unwrap();
+
+        let saved = config::load_or_default(&paths).unwrap();
+        assert_eq!(saved.recommender.backend, RecommenderBackend::Openai);
+    }
+
+    #[test]
+    fn cycling_recommender_backend_backward_persists_to_config() {
+        let root = tempdir().unwrap().keep();
+        let paths = Paths::from_root(root);
+        let config = Config::default();
+        config::save(&paths, &config).unwrap();
+
+        cycle_recommender_backend(&paths, CycleDirection::Backward).unwrap();
+
+        let saved = config::load_or_default(&paths).unwrap();
+        assert_eq!(saved.recommender.backend, RecommenderBackend::Off);
+    }
+
+    #[test]
+    fn openai_without_api_key_is_unavailable() {
+        std::env::remove_var("SVAROG_TEST_MISSING_OPENAI_KEY");
+        let root = tempdir().unwrap().keep();
+        let paths = Paths::from_root(root);
+        let mut config = Config {
+            recommender: Recommender {
+                backend: RecommenderBackend::Openai,
+                ..Recommender::default()
+            },
+            ..Config::default()
+        };
+        config.recommender.openai.api_key_env = "SVAROG_TEST_MISSING_OPENAI_KEY".to_string();
+        config::save(&paths, &config).unwrap();
+
+        let backend = recommender_backend_view(&paths);
+
+        assert_eq!(backend.label, "OpenAI API");
+        assert!(backend.unavailable);
+    }
+
+    #[test]
+    fn unavailable_backend_lines_include_config_path() {
+        let backend = BackendView {
+            label: "OpenAI API".to_string(),
+            unavailable: true,
+            config_file: "/tmp/svarog/config.toml".to_string(),
+        };
+        let text = idle_lines(
+            &backend,
+            &ForgeActivitySummary::default(),
+            &RecommenderTokenUsageByProvider::default(),
+            None,
+            false,
+        )
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+        assert!(text.contains("Recommender: [OpenAI API]"));
+        assert!(text.contains("Unavailable. Edit: /tmp/svarog/config.toml"));
+        assert!(text.contains("Svarog OpenAI API tokens"));
+        assert!(!text.contains("Svarog Codex tokens"));
+        assert!(!text.contains("Use fewer Codex tokens"));
+    }
+
+    #[test]
+    fn each_remote_backend_shows_only_its_own_usage() {
+        let usage = RecommenderTokenUsageByProvider {
+            codex: RecommenderTokenUsageSummary {
+                today: TokenUsageTotals {
+                    input_tokens: 12_400,
+                    output_tokens: 320,
+                },
+                week: TokenUsageTotals::default(),
+            },
+            openai: RecommenderTokenUsageSummary {
+                today: TokenUsageTotals {
+                    input_tokens: 111_500,
+                    output_tokens: 2_900,
+                },
+                week: TokenUsageTotals {
+                    input_tokens: 111_500,
+                    output_tokens: 2_900,
+                },
+            },
+        };
+
+        let openai = BackendView {
+            label: "OpenAI API".into(),
+            unavailable: false,
+            config_file: "/tmp/svarog/config.toml".into(),
+        };
+        let text = recommender_usage_lines(&openai, &usage)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Svarog OpenAI API tokens (in/out)"));
+        assert!(text.contains("Today  111.5k / 2.9k"));
+        assert!(!text.contains("12.4k / 320"));
+        assert!(!text.contains("Use fewer Codex tokens"));
+
+        for label in ["Local", "Off"] {
+            let backend = BackendView {
+                label: label.into(),
+                unavailable: false,
+                config_file: "/tmp/svarog/config.toml".into(),
+            };
+            assert!(recommender_usage_lines(&backend, &usage).is_empty());
+        }
+    }
+
+    #[test]
+    fn idle_lines_show_recommender_status_message() {
+        let backend = BackendView {
+            label: "Codex".to_string(),
+            unavailable: false,
+            config_file: "/tmp/svarog/config.toml".to_string(),
+        };
+        let text = idle_lines(
+            &backend,
+            &ForgeActivitySummary::default(),
+            &RecommenderTokenUsageByProvider::default(),
+            Some("Could not update recommender. Edit: /tmp/svarog/config.toml"),
+            false,
+        )
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+        assert!(text.contains("Could not update recommender. Edit: /tmp/svarog/config.toml"));
+    }
+
+    #[test]
+    fn forge_lines_show_reps_and_weight() {
+        let ui = TuiState {
+            recommendation_id: Some(1),
+            actual_reps: 15,
+            skip_check: false,
+            hammer_down: true,
+            ..TuiState::default()
+        };
+        let text = forge_lines(&rec(), &ui)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("LEFT CURL"));
+        assert!(text.contains("12 kg"));
+        assert!(text.contains("10 reps"));
+        assert!(text.contains("15"));
+    }
+
+    #[test]
+    fn tmux_control_lines_explain_focus_and_keyboard_controls() {
+        let text = tmux_control_lines()
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("Click pane to focus."));
+        assert!(text.contains("Drag border to resize."));
+        assert!(text.contains("Ctrl-b + ←/→ switches panes."));
+    }
+
+    #[test]
+    fn quit_hint_is_the_last_line_for_every_screen_layout() {
+        let view = ViewModel {
+            kind: ViewKind::Idle,
+            recommendation: None,
+            backend: BackendView {
+                label: "Codex".to_string(),
+                unavailable: false,
+                config_file: "/tmp/config.toml".to_string(),
+            },
+            activity: ForgeActivitySummary::default(),
+            token_usage: RecommenderTokenUsageByProvider::default(),
+            history: Vec::new(),
+            next_forges: Vec::new(),
+        };
+
+        for in_tmux in [false, true] {
+            let lines = screen_lines(&view, &TuiState::default(), in_tmux);
+            assert_eq!(lines.last().unwrap().to_string(), "[q] Quit");
+        }
+    }
+
+    #[test]
+    fn only_lowercase_q_quits() {
+        assert!(quit_requested(KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::NONE
+        )));
+        for key in [
+            KeyEvent::new(KeyCode::Char('Q'), KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
+        ] {
+            assert!(!quit_requested(key));
+        }
+    }
+
+    #[test]
+    fn plus_and_equals_increase_actual_reps() {
+        assert!(increase_reps_requested(KeyCode::Char('+')));
+        assert!(increase_reps_requested(KeyCode::Char('=')));
+        assert!(!increase_reps_requested(KeyCode::Char('-')));
+    }
+
+    #[test]
+    fn escape_cancels_skip_confirmation_without_selecting_a_skip() {
+        assert_eq!(
+            skip_confirmation_action(KeyCode::Esc),
+            Some(SkipConfirmationAction::Cancel)
+        );
+        assert_eq!(
+            skip_confirmation_action(KeyCode::Char('n')),
+            Some(SkipConfirmationAction::Normal)
+        );
+        assert_eq!(
+            skip_confirmation_action(KeyCode::Char('y')),
+            Some(SkipConfirmationAction::Fatigued)
+        );
+    }
+
+    #[test]
+    fn skip_check_asks_one_question() {
+        let ui = TuiState {
+            recommendation_id: Some(1),
+            actual_reps: 10,
+            skip_check: true,
+            hammer_down: false,
+            ..TuiState::default()
+        };
+        let text = forge_lines(&rec(), &ui)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("Are you fatigued?"));
+        assert!(text.contains("[y] Yes"));
+        assert!(text.contains("[n] No"));
+    }
+}

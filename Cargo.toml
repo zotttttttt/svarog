@@ -1,0 +1,38 @@
+[package]
+name = "svarog"
+version = "0.2.0"
+edition = "2021"
+license = "MIT"
+description = "A CLI sidecar that turns AI-agent waiting time into tiny, adaptive workouts."
+readme = "README.md"
+keywords = ["cli", "tui", "exercise", "productivity", "codex"]
+categories = ["command-line-utilities"]
+include = [
+    "Cargo.toml",
+    "Cargo.lock",
+    "LICENSE",
+    "README.md",
+    "build.rs",
+    "prompts/**",
+    "scripts/**",
+    "src/**",
+    "tests/**",
+]
+
+[dependencies]
+anyhow = "1"
+axum = "0.7"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.28"
+directories = "5"
+libc = "0.2"
+minijinja = { version = "2", features = ["json"] }
+ratatui = "0.29"
+rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal"] }
+toml = "0.8"
