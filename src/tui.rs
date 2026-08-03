@@ -27,104 +27,129 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-type Spark = (usize, usize, bool);
+type Spark = (usize, usize, char, bool);
 
 const SPARK_BURSTS: [&[Spark]; 10] = [
     &[
-        (0, 8, true),
-        (0, 10, true),
-        (0, 12, true),
-        (1, 6, false),
-        (1, 9, true),
-        (1, 11, true),
-        (1, 14, false),
-        (2, 15, false),
+        (0, 6, '˚', false),
+        (0, 10, '⋆', true),
+        (0, 14, '｡', false),
+        (1, 8, '✧', true),
+        (1, 10, '⋆', true),
+        (1, 11, '✧', true),
+        (1, 12, '˚', false),
+        (2, 5, '｡', false),
+        (2, 15, '˚', false),
     ],
     &[
-        (0, 7, false),
-        (0, 11, true),
-        (0, 13, true),
-        (1, 5, false),
-        (1, 8, true),
-        (1, 12, true),
-        (1, 15, false),
-        (2, 5, true),
+        (0, 5, '｡', false),
+        (0, 10, '⋆', true),
+        (0, 12, '˚', false),
+        (0, 15, '˚', false),
+        (1, 7, '˚', false),
+        (1, 9, '⋆', true),
+        (1, 10, '˚', true),
+        (1, 11, '✧', true),
+        (1, 13, '˚', false),
+        (2, 16, '｡', false),
     ],
     &[
-        (0, 9, true),
-        (0, 12, false),
-        (1, 6, true),
-        (1, 10, true),
-        (1, 14, false),
-        (2, 5, false),
-        (2, 15, false),
+        (0, 7, '˚', false),
+        (0, 10, '⋆', true),
+        (0, 13, '｡', false),
+        (1, 6, '｡', false),
+        (1, 9, '✧', true),
+        (1, 10, '⋆', true),
+        (1, 11, '✧', true),
+        (1, 12, '˚', true),
+        (1, 14, '｡', false),
+        (2, 5, '˚', false),
     ],
     &[
-        (0, 8, true),
-        (0, 11, false),
-        (0, 14, true),
-        (1, 5, false),
-        (1, 9, true),
-        (1, 13, true),
-        (2, 15, false),
+        (0, 4, '｡', false),
+        (0, 9, '˚', false),
+        (0, 12, '✧', true),
+        (0, 15, '˚', false),
+        (1, 7, '˚', false),
+        (1, 10, '⋆', true),
+        (1, 11, '˚', true),
+        (1, 12, '✧', true),
+        (1, 14, '｡', false),
+        (2, 15, '˚', false),
     ],
     &[
-        (0, 7, false),
-        (0, 10, true),
-        (0, 13, false),
-        (1, 6, true),
-        (1, 11, true),
-        (1, 14, false),
-        (2, 5, false),
-        (2, 15, true),
+        (0, 6, '˚', false),
+        (0, 9, '⋆', true),
+        (0, 11, '｡', false),
+        (0, 16, '｡', false),
+        (1, 8, '✧', true),
+        (1, 10, '⋆', true),
+        (1, 11, '✧', true),
+        (1, 13, '˚', false),
+        (2, 5, '｡', false),
+        (2, 15, '˚', false),
     ],
     &[
-        (0, 9, false),
-        (0, 11, true),
-        (0, 14, false),
-        (1, 5, false),
-        (1, 8, true),
-        (1, 12, true),
-        (1, 15, true),
-        (2, 16, false),
+        (0, 5, '｡', false),
+        (0, 8, '˚', false),
+        (0, 11, '✧', true),
+        (0, 14, '˚', false),
+        (1, 7, '˚', false),
+        (1, 9, '✧', true),
+        (1, 10, '˚', true),
+        (1, 11, '⋆', true),
+        (1, 13, '｡', false),
+        (2, 16, '｡', false),
     ],
     &[
-        (0, 7, true),
-        (0, 12, false),
-        (1, 6, false),
-        (1, 9, true),
-        (1, 11, true),
-        (1, 14, true),
-        (2, 5, false),
-        (2, 15, false),
+        (0, 7, '｡', false),
+        (0, 11, '⋆', true),
+        (0, 15, '˚', false),
+        (1, 6, '˚', false),
+        (1, 9, '⋆', true),
+        (1, 10, '✧', true),
+        (1, 11, '✧', true),
+        (1, 12, '˚', true),
+        (1, 14, '｡', false),
+        (2, 5, '｡', false),
     ],
     &[
-        (0, 8, false),
-        (0, 10, true),
-        (0, 13, true),
-        (1, 5, true),
-        (1, 7, false),
-        (1, 12, true),
-        (1, 15, false),
+        (0, 4, '˚', false),
+        (0, 9, '⋆', true),
+        (0, 12, '｡', false),
+        (0, 16, '˚', false),
+        (1, 8, '｡', false),
+        (1, 10, '⋆', true),
+        (1, 11, '✧', true),
+        (1, 12, '˚', true),
+        (1, 14, '˚', false),
+        (2, 15, '｡', false),
     ],
     &[
-        (0, 9, true),
-        (0, 13, false),
-        (1, 6, false),
-        (1, 8, true),
-        (1, 11, true),
-        (1, 14, false),
-        (2, 15, false),
+        (0, 6, '｡', false),
+        (0, 10, '˚', false),
+        (0, 12, '✧', true),
+        (0, 15, '｡', false),
+        (1, 7, '˚', false),
+        (1, 9, '✧', true),
+        (1, 10, '˚', true),
+        (1, 11, '⋆', true),
+        (1, 13, '˚', false),
+        (2, 5, '˚', false),
+        (2, 16, '｡', false),
     ],
     &[
-        (0, 7, true),
-        (0, 10, false),
-        (0, 14, true),
-        (1, 5, false),
-        (1, 9, true),
-        (1, 12, true),
-        (1, 15, false),
-        (2, 5, false),
+        (0, 5, '˚', false),
+        (0, 11, '⋆', true),
+        (0, 13, '｡', false),
+        (0, 16, '˚', false),
+        (1, 7, '｡', false),
+        (1, 9, '⋆', true),
+        (1, 10, '✧', true),
+        (1, 11, '✧', true),
+        (1, 12, '˚', true),
+        (1, 14, '｡', false),
+        (2, 15, '˚', false),
     ],
 ];
 
@@ -962,24 +987,31 @@ fn weight_label(weight: f32) -> String {
 fn animation_lines(frame: usize) -> Vec<Line<'static>> {
     let sparks = (frame % 2 == 1).then(|| SPARK_BURSTS[(frame / 2) % SPARK_BURSTS.len()]);
     let mut rows = vec![vec![(' ', muted()); 21]; 5];
-
-    for (offset, character) in "___┬___".chars().enumerate() {
-        rows[2][7 + offset] = (character, muted());
-    }
-    rows[3][10] = ('▔', muted());
-
-    let status_style = if sparks.is_some() {
+    let active_style = if sparks.is_some() {
         accent_bold()
     } else {
         muted()
     };
+
+    for (offset, character) in "___┬___".chars().enumerate() {
+        rows[2][7 + offset] = (
+            character,
+            if character == '┬' {
+                active_style
+            } else {
+                muted()
+            },
+        );
+    }
+    rows[3][10] = ('▔', muted());
+
     for (column, character) in "[FORGING IN PROGRESS]".chars().enumerate() {
-        rows[4][column] = (character, status_style);
+        rows[4][column] = (character, active_style);
     }
 
     if let Some(sparks) = sparks {
-        for &(row, column, amber) in sparks {
-            rows[row][column] = ('*', if amber { accent_bold() } else { muted() });
+        for &(row, column, character, amber) in sparks {
+            rows[row][column] = (character, if amber { accent_bold() } else { muted() });
         }
     }
 
@@ -1781,7 +1813,7 @@ mod tests {
         assert_eq!(unique_bursts.len(), 10);
         assert_eq!(
             rendered_bursts[0],
-            "        * * *\n      *  * *  *\n       ___┬___ *\n          ▔\n[FORGING IN PROGRESS]"
+            "      ˚   ⋆   ｡\n        ✧ ⋆✧˚\n     ｡ ___┬___ ˚\n          ▔\n[FORGING IN PROGRESS]"
         );
         for (index, burst) in bursts.iter().enumerate() {
             assert_eq!(burst.len(), 5);
@@ -1790,14 +1822,31 @@ mod tests {
             let spark_colors = burst
                 .iter()
                 .flat_map(|line| &line.spans)
-                .filter(|span| span.content == "*")
+                .filter(|span| ["✧", "˚", "⋆", "｡"].contains(&span.content.as_ref()))
                 .filter_map(|span| span.style.fg)
                 .collect::<Vec<_>>();
             assert!(spark_colors.contains(&colors::EMBER));
             assert!(spark_colors.contains(&colors::MUTED));
             assert!(!render(burst).contains(['⚒', '|', '/', '\\']));
+            assert_eq!(burst[2].spans[10].content, "┬");
+            assert_eq!(burst[2].spans[10].style.fg, Some(colors::EMBER));
             assert_eq!(burst[4].spans[0].style.fg, Some(colors::EMBER));
         }
+        for burst in SPARK_BURSTS {
+            assert!(burst.len() >= 9);
+            assert!(burst.iter().filter(|(_, _, _, amber)| *amber).count() >= 4);
+            assert!(burst.iter().any(|(_, _, _, amber)| !*amber));
+            assert!(burst.iter().all(|(row, column, character, amber)| {
+                *row < 3
+                    && (4..=16).contains(column)
+                    && ['✧', '˚', '⋆', '｡'].contains(character)
+                    && (!*amber
+                        || (*row == 1 && (8..=12).contains(column))
+                        || (*row == 0 && (9..=12).contains(column)))
+            }));
+        }
+        assert_eq!(quiet[2].spans[10].content, "┬");
+        assert_eq!(quiet[2].spans[10].style.fg, Some(colors::MUTED));
         assert_eq!(quiet[4].spans[0].style.fg, Some(colors::MUTED));
         assert_eq!(render(&animation_lines(20)), render(&quiet));
     }
