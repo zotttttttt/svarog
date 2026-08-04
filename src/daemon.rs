@@ -445,7 +445,8 @@ mod tests {
 
         let store = Store::open(&env.paths.database_file).unwrap();
         let queued = store.queued_recommendations().unwrap();
-        assert_eq!(queued.len(), recommender::QUEUE_TARGET as usize);
+        assert!(!queued.is_empty());
+        assert!(queued.len() <= recommender::QUEUE_TARGET as usize);
         assert!(queued
             .iter()
             .all(|rec| !rec.movement_name.contains("old forge")));

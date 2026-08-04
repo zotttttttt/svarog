@@ -1086,18 +1086,36 @@ impl Store {
             .context("loading today's stats")
     }
 
-    pub fn today_sets(&self, limit: u32) -> Result<Vec<SetSummary>> {
-        let today = Utc::now().date_naive().to_string();
+    pub fn completed_sets_today_and_yesterday(&self) -> Result<Vec<SetSummary>> {
+        let now = Local::now();
+        let today = now.date_naive();
+        let start = Local
+            .from_local_datetime(
+                &(today - Duration::days(1))
+                    .and_hms_opt(0, 0, 0)
+                    .context("building local start of yesterday")?,
+            )
+            .earliest()
+            .context("determining local start of yesterday")?
+            .with_timezone(&Utc);
+        let end = Local
+            .from_local_datetime(
+                &(today + Duration::days(1))
+                    .and_hms_opt(0, 0, 0)
+                    .context("building local start of tomorrow")?,
+            )
+            .earliest()
+            .context("determining local start of tomorrow")?
+            .with_timezone(&Utc);
         let mut stmt = self.conn.prepare(
             r#"
             SELECT movement_id, muscles_json, status, reps, weight_kg, agent, project, created_at
             FROM sets
-            WHERE substr(created_at, 1, 10) = ?1
-            ORDER BY id DESC
-            LIMIT ?2
+            WHERE status = 'done' AND created_at >= ?1 AND created_at < ?2
+            ORDER BY created_at DESC, id DESC
             "#,
         )?;
-        let rows = stmt.query_map(params![today, i64::from(limit)], |row| {
+        let rows = stmt.query_map(params![start.to_rfc3339(), end.to_rfc3339()], |row| {
             let muscles_json: String = row.get(1)?;
             Ok(SetSummary {
                 movement_id: row.get(0)?,
@@ -1111,7 +1129,7 @@ impl Store {
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
-            .context("loading today's sets")
+            .context("loading completed exercises from today and yesterday")
     }
 }
 

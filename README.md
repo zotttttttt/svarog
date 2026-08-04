@@ -9,9 +9,9 @@ With Svarog, you can:
 
 - get a small exercise whenever your coding agent gives you a natural pause;
 - record completed reps, skips, fatigue, and pain;
-- preview or regenerate your next five forges;
+- preview or regenerate your next movement sessions;
 - use Codex, the OpenAI API, or the built-in local recommender;
-- track today’s and the last seven days’ forges, reps, and recommender token use.
+- track today’s and the last seven days’ movement sessions, reps, and recommender token use.
 
 ## Get started
 
@@ -47,11 +47,11 @@ authenticated.
 
 ## Use Svarog
 
-When a forge appears, do the movement and record the outcome:
+When a movement session appears, do the movement and record the outcome:
 
 | Key | Action |
 | --- | --- |
-| `d` or Enter | Finish the forge |
+| `d` or Enter | Finish the movement session |
 | `+` (`=`) / `-` | Adjust the reps you completed |
 | `s` | Skip and optionally report fatigue |
 | `p` | Report pain and block that movement |
@@ -62,13 +62,13 @@ While waiting:
 
 | Key | Action |
 | --- | --- |
-| `l` | Show up to 10 latest forges, grouped by date |
-| `n` | Preview the next forges |
-| `f` | Open the first safe queued forge |
-| `r` | Regenerate the queue from the next-forges view |
+| `l` | Show up to 10 latest movement sessions, grouped by date |
+| `n` | Preview the next movement sessions |
+| `f` | Open the first safe queued session |
+| `r` | Regenerate the queue from the next-sessions view |
 | `←` / `→` | Change the recommender |
 
-A forge remains available until you finish, skip, or report pain—even if the
+A movement session remains available until you finish, skip, or report pain—even if the
 Codex turn that triggered it has already ended.
 
 ## Work beside your coding agent
@@ -113,9 +113,10 @@ svarog run
 Then select **OpenAI API** with `←` or `→`. To make the key available every
 time, add the export to your shell profile.
 
-Svarog asks for five recommendations at a time, validates them against your
-profile, and safely fills missing positions locally. If you regenerate the
-queue, the current list stays available until its replacement is ready.
+Svarog generates recommendations in batches of ten, validates them against your
+profile, and safely fills missing positions locally. When one queued session
+remains, Svarog prepares another batch of ten and keeps the current session
+available.
 
 The waiting screen shows input/output token totals for the currently selected
 remote recommender. Codex and OpenAI API usage are stored separately. Local and
@@ -123,7 +124,7 @@ Off do not show a token panel.
 
 ## Notifications and safety
 
-Svarog can notify you when a new forge becomes actionable. Setup asks whether
+Svarog can notify you when a new movement session becomes actionable. Setup asks whether
 you want desktop notifications; you can change the setting later in:
 
 ```text

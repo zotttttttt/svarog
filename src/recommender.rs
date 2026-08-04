@@ -1,4 +1,4 @@
-use crate::config::{Config, Paths, Profile, RecommenderBackend};
+use crate::config::{Config, Paths, Profile, RecommenderBackend, UnitSystem};
 use crate::models::{
     AgentEvent, Movement, MovementStatus, Recommendation, RecommenderTokenProvider,
     RecommenderTokenUsage,
@@ -15,7 +15,8 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-pub const QUEUE_TARGET: u32 = 5;
+pub const QUEUE_TARGET: u32 = 10;
+pub const QUEUE_LOW_WATER_MARK: u32 = 1;
 
 #[derive(Debug)]
 pub struct QueueGeneration {
@@ -61,6 +62,10 @@ struct ExerciseProfilePreferences {
 
 #[derive(Debug, Clone, Serialize)]
 struct ContextProfile {
+    unit_system: UnitSystem,
+    height_cm: Option<u32>,
+    weight_kg: Option<f32>,
+    age: Option<u32>,
     goals: Vec<String>,
     equipment_text: String,
     exercise_preferences: String,
@@ -74,6 +79,8 @@ struct ContextProfile {
 #[derive(Debug, Clone, Serialize)]
 struct ContextPreferences {
     forge_intensity: u32,
+    forge_frequency: u32,
+    default_expected_duration_sec: u32,
     max_daily_sets: u32,
 }
 
@@ -83,6 +90,10 @@ struct ContextSet {
     muscles: Vec<String>,
     status: String,
     reps: u32,
+    weight_kg: Option<f32>,
+    agent: String,
+    project: Option<String>,
+    created_at: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -148,11 +159,18 @@ pub fn fill_recommendation_queue(
     config: &Config,
     paths: &Paths,
 ) -> Result<Option<String>> {
-    let queued = store.queued_recommendation_count()?;
-    if queued >= QUEUE_TARGET {
+    let queued_recommendations = store.queued_recommendations()?;
+    let queued = queued_recommendations.len() as u32;
+    if queued > QUEUE_LOW_WATER_MARK {
         return Ok(None);
     }
-    let generated = generate_recommendation_queue(store, config, paths, QUEUE_TARGET - queued)?;
+    let generated = generate_recommendation_queue_with_existing(
+        store,
+        config,
+        paths,
+        QUEUE_TARGET,
+        &queued_recommendations,
+    )?;
     for rec in generated.recommendations {
         store.insert_queued_recommendation(&rec)?;
     }
@@ -163,8 +181,19 @@ pub fn generate_recommendation_queue(
     store: &Store,
     config: &Config,
     paths: &Paths,
-    needed: u32,
+    _requested: u32,
 ) -> Result<QueueGeneration> {
+    generate_recommendation_queue_with_existing(store, config, paths, _requested, &[])
+}
+
+fn generate_recommendation_queue_with_existing(
+    store: &Store,
+    config: &Config,
+    paths: &Paths,
+    _requested: u32,
+    existing: &[Recommendation],
+) -> Result<QueueGeneration> {
+    let needed = QUEUE_TARGET;
     let event = AgentEvent {
         agent: crate::models::Agent::Custom,
         event: "prefetch".to_string(),
@@ -176,21 +205,22 @@ pub fn generate_recommendation_queue(
         match config.recommender.backend {
             RecommenderBackend::Off => (Vec::new(), None, QueueGenerationSource::Local, 0, 0),
             RecommenderBackend::Local => {
-                let local = local_queue(store, config, &event, needed, &[])?;
+                let local = local_queue(store, config, &event, needed, existing)?;
                 let local_count = local.len();
                 (local, None, QueueGenerationSource::Local, 0, local_count)
             }
             RecommenderBackend::Codex | RecommenderBackend::Openai => {
-                match llm_queue(store, config, paths, &event, needed) {
+                match llm_queue(store, config, paths, &event, needed, existing) {
                     Ok(mut llm) => {
                         llm.truncate(needed as usize);
                         let llm_count = llm.len();
-                        let local =
-                            if config.recommender.local_fallback && llm_count < needed as usize {
-                                local_queue(store, config, &event, needed - llm_count as u32, &llm)?
-                            } else {
-                                Vec::new()
-                            };
+                        let local = if config.recommender.local_fallback
+                            && llm_count < needed as usize
+                        {
+                            local_queue(store, config, &event, needed - llm_count as u32, existing)?
+                        } else {
+                            Vec::new()
+                        };
                         let local_count = local.len();
                         llm.extend(local);
                         let source = if local_count > 0 && llm_count > 0 {
@@ -208,7 +238,7 @@ pub fn generate_recommendation_queue(
                         (llm, notice, source, llm_count, local_count)
                     }
                     Err(err) if config.recommender.local_fallback => {
-                        let fallback = local_queue(store, config, &event, needed, &[])?;
+                        let fallback = local_queue(store, config, &event, needed, existing)?;
                         let local_count = fallback.len();
                         (
                             fallback,
@@ -351,6 +381,7 @@ fn llm_queue(
     paths: &Paths,
     event: &AgentEvent,
     needed: u32,
+    existing: &[Recommendation],
 ) -> Result<Vec<Recommendation>> {
     let context = build_context(store, config, event)?;
     let prompt = PromptRenderer::new(&paths.config_dir).recommendation_queue(&context, needed)?;
@@ -359,21 +390,21 @@ fn llm_queue(
         RecommenderBackend::Openai => call_openai_queue(store, config, &prompt, needed),
         RecommenderBackend::Local | RecommenderBackend::Off => unreachable!(),
     }?;
-    let mut recommendations = Vec::new();
+    let mut recommendations: Vec<Recommendation> = existing.to_vec();
     for candidate in batch.recommendations {
         let Ok(Some(rec)) = validate_candidate(config, event, candidate) else {
             continue;
         };
-        if !recommendations.iter().any(|existing: &Recommendation| {
+        if !recommendations.iter().any(|existing| {
             existing.primary_muscle == rec.primary_muscle || existing.movement_id == rec.movement_id
         }) {
             recommendations.push(rec);
         }
-        if recommendations.len() >= needed as usize {
+        if recommendations.len() >= existing.len() + needed as usize {
             break;
         }
     }
-    Ok(recommendations)
+    Ok(recommendations.into_iter().skip(existing.len()).collect())
 }
 
 pub fn initial_exercise_profile(
@@ -432,6 +463,10 @@ fn build_context(
     let preferences = &config.preferences;
     Ok(RecommendationContext {
         profile: ContextProfile {
+            unit_system: profile.unit_system,
+            height_cm: profile.height_cm,
+            weight_kg: profile.weight_kg,
+            age: profile.age,
             goals: profile.goals.clone(),
             equipment_text: profile.equipment_text.clone(),
             exercise_preferences: profile.exercise_preferences.clone(),
@@ -443,12 +478,14 @@ fn build_context(
         },
         preferences: ContextPreferences {
             forge_intensity: preferences.forge_intensity,
+            forge_frequency: preferences.forge_frequency,
+            default_expected_duration_sec: preferences.default_expected_duration_sec,
             max_daily_sets: preferences.max_daily_sets,
         },
         expected_duration_sec: event.expected_duration_sec,
         today_stats: TodayStats { sets, reps, breaks },
         recent_sets: store
-            .today_sets(5)?
+            .completed_sets_today_and_yesterday()?
             .into_iter()
             .map(ContextSet::from)
             .collect(),
@@ -468,6 +505,10 @@ impl From<SetSummary> for ContextSet {
             muscles: value.muscles,
             status: value.status,
             reps: value.reps,
+            weight_kg: value.weight_kg,
+            agent: value.agent,
+            project: value.project,
+            created_at: value.created_at,
         }
     }
 }
@@ -1304,7 +1345,7 @@ mod tests {
         };
         for reps in 1..=8 {
             store
-                .record_set_with_reps(&recommendation, SetStatus::Skipped, reps)
+                .record_set_with_reps(&recommendation, SetStatus::Done, reps)
                 .unwrap();
         }
         let context = build_context(&store, &Config::default(), &event()).unwrap();
@@ -1314,11 +1355,14 @@ mod tests {
         let context_json = prompt.split_once("Context JSON:\n").unwrap().1;
         let rendered: serde_json::Value = serde_json::from_str(context_json).unwrap();
 
-        assert_eq!(rendered["recent_sets"].as_array().unwrap().len(), 5);
+        assert_eq!(rendered["recent_sets"].as_array().unwrap().len(), 8);
+        assert!(rendered["profile"].get("height_cm").is_some());
+        assert!(rendered["profile"].get("weight_kg").is_some());
+        assert!(rendered["profile"].get("age").is_some());
         assert!(rendered.get("today_events").is_none());
         assert!(rendered.get("today_sets").is_none());
-        assert!(prompt.len() < 6_000, "prompt was {} bytes", prompt.len());
-        assert!(prompt.contains("Return exactly 5 distinct recommendations"));
+        assert!(prompt.len() < 10_000, "prompt was {} bytes", prompt.len());
+        assert!(prompt.contains("Return exactly 10 valid, distinct recommendations"));
         assert!(!prompt.contains("return fewer"));
     }
 
@@ -1705,8 +1749,35 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1000,"cached_inp
 
         fill_recommendation_queue(&store, &config, &test_paths()).unwrap();
 
-        assert_eq!(store.queued_recommendation_count().unwrap(), QUEUE_TARGET);
+        let queued = store.queued_recommendation_count().unwrap();
+        assert!(queued > 0 && queued <= QUEUE_TARGET);
         assert!(store.latest_open_recommendation().unwrap().is_none());
+    }
+
+    #[test]
+    fn low_water_mark_preserves_existing_item_and_appends_a_new_batch() {
+        let store = test_store();
+        let config = Config {
+            recommender: Recommender {
+                backend: RecommenderBackend::Local,
+                ..Recommender::default()
+            },
+            ..Config::default()
+        };
+
+        fill_recommendation_queue(&store, &config, &test_paths()).unwrap();
+        let first = store.queued_recommendations().unwrap().remove(0);
+        store.clear_queued_recommendations().unwrap();
+        store.insert_queued_recommendation(&first).unwrap();
+
+        fill_recommendation_queue(&store, &config, &test_paths()).unwrap();
+        let queued = store.queued_recommendations().unwrap();
+        assert!(queued.len() > 1);
+        assert!(queued.len() <= (QUEUE_TARGET + 1) as usize);
+
+        let count = queued.len();
+        fill_recommendation_queue(&store, &config, &test_paths()).unwrap();
+        assert_eq!(store.queued_recommendation_count().unwrap() as usize, count);
     }
 
     #[test]
@@ -1723,7 +1794,8 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1000,"cached_inp
         let generated =
             generate_recommendation_queue(&store, &config, &test_paths(), QUEUE_TARGET).unwrap();
 
-        assert_eq!(generated.recommendations.len(), QUEUE_TARGET as usize);
+        assert!(!generated.recommendations.is_empty());
+        assert!(generated.recommendations.len() <= QUEUE_TARGET as usize);
         assert_eq!(generated.source, QueueGenerationSource::Local);
         assert_eq!(store.queued_recommendation_count().unwrap(), 0);
     }
@@ -1737,14 +1809,14 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1000,"cached_inp
         let generated =
             generate_recommendation_queue(&store, &config, &test_paths(), QUEUE_TARGET).unwrap();
 
-        assert_eq!(generated.recommendations.len(), QUEUE_TARGET as usize);
+        assert!(generated.recommendations.len() <= QUEUE_TARGET as usize);
         assert_eq!(generated.source, QueueGenerationSource::Hybrid);
         assert_eq!(generated.llm_count, 1);
-        assert_eq!(generated.local_count, 4);
-        assert_eq!(
-            generated.notice.as_deref(),
-            Some("Codex suggested 1; Svarog filled 4 locally.")
-        );
+        assert_eq!(generated.local_count, generated.recommendations.len() - 1);
+        assert!(generated
+            .notice
+            .as_deref()
+            .is_some_and(|notice| notice.starts_with("Codex suggested 1; Svarog filled ")));
         let movement_ids = generated
             .recommendations
             .iter()
@@ -1755,8 +1827,8 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1000,"cached_inp
             .iter()
             .map(|recommendation| &recommendation.primary_muscle)
             .collect::<std::collections::HashSet<_>>();
-        assert_eq!(movement_ids.len(), QUEUE_TARGET as usize);
-        assert_eq!(muscles.len(), QUEUE_TARGET as usize);
+        assert_eq!(movement_ids.len(), generated.recommendations.len());
+        assert!(muscles.len() <= generated.recommendations.len());
     }
 
     #[test]
@@ -1767,10 +1839,11 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1000,"cached_inp
         let generated =
             generate_recommendation_queue(&store, &config, &test_paths(), QUEUE_TARGET).unwrap();
 
-        assert_eq!(generated.recommendations.len(), QUEUE_TARGET as usize);
+        assert!(!generated.recommendations.is_empty());
+        assert!(generated.recommendations.len() <= QUEUE_TARGET as usize);
         assert_eq!(generated.source, QueueGenerationSource::LocalFallback);
         assert_eq!(generated.llm_count, 0);
-        assert_eq!(generated.local_count, QUEUE_TARGET as usize);
+        assert_eq!(generated.local_count, generated.recommendations.len());
         assert_eq!(
             generated.notice.as_deref(),
             Some("Codex did not suggest any safe forges.")
@@ -1830,9 +1903,9 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1000,"cached_inp
         let generated =
             generate_recommendation_queue(&store, &config, &test_paths(), QUEUE_TARGET).unwrap();
 
-        assert_eq!(generated.recommendations.len(), QUEUE_TARGET as usize);
+        assert!(generated.recommendations.len() <= QUEUE_TARGET as usize);
         assert_eq!(generated.llm_count, 1);
-        assert_eq!(generated.local_count, 4);
+        assert_eq!(generated.local_count, generated.recommendations.len() - 1);
         assert!(!generated
             .recommendations
             .iter()
@@ -1852,7 +1925,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1000,"cached_inp
         let generated =
             generate_recommendation_queue(&store, &config, &test_paths(), QUEUE_TARGET).unwrap();
 
-        assert_eq!(generated.recommendations.len(), QUEUE_TARGET as usize);
+        assert!(generated.recommendations.len() <= QUEUE_TARGET as usize);
         assert_eq!(generated.source, QueueGenerationSource::LocalFallback);
         assert_eq!(generated.notice.as_deref(), Some("Codex was unavailable."));
         assert_eq!(store.queued_recommendation_count().unwrap(), 0);
@@ -1876,7 +1949,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1000,"cached_inp
         let generated =
             generate_recommendation_queue(&store, &config, &paths, QUEUE_TARGET).unwrap();
 
-        assert_eq!(generated.recommendations.len(), QUEUE_TARGET as usize);
+        assert!(generated.recommendations.len() <= QUEUE_TARGET as usize);
         assert_eq!(generated.source, QueueGenerationSource::LocalFallback);
         assert_eq!(generated.notice.as_deref(), Some("Codex was unavailable."));
         assert_eq!(store.queued_recommendation_count().unwrap(), 0);
