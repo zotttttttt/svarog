@@ -879,7 +879,7 @@ fn next_forge_lines(
                 "{}. {} {}",
                 index + 1,
                 recommendation.reps,
-                recommendation.movement_name
+                recommendation.display_name()
             );
             if let Some(weight) = recommendation.weight_kg {
                 label.push_str(&format!(" · {}", weight_label(weight)));
@@ -1067,7 +1067,7 @@ fn forge_lines(rec: &Recommendation, ui: &TuiState) -> Vec<Line<'static>> {
         title_line(ui.demo),
         Line::from(""),
         Line::from(Span::styled(
-            rec.movement_name.to_uppercase(),
+            rec.display_name().to_uppercase(),
             accent_bold(),
         )),
     ];
@@ -1212,6 +1212,7 @@ mod tests {
             estimated_seconds: 60,
             agent: Agent::Codex,
             project: None,
+            side: None,
             created_at: Utc::now(),
         }
     }

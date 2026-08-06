@@ -87,6 +87,7 @@ pub fn recommend(
         estimated_seconds: movement.estimated_seconds,
         agent: event.agent,
         project: event.project.clone(),
+        side: None,
         created_at: Utc::now(),
     }))
 }
@@ -265,6 +266,7 @@ mod tests {
             estimated_seconds: 30,
             status: MovementStatus::Allowed,
             mobility: false,
+            sidedness: crate::models::MovementSidedness::Bilateral,
         };
         let equipment_text = "12 kg kettlebell 2x8 kg dumbbells and a medical ball";
 

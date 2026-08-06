@@ -6,6 +6,8 @@ Rules:
 - Build a conservative whitelist from every relevant onboarding answer.
 - Prefer movements the user would comfortably do during a short break from work.
 - Respect the user's equipment, work setup, arm availability, injuries, and cautious body parts.
+- Represent every safe equipment category available near the desk, including weighted equipment when listed.
+- Mark a movement as unilateral only when it is intentionally performed on one side at a time; otherwise mark it bilateral.
 - Never include failure training, medical treatment, or movements that require guessing.
 - Keep each movement brief: 10 to 120 seconds.
 - Use status "allowed" for good starter movements, "caution" for possible later movements, and "blocked" for movements to avoid.
@@ -14,3 +16,6 @@ Rules:
 
 User config JSON:
 {{ config | tojson }}
+
+Normalized equipment capabilities:
+{{ config.available_equipment | default([]) | tojson }}

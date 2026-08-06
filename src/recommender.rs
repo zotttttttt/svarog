@@ -1,7 +1,7 @@
 use crate::config::{Config, Paths, Profile, RecommenderBackend, UnitSystem};
 use crate::models::{
-    AgentEvent, Movement, MovementStatus, Recommendation, RecommenderTokenProvider,
-    RecommenderTokenUsage,
+    AgentEvent, Movement, MovementSidedness, MovementStatus, Recommendation, RecommendationSide,
+    RecommenderTokenProvider, RecommenderTokenUsage,
 };
 use crate::prompt_templates::PromptRenderer;
 use crate::storage::{SetSummary, Store, MUSCLE_COOLDOWN_MINUTES};
@@ -51,6 +51,7 @@ struct RecommendationContext {
 struct ExerciseProfileContext<'a> {
     profile: &'a Profile,
     preferences: ExerciseProfilePreferences,
+    available_equipment: Vec<EquipmentCapability>,
 }
 
 #[derive(Debug, Serialize)]
@@ -68,6 +69,7 @@ struct ContextProfile {
     age: Option<u32>,
     goals: Vec<String>,
     equipment_text: String,
+    available_equipment: Vec<EquipmentCapability>,
     exercise_preferences: String,
     work_setup: String,
     one_hand_available: bool,
@@ -91,9 +93,14 @@ struct ContextSet {
     status: String,
     reps: u32,
     weight_kg: Option<f32>,
-    agent: String,
-    project: Option<String>,
+    side: Option<RecommendationSide>,
     created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct EquipmentCapability {
+    kind: String,
+    weights_kg: Vec<f32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -123,6 +130,8 @@ struct LlmRecommendation {
     equipment_used: Option<String>,
     safety_notes: Option<String>,
     rationale: Option<String>,
+    #[serde(default)]
+    side: Option<RecommendationSide>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -145,6 +154,8 @@ struct LlmExerciseMovement {
     estimated_seconds: u32,
     status: MovementStatus,
     mobility: bool,
+    #[serde(default)]
+    sidedness: MovementSidedness,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -253,6 +264,7 @@ fn generate_recommendation_queue_with_existing(
             }
         };
 
+    recommendations = schedule_equipment_batch(config, store.movements()?, recommendations);
     recommendations.truncate(needed as usize);
     Ok(QueueGeneration {
         recommendations,
@@ -366,6 +378,7 @@ fn local_queue(
             estimated_seconds: movement.estimated_seconds,
             agent: event.agent,
             project: event.project.clone(),
+            side: None,
             created_at: Utc::now(),
         });
         if recommendations.len() >= needed as usize {
@@ -390,14 +403,22 @@ fn llm_queue(
         RecommenderBackend::Openai => call_openai_queue(store, config, &prompt, needed),
         RecommenderBackend::Local | RecommenderBackend::Off => unreachable!(),
     }?;
+    let movements = store.movements()?;
     let mut recommendations: Vec<Recommendation> = existing.to_vec();
     for candidate in batch.recommendations {
-        let Ok(Some(rec)) = validate_candidate(config, event, candidate) else {
+        let Ok(Some(rec)) = validate_candidate(config, event, candidate, &movements) else {
             continue;
         };
-        if !recommendations.iter().any(|existing| {
-            existing.primary_muscle == rec.primary_muscle || existing.movement_id == rec.movement_id
-        }) {
+        let repeats_movement = recommendations.iter().any(|existing| {
+            existing.movement_id == rec.movement_id && !is_opposite_side_pair(existing, &rec)
+        });
+        let repeats_muscle = recommendations.iter().any(|existing| {
+            existing.primary_muscle == rec.primary_muscle
+                && !recommendations
+                    .last()
+                    .is_some_and(|last| is_opposite_side_pair(last, &rec))
+        });
+        if !repeats_movement && !repeats_muscle {
             recommendations.push(rec);
         }
         if recommendations.len() >= existing.len() + needed as usize {
@@ -405,6 +426,93 @@ fn llm_queue(
         }
     }
     Ok(recommendations.into_iter().skip(existing.len()).collect())
+}
+
+fn is_opposite_side_pair(left: &Recommendation, right: &Recommendation) -> bool {
+    left.movement_id == right.movement_id
+        && matches!(
+            (left.side, right.side),
+            (
+                Some(RecommendationSide::Left),
+                Some(RecommendationSide::Right)
+            ) | (
+                Some(RecommendationSide::Right),
+                Some(RecommendationSide::Left)
+            )
+        )
+}
+
+fn schedule_equipment_batch(
+    config: &Config,
+    movements: Vec<Movement>,
+    recommendations: Vec<Recommendation>,
+) -> Vec<Recommendation> {
+    let movement_by_id = movements
+        .into_iter()
+        .map(|movement| (movement.id.clone(), movement))
+        .collect::<std::collections::HashMap<_, _>>();
+    let is_equipment = |recommendation: &Recommendation| {
+        movement_by_id
+            .get(&recommendation.movement_id)
+            .is_some_and(|movement| {
+                movement
+                    .equipment
+                    .iter()
+                    .any(|equipment| equipment != "bodyweight")
+                    && equipment_available(&config.profile.equipment_text, movement)
+            })
+    };
+    let equipment_count = recommendations
+        .iter()
+        .filter(|rec| is_equipment(rec))
+        .count();
+    if equipment_count < 5 {
+        return recommendations;
+    }
+
+    let mut equipment = recommendations
+        .iter()
+        .filter(|rec| is_equipment(rec))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut other = recommendations
+        .iter()
+        .filter(|rec| !is_equipment(rec))
+        .cloned()
+        .collect::<Vec<_>>();
+    let unilateral = equipment.iter().any(|rec| {
+        movement_by_id
+            .get(&rec.movement_id)
+            .is_some_and(|movement| movement.sidedness == MovementSidedness::Unilateral)
+    });
+
+    if unilateral {
+        equipment.sort_by_key(|rec| {
+            (
+                rec.movement_id.clone(),
+                matches!(rec.side, Some(RecommendationSide::Left)),
+            )
+        });
+        let equipment = equipment.into_iter().take(8).collect::<Vec<_>>();
+        other.truncate(recommendations.len().saturating_sub(equipment.len()));
+        other.extend(equipment);
+        other
+    } else {
+        let mut scheduled = Vec::with_capacity(recommendations.len());
+        let mut equipment_iter = equipment.into_iter();
+        let mut other_iter = other.into_iter();
+        for index in 0..recommendations.len() {
+            let item = if index % 2 == 1 {
+                equipment_iter.next().or_else(|| other_iter.next())
+            } else {
+                other_iter.next().or_else(|| equipment_iter.next())
+            };
+            if let Some(item) = item {
+                scheduled.push(item);
+            }
+        }
+        scheduled
+    }
 }
 
 pub fn initial_exercise_profile(
@@ -449,7 +557,72 @@ fn exercise_profile_context(config: &Config) -> ExerciseProfileContext<'_> {
             default_expected_duration_sec: config.preferences.default_expected_duration_sec,
             max_daily_sets: config.preferences.max_daily_sets,
         },
+        available_equipment: normalize_equipment(&config.profile.equipment_text),
     }
+}
+
+fn normalize_equipment(text: &str) -> Vec<EquipmentCapability> {
+    let normalized = text.to_lowercase();
+    let weights = extract_weight_values_kg(&normalized);
+    let mut capabilities = Vec::new();
+    for (kind, matches) in [
+        ("kettlebell", ["kettlebell", "kettle bell"].as_slice()),
+        ("dumbbell", ["dumbbell", "dumb bell"].as_slice()),
+        ("band", ["band", "resistance band"].as_slice()),
+        (
+            "medicine_ball",
+            ["medicine ball", "medical ball", "medicine_ball"].as_slice(),
+        ),
+    ] {
+        if matches.iter().any(|needle| normalized.contains(needle)) {
+            capabilities.push(EquipmentCapability {
+                kind: kind.to_string(),
+                weights_kg: if kind == "kettlebell" || kind == "dumbbell" {
+                    weights.clone()
+                } else {
+                    Vec::new()
+                },
+            });
+        }
+    }
+    capabilities.push(EquipmentCapability {
+        kind: "bodyweight".to_string(),
+        weights_kg: Vec::new(),
+    });
+    capabilities
+}
+
+fn extract_weight_values_kg(text: &str) -> Vec<f32> {
+    let mut weights = Vec::new();
+    let mut previous_number = None;
+    for token in text
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '.'))
+        .filter(|token| !token.is_empty())
+    {
+        if let Ok(value) = token.parse::<f32>() {
+            previous_number = Some(value);
+        } else if let Some((_, value)) = token.rsplit_once('x') {
+            if let Ok(value) = value.parse::<f32>() {
+                previous_number = Some(value);
+            }
+        } else if matches!(token, "kg" | "kgs" | "kilogram" | "kilograms") {
+            if let Some(value) = previous_number.take() {
+                weights.push(value);
+            }
+        }
+    }
+    weights
+}
+
+fn equipment_available(equipment_text: &str, movement: &Movement) -> bool {
+    let capabilities = normalize_equipment(equipment_text);
+    movement.equipment.iter().any(|equipment| {
+        let kind = equipment.replace(' ', "_");
+        capabilities.iter().any(|capability| {
+            capability.kind == kind
+                || (kind == "medicine_ball" && capability.kind == "medicine_ball")
+        })
+    })
 }
 
 fn build_context(
@@ -469,6 +642,7 @@ fn build_context(
             age: profile.age,
             goals: profile.goals.clone(),
             equipment_text: profile.equipment_text.clone(),
+            available_equipment: normalize_equipment(&profile.equipment_text),
             exercise_preferences: profile.exercise_preferences.clone(),
             work_setup: profile.work_setup.clone(),
             one_hand_available: profile.one_hand_available,
@@ -506,8 +680,7 @@ impl From<SetSummary> for ContextSet {
             status: value.status,
             reps: value.reps,
             weight_kg: value.weight_kg,
-            agent: value.agent,
-            project: value.project,
+            side: value.side,
             created_at: value.created_at,
         }
     }
@@ -836,6 +1009,7 @@ fn recommendation_schema() -> serde_json::Value {
         "required": [
             "action", "movement_name", "reps", "sets", "weight_text", "duration_sec",
             "primary_muscle", "muscles", "equipment_used", "safety_notes", "rationale"
+            , "side"
         ],
         "properties": {
             "action": { "type": "string", "enum": ["recommend", "no_recommendation"] },
@@ -852,6 +1026,7 @@ fn recommendation_schema() -> serde_json::Value {
             "equipment_used": { "type": ["string", "null"] },
             "safety_notes": { "type": ["string", "null"] },
             "rationale": { "type": ["string", "null"] }
+            , "side": { "type": ["string", "null"], "enum": ["left", "right", "bilateral", null] }
         }
     })
 }
@@ -913,7 +1088,7 @@ fn exercise_profile_schema() -> serde_json::Value {
                     "additionalProperties": false,
                     "required": [
                         "name", "primary_muscle", "muscles", "equipment", "base_reps",
-                        "estimated_seconds", "status", "mobility"
+                        "estimated_seconds", "status", "mobility", "sidedness"
                     ],
                     "properties": {
                         "name": { "type": "string" },
@@ -934,6 +1109,7 @@ fn exercise_profile_schema() -> serde_json::Value {
                         "estimated_seconds": { "type": "integer", "minimum": 10, "maximum": 120 },
                         "status": { "type": "string", "enum": ["allowed", "caution", "blocked"] },
                         "mobility": { "type": "boolean" }
+                        , "sidedness": { "type": "string", "enum": ["bilateral", "unilateral"] }
                     }
                 }
             }
@@ -1005,6 +1181,7 @@ fn validate_exercise_movement(config: &Config, movement: LlmExerciseMovement) ->
         estimated_seconds: movement.estimated_seconds,
         status,
         mobility: movement.mobility,
+        sidedness: movement.sidedness,
     })
 }
 
@@ -1049,6 +1226,7 @@ fn validate_candidate(
     config: &Config,
     event: &AgentEvent,
     candidate: LlmRecommendation,
+    movements: &[Movement],
 ) -> Result<Option<Recommendation>> {
     if candidate.action == LlmAction::NoRecommendation {
         return Ok(None);
@@ -1073,6 +1251,34 @@ fn validate_candidate(
     if conflicts_with_limitations(config, &primary_muscle, &muscles) {
         bail!("LLM recommendation conflicts with limitations");
     }
+    let movement = movements
+        .iter()
+        .find(|movement| {
+            movement.id == slugify(&movement_name)
+                || slugify(&movement.name) == slugify(&movement_name)
+        })
+        .ok_or_else(|| anyhow!("LLM recommendation is not in the movement catalog"))?;
+    if !equipment_available(&config.profile.equipment_text, movement) {
+        bail!("LLM recommendation requires unavailable equipment");
+    }
+    if let Some(equipment_used) = candidate.equipment_used.as_deref() {
+        let equipment_used = equipment_used.to_lowercase().replace(' ', "_");
+        if !movement.equipment.iter().any(|equipment| {
+            equipment_used.contains(equipment) || equipment.contains(&equipment_used)
+        }) {
+            bail!("LLM recommendation uses equipment not listed for the movement");
+        }
+    }
+    if movement.sidedness == MovementSidedness::Unilateral && candidate.side.is_none() {
+        bail!("unilateral movement is missing a side");
+    }
+    if movement.sidedness == MovementSidedness::Bilateral
+        && candidate
+            .side
+            .is_some_and(|side| side != RecommendationSide::Bilateral)
+    {
+        bail!("bilateral movement cannot have a single-side assignment");
+    }
     let safety_text = format!(
         "{} {}",
         candidate.safety_notes.unwrap_or_default(),
@@ -1086,14 +1292,15 @@ fn validate_candidate(
     Ok(Some(Recommendation {
         id: None,
         movement_id: slugify(&movement_name),
-        movement_name,
-        primary_muscle,
-        muscles,
+        movement_name: movement.name.clone(),
+        primary_muscle: movement.primary_muscle.clone(),
+        muscles: movement.muscles.clone(),
         reps,
         weight_kg: parse_weight_kg(candidate.weight_text.as_deref()),
         estimated_seconds: duration_sec,
         agent: event.agent,
         project: event.project.clone(),
+        side: candidate.side,
         created_at: Utc::now(),
     }))
 }
@@ -1341,6 +1548,7 @@ mod tests {
             estimated_seconds: movement.estimated_seconds,
             agent: Agent::Codex,
             project: Some("svarog".into()),
+            side: None,
             created_at: Utc::now(),
         };
         for reps in 1..=8 {
@@ -1359,11 +1567,64 @@ mod tests {
         assert!(rendered["profile"].get("height_cm").is_some());
         assert!(rendered["profile"].get("weight_kg").is_some());
         assert!(rendered["profile"].get("age").is_some());
+        assert!(rendered["recent_sets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|set| set.get("agent").is_none() && set.get("project").is_none()));
         assert!(rendered.get("today_events").is_none());
         assert!(rendered.get("today_sets").is_none());
         assert!(prompt.len() < 10_000, "prompt was {} bytes", prompt.len());
         assert!(prompt.contains("Return exactly 10 valid, distinct recommendations"));
         assert!(!prompt.contains("return fewer"));
+    }
+
+    #[test]
+    fn equipment_text_normalizes_categories_and_weights() {
+        let capabilities = normalize_equipment(
+            "12 kg kettlebell, 2x8 kg dumbbells, resistance band, and a medical ball",
+        );
+        assert!(capabilities.iter().any(|capability| {
+            capability.kind == "kettlebell" && capability.weights_kg.contains(&12.0)
+        }));
+        assert!(capabilities.iter().any(|capability| {
+            capability.kind == "dumbbell" && capability.weights_kg.contains(&8.0)
+        }));
+        assert!(capabilities
+            .iter()
+            .any(|capability| capability.kind == "band"));
+        assert!(capabilities
+            .iter()
+            .any(|capability| capability.kind == "medicine_ball"));
+    }
+
+    #[test]
+    fn validator_rejects_unavailable_catalog_equipment() {
+        let mut config = Config::default();
+        config.profile.equipment_text = "bodyweight only".into();
+        let candidate: LlmRecommendation = serde_json::from_value(json!({
+            "action": "recommend",
+            "movement_name": "seated curls",
+            "reps": 8,
+            "sets": 1,
+            "weight_text": null,
+            "duration_sec": 35,
+            "primary_muscle": "biceps",
+            "muscles": ["biceps"],
+            "equipment_used": "kettlebell",
+            "safety_notes": "Move gently.",
+            "rationale": "Fits the wait.",
+            "side": "left"
+        }))
+        .unwrap();
+        let error = validate_candidate(
+            &config,
+            &event(),
+            candidate,
+            &test_store().movements().unwrap(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unavailable equipment"));
     }
 
     #[test]
@@ -1731,8 +1992,15 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1000,"cached_inp
             equipment_used: None,
             safety_notes: Some("stop if pain appears".into()),
             rationale: Some("short movement".into()),
+            side: None,
         };
-        let err = validate_candidate(&config, &event(), candidate).unwrap_err();
+        let err = validate_candidate(
+            &config,
+            &event(),
+            candidate,
+            &test_store().movements().unwrap(),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("limitations"));
     }
 
@@ -1870,6 +2138,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1000,"cached_inp
             estimated_seconds: movement.estimated_seconds,
             agent: Agent::Codex,
             project: None,
+            side: None,
             created_at: Utc::now(),
         };
         store.insert_queued_recommendation(&completed).unwrap();

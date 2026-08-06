@@ -1,8 +1,9 @@
 use crate::config::Config;
 use crate::models::{
     Agent, AgentEvent, AppState, AppStateKind, CodexHookEvent, ForgeActivitySummary,
-    ForgeActivityTotals, Movement, MovementStatus, Recommendation, RecommenderTokenProvider,
-    RecommenderTokenUsage, RecommenderTokenUsageSummary, SetStatus, TokenUsageTotals,
+    ForgeActivityTotals, Movement, MovementSidedness, MovementStatus, Recommendation,
+    RecommendationSide, RecommenderTokenProvider, RecommenderTokenUsage,
+    RecommenderTokenUsageSummary, SetStatus, TokenUsageTotals,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Local, TimeZone, Utc};
@@ -23,6 +24,7 @@ pub struct SetSummary {
     pub weight_kg: Option<f32>,
     pub agent: String,
     pub project: Option<String>,
+    pub side: Option<RecommendationSide>,
     pub created_at: String,
 }
 
@@ -67,7 +69,8 @@ impl Store {
                 base_reps INTEGER NOT NULL,
                 estimated_seconds INTEGER NOT NULL,
                 status TEXT NOT NULL,
-                mobility INTEGER NOT NULL DEFAULT 0
+                mobility INTEGER NOT NULL DEFAULT 0,
+                sidedness TEXT NOT NULL DEFAULT 'bilateral'
             );
 
             CREATE TABLE IF NOT EXISTS users (
@@ -104,6 +107,7 @@ impl Store {
                 reps INTEGER NOT NULL,
                 weight_kg REAL,
                 estimated_seconds INTEGER NOT NULL,
+                side TEXT,
                 agent TEXT NOT NULL,
                 project TEXT,
                 status TEXT NOT NULL DEFAULT 'recommended',
@@ -118,6 +122,7 @@ impl Store {
                 status TEXT NOT NULL,
                 reps INTEGER NOT NULL,
                 weight_kg REAL,
+                side TEXT,
                 agent TEXT NOT NULL,
                 project TEXT,
                 created_at TEXT NOT NULL
@@ -162,6 +167,16 @@ impl Store {
             "ALTER TABLE sets ADD COLUMN muscles_json TEXT NOT NULL DEFAULT '[]'",
             [],
         );
+        let _ = self.conn.execute(
+            "ALTER TABLE movements ADD COLUMN sidedness TEXT NOT NULL DEFAULT 'bilateral'",
+            [],
+        );
+        let _ = self
+            .conn
+            .execute("ALTER TABLE recommendations ADD COLUMN side TEXT", []);
+        let _ = self
+            .conn
+            .execute("ALTER TABLE sets ADD COLUMN side TEXT", []);
         let _ = self.conn.execute(
             "ALTER TABLE app_state ADD COLUMN suppress_until_event_count INTEGER",
             [],
@@ -492,8 +507,8 @@ impl Store {
         self.conn.execute(
             r#"
             INSERT OR IGNORE INTO movements
-                (id, name, primary_muscle, muscles_json, equipment_json, base_reps, estimated_seconds, status, mobility)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                (id, name, primary_muscle, muscles_json, equipment_json, base_reps, estimated_seconds, status, mobility, sidedness)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
             "#,
             params![
                 &movement.id,
@@ -505,6 +520,7 @@ impl Store {
                 i64::from(movement.estimated_seconds),
                 status,
                 movement.mobility as i32,
+                sidedness_to_str(movement.sidedness),
             ],
         )?;
         Ok(())
@@ -515,8 +531,8 @@ impl Store {
         self.conn.execute(
             r#"
             INSERT INTO movements
-                (id, name, primary_muscle, muscles_json, equipment_json, base_reps, estimated_seconds, status, mobility)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                (id, name, primary_muscle, muscles_json, equipment_json, base_reps, estimated_seconds, status, mobility, sidedness)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
             ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
                 primary_muscle = excluded.primary_muscle,
@@ -531,7 +547,8 @@ impl Store {
                     ) THEN 'blocked'
                     ELSE excluded.status
                 END,
-                mobility = excluded.mobility
+                mobility = excluded.mobility,
+                sidedness = excluded.sidedness
             "#,
             params![
                 &movement.id,
@@ -543,6 +560,7 @@ impl Store {
                 i64::from(movement.estimated_seconds),
                 status,
                 movement.mobility as i32,
+                sidedness_to_str(movement.sidedness),
             ],
         )?;
         Ok(())
@@ -550,7 +568,7 @@ impl Store {
 
     pub fn movements(&self) -> Result<Vec<Movement>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, primary_muscle, muscles_json, equipment_json, base_reps, estimated_seconds, status, mobility FROM movements",
+            "SELECT id, name, primary_muscle, muscles_json, equipment_json, base_reps, estimated_seconds, status, mobility, sidedness FROM movements",
         )?;
         let rows = stmt.query_map([], |row| {
             let status: String = row.get(7)?;
@@ -566,6 +584,7 @@ impl Store {
                 estimated_seconds: row.get::<_, i64>(6)? as u32,
                 status: str_to_status(&status),
                 mobility: row.get::<_, i32>(8)? == 1,
+                sidedness: sidedness_from_str(&row.get::<_, String>(9)?),
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -598,8 +617,8 @@ impl Store {
         self.conn.execute(
             r#"
             INSERT INTO recommendations
-                (movement_id, movement_name, primary_muscle, muscles_json, reps, weight_kg, estimated_seconds, agent, project, status, created_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                (movement_id, movement_name, primary_muscle, muscles_json, reps, weight_kg, estimated_seconds, side, agent, project, status, created_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
             "#,
             params![
                 &rec.movement_id,
@@ -609,6 +628,7 @@ impl Store {
                 i64::from(rec.reps),
                 rec.weight_kg.map(f64::from),
                 i64::from(rec.estimated_seconds),
+                rec.side.map(side_to_str),
                 rec.agent.as_str(),
                 rec.project.as_deref(),
                 status,
@@ -636,7 +656,7 @@ impl Store {
         let mut statement = self.conn.prepare(
             r#"
             SELECT id, movement_id, movement_name, primary_muscle, muscles_json, reps,
-                   weight_kg, estimated_seconds, agent, project, created_at
+                   weight_kg, estimated_seconds, side, agent, project, created_at
             FROM recommendations
             WHERE status = 'queued'
             ORDER BY id ASC
@@ -669,8 +689,8 @@ impl Store {
             let mut statement = transaction.prepare(
                 r#"
                 INSERT INTO recommendations
-                    (movement_id, movement_name, primary_muscle, muscles_json, reps, weight_kg, estimated_seconds, agent, project, status, created_at)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'queued', ?10)
+                    (movement_id, movement_name, primary_muscle, muscles_json, reps, weight_kg, estimated_seconds, side, agent, project, status, created_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'queued', ?11)
                 "#,
             )?;
             for rec in recommendations {
@@ -682,6 +702,7 @@ impl Store {
                     i64::from(rec.reps),
                     rec.weight_kg.map(f64::from),
                     i64::from(rec.estimated_seconds),
+                    rec.side.map(side_to_str),
                     rec.agent.as_str(),
                     rec.project.as_deref(),
                     rec.created_at.to_rfc3339(),
@@ -753,7 +774,7 @@ impl Store {
         self.conn
             .query_row(
                 r#"
-                SELECT id, movement_id, movement_name, primary_muscle, muscles_json, reps, weight_kg, estimated_seconds, agent, project, created_at
+                SELECT id, movement_id, movement_name, primary_muscle, muscles_json, reps, weight_kg, estimated_seconds, side, agent, project, created_at
                 FROM recommendations
                 WHERE id = ?1
                 "#,
@@ -768,7 +789,7 @@ impl Store {
         self.conn
             .query_row(
                 r#"
-                SELECT id, movement_id, movement_name, primary_muscle, muscles_json, reps, weight_kg, estimated_seconds, agent, project, created_at
+                SELECT id, movement_id, movement_name, primary_muscle, muscles_json, reps, weight_kg, estimated_seconds, side, agent, project, created_at
                 FROM recommendations
                 WHERE status IN ('recommended', 'active')
                 ORDER BY id DESC
@@ -801,8 +822,8 @@ impl Store {
     ) -> Result<()> {
         self.conn.execute(
             r#"
-            INSERT INTO sets (recommendation_id, movement_id, muscles_json, status, reps, weight_kg, agent, project, created_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            INSERT INTO sets (recommendation_id, movement_id, muscles_json, status, reps, weight_kg, side, agent, project, created_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
             "#,
             params![
                 rec.id,
@@ -811,6 +832,7 @@ impl Store {
                 status.as_str(),
                 i64::from(reps),
                 rec.weight_kg.map(f64::from),
+                rec.side.map(side_to_str),
                 rec.agent.as_str(),
                 rec.project.as_deref(),
                 Utc::now().to_rfc3339(),
@@ -1109,7 +1131,7 @@ impl Store {
             .with_timezone(&Utc);
         let mut stmt = self.conn.prepare(
             r#"
-            SELECT movement_id, muscles_json, status, reps, weight_kg, agent, project, created_at
+            SELECT movement_id, muscles_json, status, reps, weight_kg, agent, project, side, created_at
             FROM sets
             WHERE status = 'done' AND created_at >= ?1 AND created_at < ?2
             ORDER BY created_at DESC, id DESC
@@ -1125,7 +1147,8 @@ impl Store {
                 weight_kg: row.get::<_, Option<f64>>(4)?.map(|value| value as f32),
                 agent: row.get(5)?,
                 project: row.get(6)?,
-                created_at: row.get(7)?,
+                side: side_from_str(row.get(7)?),
+                created_at: row.get(8)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -1158,8 +1181,9 @@ fn local_period_starts_at(now: DateTime<Local>) -> Result<(DateTime<Utc>, DateTi
 }
 
 fn recommendation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Recommendation> {
-    let agent: String = row.get(8)?;
-    let created: String = row.get(10)?;
+    let side: Option<String> = row.get(8)?;
+    let agent: String = row.get(9)?;
+    let created: String = row.get(11)?;
     Ok(Recommendation {
         id: row.get(0)?,
         movement_id: row.get(1)?,
@@ -1169,8 +1193,9 @@ fn recommendation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Recommen
         reps: row.get::<_, i64>(5)? as u32,
         weight_kg: row.get::<_, Option<f64>>(6)?.map(|value| value as f32),
         estimated_seconds: row.get::<_, i64>(7)? as u32,
+        side: side_from_str(side),
         agent: agent.parse().unwrap_or(crate::models::Agent::Custom),
-        project: row.get(9)?,
+        project: row.get(10)?,
         created_at: DateTime::parse_from_rfc3339(&created)
             .map(|dt| dt.with_timezone(&Utc))
             .unwrap_or_else(|_| Utc::now()),
@@ -1189,6 +1214,7 @@ pub fn default_movements() -> Vec<Movement> {
             estimated_seconds: 35,
             status: MovementStatus::Allowed,
             mobility: true,
+            sidedness: MovementSidedness::Bilateral,
         },
         Movement {
             id: "standing_calf_raise".into(),
@@ -1200,6 +1226,7 @@ pub fn default_movements() -> Vec<Movement> {
             estimated_seconds: 45,
             status: MovementStatus::Allowed,
             mobility: false,
+            sidedness: MovementSidedness::Bilateral,
         },
         Movement {
             id: "seated_curl".into(),
@@ -1211,6 +1238,7 @@ pub fn default_movements() -> Vec<Movement> {
             estimated_seconds: 50,
             status: MovementStatus::Caution,
             mobility: false,
+            sidedness: MovementSidedness::Unilateral,
         },
         Movement {
             id: "wall_pushup".into(),
@@ -1222,6 +1250,7 @@ pub fn default_movements() -> Vec<Movement> {
             estimated_seconds: 45,
             status: MovementStatus::Caution,
             mobility: false,
+            sidedness: MovementSidedness::Bilateral,
         },
         Movement {
             id: "short_walk".into(),
@@ -1233,6 +1262,7 @@ pub fn default_movements() -> Vec<Movement> {
             estimated_seconds: 60,
             status: MovementStatus::Allowed,
             mobility: true,
+            sidedness: MovementSidedness::Bilateral,
         },
         Movement {
             id: "wrist_extensor_reset".into(),
@@ -1244,6 +1274,7 @@ pub fn default_movements() -> Vec<Movement> {
             estimated_seconds: 35,
             status: MovementStatus::Allowed,
             mobility: true,
+            sidedness: MovementSidedness::Bilateral,
         },
         Movement {
             id: "scapular_squeeze".into(),
@@ -1255,6 +1286,7 @@ pub fn default_movements() -> Vec<Movement> {
             estimated_seconds: 40,
             status: MovementStatus::Allowed,
             mobility: false,
+            sidedness: MovementSidedness::Bilateral,
         },
         Movement {
             id: "chair_sit_to_stand".into(),
@@ -1266,6 +1298,7 @@ pub fn default_movements() -> Vec<Movement> {
             estimated_seconds: 45,
             status: MovementStatus::Caution,
             mobility: false,
+            sidedness: MovementSidedness::Bilateral,
         },
         Movement {
             id: "standing_row_band".into(),
@@ -1277,6 +1310,7 @@ pub fn default_movements() -> Vec<Movement> {
             estimated_seconds: 50,
             status: MovementStatus::Caution,
             mobility: false,
+            sidedness: MovementSidedness::Bilateral,
         },
         Movement {
             id: "farmer_hold_light".into(),
@@ -1288,6 +1322,7 @@ pub fn default_movements() -> Vec<Movement> {
             estimated_seconds: 30,
             status: MovementStatus::Caution,
             mobility: false,
+            sidedness: MovementSidedness::Unilateral,
         },
         Movement {
             id: "medicine_ball_hold".into(),
@@ -1299,6 +1334,7 @@ pub fn default_movements() -> Vec<Movement> {
             estimated_seconds: 35,
             status: MovementStatus::Caution,
             mobility: false,
+            sidedness: MovementSidedness::Bilateral,
         },
     ]
 }
@@ -1316,6 +1352,37 @@ fn str_to_status(status: &str) -> MovementStatus {
         "allowed" => MovementStatus::Allowed,
         "blocked" => MovementStatus::Blocked,
         _ => MovementStatus::Caution,
+    }
+}
+
+fn sidedness_to_str(sidedness: MovementSidedness) -> &'static str {
+    match sidedness {
+        MovementSidedness::Bilateral => "bilateral",
+        MovementSidedness::Unilateral => "unilateral",
+    }
+}
+
+fn sidedness_from_str(sidedness: &str) -> MovementSidedness {
+    match sidedness {
+        "unilateral" => MovementSidedness::Unilateral,
+        _ => MovementSidedness::Bilateral,
+    }
+}
+
+fn side_to_str(side: RecommendationSide) -> &'static str {
+    match side {
+        RecommendationSide::Left => "left",
+        RecommendationSide::Right => "right",
+        RecommendationSide::Bilateral => "bilateral",
+    }
+}
+
+fn side_from_str(side: Option<String>) -> Option<RecommendationSide> {
+    match side.as_deref() {
+        Some("left") => Some(RecommendationSide::Left),
+        Some("right") => Some(RecommendationSide::Right),
+        Some("bilateral") => Some(RecommendationSide::Bilateral),
+        _ => None,
     }
 }
 
@@ -1458,6 +1525,7 @@ mod tests {
             estimated_seconds: 60,
             agent: Agent::Codex,
             project: None,
+            side: None,
             created_at: Utc::now(),
         }
     }

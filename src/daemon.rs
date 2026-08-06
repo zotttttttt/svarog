@@ -293,7 +293,7 @@ pub fn process_event(env: &RuntimeEnv, payload: IncomingEvent) -> Result<EventRe
         notifications::notify(
             config.preferences.desktop_notifications,
             "Svarog",
-            &format!("{} {}", rec.reps, rec.movement_name),
+            &format!("{} {}", rec.reps, rec.display_name()),
         );
     }
     if store.queued_recommendation_count()? == 0 {
@@ -434,6 +434,7 @@ mod tests {
             estimated_seconds: 1,
             agent: Agent::Custom,
             project: None,
+            side: None,
             created_at: chrono::Utc::now(),
         };
         store.insert_queued_recommendation(&old).unwrap();
@@ -470,6 +471,7 @@ mod tests {
             estimated_seconds: 1,
             agent: Agent::Custom,
             project: None,
+            side: None,
             created_at: chrono::Utc::now(),
         };
         store.insert_queued_recommendation(&old).unwrap();
@@ -499,6 +501,7 @@ mod tests {
             estimated_seconds: 30,
             agent: Agent::Claude,
             project: Some("manual-project".into()),
+            side: None,
             created_at: chrono::Utc::now(),
         };
         store.insert_queued_recommendation(&rec).unwrap();
@@ -563,6 +566,7 @@ mod tests {
             estimated_seconds: 35,
             agent: Agent::Custom,
             project: None,
+            side: None,
             created_at: chrono::Utc::now(),
         };
         store.insert_queued_recommendation(&rec).unwrap();

@@ -64,6 +64,27 @@ pub enum MovementStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum MovementSidedness {
+    Bilateral,
+    Unilateral,
+}
+
+impl Default for MovementSidedness {
+    fn default() -> Self {
+        Self::Bilateral
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecommendationSide {
+    Left,
+    Right,
+    Bilateral,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AppStateKind {
     Idle,
     Recommendation,
@@ -107,6 +128,8 @@ pub struct Movement {
     pub estimated_seconds: u32,
     pub status: MovementStatus,
     pub mobility: bool,
+    #[serde(default)]
+    pub sidedness: MovementSidedness,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -230,7 +253,18 @@ pub struct Recommendation {
     pub estimated_seconds: u32,
     pub agent: Agent,
     pub project: Option<String>,
+    pub side: Option<RecommendationSide>,
     pub created_at: DateTime<Utc>,
+}
+
+impl Recommendation {
+    pub fn display_name(&self) -> String {
+        match self.side {
+            Some(RecommendationSide::Left) => format!("{} (left side)", self.movement_name),
+            Some(RecommendationSide::Right) => format!("{} (right side)", self.movement_name),
+            Some(RecommendationSide::Bilateral) | None => self.movement_name.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -126,7 +126,7 @@ pub async fn run() -> Result<()> {
                 println!("{notice}");
             }
             if let Some(rec) = response.recommendation {
-                println!("{}: {} {}", rec.agent, rec.reps, rec.movement_name);
+                println!("{}: {} {}", rec.agent, rec.reps, rec.display_name());
             } else {
                 println!("no recommendation");
             }
@@ -780,7 +780,7 @@ fn status(env: &RuntimeEnv) -> Result<()> {
         println!("Today: {sets} sets, {reps} reps, {breaks} breaks");
         println!("Queued: {}", store.queued_recommendation_count()?);
         if let Some(rec) = store.latest_open_recommendation()? {
-            println!("Current: {} {}", rec.reps, rec.movement_name);
+            println!("Current: {} {}", rec.reps, rec.display_name());
         }
         let state = store.state()?;
         println!("State: {}", state.kind.as_str());
@@ -1352,6 +1352,7 @@ mod tests {
             estimated_seconds: 35,
             agent: Agent::Codex,
             project: Some("svarog".into()),
+            side: None,
             created_at: chrono::Utc::now(),
         };
         let current_id = store.insert_recommendation(&current).unwrap();
