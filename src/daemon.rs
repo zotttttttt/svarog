@@ -1,4 +1,4 @@
-use crate::config::{load_or_default, RuntimeEnv};
+use crate::config::{load_or_default, Config, RuntimeEnv};
 use crate::engine;
 use crate::models::{Agent, AppStateKind, CodexHookEvent, IncomingEvent, Recommendation};
 use crate::notifications;
@@ -243,7 +243,7 @@ pub fn process_event(env: &RuntimeEnv, payload: IncomingEvent) -> Result<EventRe
     let paths = &env.paths;
     let config = load_or_default(paths)?;
     let store = Store::open(&paths.database_file)?;
-    store.seed_movements()?;
+    ensure_exercise_pool(&store, &config)?;
     let event = payload.into_event_with_default(config.preferences.default_expected_duration_sec);
     store.insert_event(&event)?;
     if store.fatigue_suppression_active()? {
@@ -319,8 +319,19 @@ pub fn refill_queue_best_effort(env: &RuntimeEnv) {
         let Ok(store) = Store::open(&env.paths.database_file) else {
             return;
         };
-        let _ = store.seed_movements();
+        let _ = ensure_exercise_pool(&store, &config);
         let _ = recommender::fill_recommendation_queue(&store, &config, &env.paths);
+    });
+}
+
+pub fn regenerate_queue_best_effort(env: &RuntimeEnv) {
+    if !begin_queue_job(&REFILL_IN_PROGRESS) {
+        return;
+    }
+    let env = env.clone();
+    std::thread::spawn(move || {
+        let _guard = RefillGuard;
+        let _ = regenerate_queue_now(&env);
     });
 }
 
@@ -359,7 +370,7 @@ fn begin_queue_job(flag: &AtomicBool) -> bool {
 fn regenerate_queue_now(env: &RuntimeEnv) -> Result<QueueRegenerationOutcome> {
     let config = load_or_default(&env.paths)?;
     let mut store = Store::open(&env.paths.database_file)?;
-    store.seed_movements()?;
+    ensure_exercise_pool(&store, &config)?;
     let generated = recommender::generate_recommendation_queue(
         &store,
         &config,
@@ -376,6 +387,16 @@ fn regenerate_queue_now(env: &RuntimeEnv) -> Result<QueueRegenerationOutcome> {
         llm_count: generated.llm_count,
         local_count: generated.local_count,
     })
+}
+
+fn ensure_exercise_pool(store: &Store, config: &Config) -> Result<()> {
+    if store.exercise_catalog_is_current()? {
+        return Ok(());
+    }
+    let equipment =
+        crate::exercise_catalog::locally_resolved_equipment(&config.profile.equipment_text);
+    let movements = crate::exercise_catalog::movements_for_equipment(&equipment);
+    store.replace_movement_pool(&movements)
 }
 
 #[cfg(test)]
@@ -425,7 +446,7 @@ mod tests {
         let store = Store::open(&env.paths.database_file).unwrap();
         let mut old = Recommendation {
             id: None,
-            movement_id: "old".into(),
+            movement_id: "Dead_Bug".into(),
             movement_name: "old queued forge".into(),
             primary_muscle: "old".into(),
             muscles: vec!["old".into()],
@@ -462,7 +483,7 @@ mod tests {
         let store = Store::open(&env.paths.database_file).unwrap();
         let old = Recommendation {
             id: None,
-            movement_id: "old".into(),
+            movement_id: "Dead_Bug".into(),
             movement_name: "old queued forge".into(),
             primary_muscle: "old".into(),
             muscles: vec!["old".into()],

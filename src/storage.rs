@@ -135,6 +135,18 @@ impl Store {
                 created_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS exercise_catalog_state (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                catalog_revision TEXT NOT NULL,
+                equipment_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS exercise_exclusions (
+                exercise_id TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS app_state (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 kind TEXT NOT NULL,
@@ -250,6 +262,8 @@ impl Store {
             DELETE FROM turns;
             DELETE FROM sessions;
             DELETE FROM pain_events;
+            DELETE FROM exercise_exclusions;
+            DELETE FROM exercise_catalog_state;
             DELETE FROM recommender_token_usage;
             DELETE FROM users;
             DELETE FROM movements;
@@ -496,34 +510,171 @@ impl Store {
     }
 
     pub fn seed_movements(&self) -> Result<()> {
-        for movement in default_movements() {
-            self.insert_default_movement(&movement)?;
+        let existing: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM movements", [], |row| row.get(0))?;
+        if existing > 0 {
+            return Ok(());
         }
+        let equipment = vec!["bodyweight".to_string()];
+        self.replace_movement_pool(&crate::exercise_catalog::movements_for_equipment(
+            &equipment,
+        ))
+    }
+
+    pub fn replace_movement_pool(&self, movements: &[Movement]) -> Result<()> {
+        let transaction = self
+            .conn
+            .unchecked_transaction()
+            .context("starting exercise-pool replacement")?;
+        transaction.execute("DELETE FROM movements", [])?;
+        {
+            let mut statement = transaction.prepare(
+                r#"
+                INSERT INTO movements
+                    (id, name, primary_muscle, muscles_json, equipment_json, base_reps, estimated_seconds, status, mobility, sidedness)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7,
+                    CASE WHEN EXISTS (SELECT 1 FROM pain_events WHERE movement_id = ?1)
+                         THEN 'blocked' ELSE ?8 END,
+                    ?9, ?10)
+                "#,
+            )?;
+            for movement in movements {
+                statement.execute(params![
+                    &movement.id,
+                    &movement.name,
+                    &movement.primary_muscle,
+                    serde_json::to_string(&movement.muscles)?,
+                    serde_json::to_string(&movement.equipment)?,
+                    i64::from(movement.base_reps),
+                    i64::from(movement.estimated_seconds),
+                    status_to_str(movement.status),
+                    movement.mobility as i32,
+                    sidedness_to_str(movement.sidedness),
+                ])?;
+            }
+        }
+        let equipment = movements
+            .iter()
+            .flat_map(|movement| movement.equipment.iter().cloned())
+            .collect::<std::collections::BTreeSet<_>>();
+        let equipment = equipment
+            .into_iter()
+            .map(|kind| serde_json::json!({ "kind": kind, "weights_kg": [] }))
+            .collect::<Vec<_>>();
+        transaction.execute(
+            r#"
+            INSERT INTO exercise_catalog_state (id, catalog_revision, equipment_json, updated_at)
+            VALUES (1, ?1, ?2, ?3)
+            ON CONFLICT(id) DO UPDATE SET
+                catalog_revision = excluded.catalog_revision,
+                updated_at = excluded.updated_at
+            "#,
+            params![
+                crate::exercise_catalog::CATALOG_REVISION,
+                serde_json::to_string(&equipment)?,
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        transaction.execute(
+            r#"
+            UPDATE recommendations
+            SET status = 'retired'
+            WHERE status IN ('queued', 'recommended', 'active')
+              AND movement_id NOT IN (SELECT id FROM movements)
+            "#,
+            [],
+        )?;
+        transaction.execute(
+            r#"
+            UPDATE app_state
+            SET kind = 'idle', current_recommendation_id = NULL,
+                cooldown_muscle = NULL, cooldown_until = NULL, updated_at = ?1
+            WHERE current_recommendation_id IN (
+                SELECT id FROM recommendations WHERE status = 'retired'
+            )
+            "#,
+            [Utc::now().to_rfc3339()],
+        )?;
+        transaction
+            .commit()
+            .context("committing exercise-pool replacement")
+    }
+
+    pub fn clear_exercise_exclusions(&self) -> Result<()> {
+        self.conn.execute("DELETE FROM exercise_exclusions", [])?;
         Ok(())
     }
 
-    fn insert_default_movement(&self, movement: &Movement) -> Result<()> {
-        let status = status_to_str(movement.status);
+    pub fn exercise_catalog_is_current(&self) -> Result<bool> {
+        let revision = self
+            .conn
+            .query_row(
+                "SELECT catalog_revision FROM exercise_catalog_state WHERE id = 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(revision.as_deref() == Some(crate::exercise_catalog::CATALOG_REVISION))
+    }
+
+    pub fn save_exercise_filter<T: serde::Serialize>(&self, filter: &T) -> Result<()> {
         self.conn.execute(
             r#"
-            INSERT OR IGNORE INTO movements
-                (id, name, primary_muscle, muscles_json, equipment_json, base_reps, estimated_seconds, status, mobility, sidedness)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            INSERT INTO exercise_catalog_state (id, catalog_revision, equipment_json, updated_at)
+            VALUES (1, 'pending', ?1, ?2)
+            ON CONFLICT(id) DO UPDATE SET
+                catalog_revision = 'pending',
+                equipment_json = excluded.equipment_json,
+                updated_at = excluded.updated_at
             "#,
-            params![
-                &movement.id,
-                &movement.name,
-                &movement.primary_muscle,
-                serde_json::to_string(&movement.muscles)?,
-                serde_json::to_string(&movement.equipment)?,
-                i64::from(movement.base_reps),
-                i64::from(movement.estimated_seconds),
-                status,
-                movement.mobility as i32,
-                sidedness_to_str(movement.sidedness),
-            ],
+            params![serde_json::to_string(filter)?, Utc::now().to_rfc3339(),],
         )?;
         Ok(())
+    }
+
+    pub fn exercise_filter<T: serde::de::DeserializeOwned>(&self) -> Result<Option<T>> {
+        let json = self
+            .conn
+            .query_row(
+                "SELECT equipment_json FROM exercise_catalog_state WHERE id = 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        json.map(|json| serde_json::from_str(&json).context("parsing stored exercise filter"))
+            .transpose()
+    }
+
+    pub fn exclude_exercise(&self, exercise_id: &str) -> Result<()> {
+        if crate::exercise_catalog::find(exercise_id).is_none() {
+            anyhow::bail!("unknown canonical exercise id: {exercise_id}");
+        }
+        self.conn.execute(
+            "INSERT OR REPLACE INTO exercise_exclusions (exercise_id, created_at) VALUES (?1, ?2)",
+            params![exercise_id, Utc::now().to_rfc3339()],
+        )?;
+        self.conn.execute(
+            "UPDATE recommendations SET status = 'retired' WHERE movement_id = ?1 AND status = 'queued'",
+            [exercise_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn removed_exercise_ids(&self) -> Result<Vec<String>> {
+        let mut statement = self.conn.prepare(
+            "SELECT exercise_id FROM exercise_exclusions ORDER BY created_at, exercise_id",
+        )?;
+        let rows = statement.query_map([], |row| row.get(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("loading removed exercises")
+    }
+
+    pub fn restore_exercise(&self, exercise_id: &str) -> Result<bool> {
+        Ok(self.conn.execute(
+            "DELETE FROM exercise_exclusions WHERE exercise_id = ?1",
+            [exercise_id],
+        )? > 0)
     }
 
     pub fn upsert_movement(&self, movement: &Movement) -> Result<()> {
@@ -568,7 +719,12 @@ impl Store {
 
     pub fn movements(&self) -> Result<Vec<Movement>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, primary_muscle, muscles_json, equipment_json, base_reps, estimated_seconds, status, mobility, sidedness FROM movements",
+            r#"
+            SELECT id, name, primary_muscle, muscles_json, equipment_json,
+                   base_reps, estimated_seconds, status, mobility, sidedness
+            FROM movements
+            WHERE id NOT IN (SELECT exercise_id FROM exercise_exclusions)
+            "#,
         )?;
         let rows = stmt.query_map([], |row| {
             let status: String = row.get(7)?;
@@ -1202,143 +1358,6 @@ fn recommendation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Recommen
     })
 }
 
-pub fn default_movements() -> Vec<Movement> {
-    vec![
-        Movement {
-            id: "desk_posture_reset".into(),
-            name: "desk posture reset".into(),
-            primary_muscle: "mobility".into(),
-            muscles: vec!["neck".into(), "upper_back".into()],
-            equipment: vec!["bodyweight".into()],
-            base_reps: 4,
-            estimated_seconds: 35,
-            status: MovementStatus::Allowed,
-            mobility: true,
-            sidedness: MovementSidedness::Bilateral,
-        },
-        Movement {
-            id: "standing_calf_raise".into(),
-            name: "standing calf raises".into(),
-            primary_muscle: "calves".into(),
-            muscles: vec!["calves".into()],
-            equipment: vec!["bodyweight".into()],
-            base_reps: 10,
-            estimated_seconds: 45,
-            status: MovementStatus::Allowed,
-            mobility: false,
-            sidedness: MovementSidedness::Bilateral,
-        },
-        Movement {
-            id: "seated_curl".into(),
-            name: "seated curls".into(),
-            primary_muscle: "biceps".into(),
-            muscles: vec!["biceps".into(), "grip".into()],
-            equipment: vec!["dumbbell".into(), "kettlebell".into()],
-            base_reps: 8,
-            estimated_seconds: 50,
-            status: MovementStatus::Caution,
-            mobility: false,
-            sidedness: MovementSidedness::Unilateral,
-        },
-        Movement {
-            id: "wall_pushup".into(),
-            name: "wall pushups".into(),
-            primary_muscle: "chest".into(),
-            muscles: vec!["chest".into(), "triceps".into()],
-            equipment: vec!["bodyweight".into()],
-            base_reps: 8,
-            estimated_seconds: 45,
-            status: MovementStatus::Caution,
-            mobility: false,
-            sidedness: MovementSidedness::Bilateral,
-        },
-        Movement {
-            id: "short_walk".into(),
-            name: "short walk".into(),
-            primary_muscle: "circulation".into(),
-            muscles: vec!["legs".into()],
-            equipment: vec!["bodyweight".into()],
-            base_reps: 1,
-            estimated_seconds: 60,
-            status: MovementStatus::Allowed,
-            mobility: true,
-            sidedness: MovementSidedness::Bilateral,
-        },
-        Movement {
-            id: "wrist_extensor_reset".into(),
-            name: "wrist extensor reset".into(),
-            primary_muscle: "mobility".into(),
-            muscles: vec!["forearms".into(), "wrists".into()],
-            equipment: vec!["bodyweight".into()],
-            base_reps: 5,
-            estimated_seconds: 35,
-            status: MovementStatus::Allowed,
-            mobility: true,
-            sidedness: MovementSidedness::Bilateral,
-        },
-        Movement {
-            id: "scapular_squeeze".into(),
-            name: "scapular squeezes".into(),
-            primary_muscle: "upper_back".into(),
-            muscles: vec!["upper_back".into(), "shoulders".into()],
-            equipment: vec!["bodyweight".into()],
-            base_reps: 8,
-            estimated_seconds: 40,
-            status: MovementStatus::Allowed,
-            mobility: false,
-            sidedness: MovementSidedness::Bilateral,
-        },
-        Movement {
-            id: "chair_sit_to_stand".into(),
-            name: "chair sit-to-stands".into(),
-            primary_muscle: "legs".into(),
-            muscles: vec!["quads".into(), "glutes".into()],
-            equipment: vec!["bodyweight".into()],
-            base_reps: 5,
-            estimated_seconds: 45,
-            status: MovementStatus::Caution,
-            mobility: false,
-            sidedness: MovementSidedness::Bilateral,
-        },
-        Movement {
-            id: "standing_row_band".into(),
-            name: "standing band rows".into(),
-            primary_muscle: "back".into(),
-            muscles: vec!["back".into(), "biceps".into()],
-            equipment: vec!["band".into()],
-            base_reps: 8,
-            estimated_seconds: 50,
-            status: MovementStatus::Caution,
-            mobility: false,
-            sidedness: MovementSidedness::Bilateral,
-        },
-        Movement {
-            id: "farmer_hold_light".into(),
-            name: "light farmer hold".into(),
-            primary_muscle: "grip".into(),
-            muscles: vec!["grip".into(), "forearms".into()],
-            equipment: vec!["dumbbell".into(), "kettlebell".into()],
-            base_reps: 1,
-            estimated_seconds: 30,
-            status: MovementStatus::Caution,
-            mobility: false,
-            sidedness: MovementSidedness::Unilateral,
-        },
-        Movement {
-            id: "medicine_ball_hold".into(),
-            name: "medicine ball hold".into(),
-            primary_muscle: "core".into(),
-            muscles: vec!["core".into(), "grip".into()],
-            equipment: vec!["medicine_ball".into()],
-            base_reps: 1,
-            estimated_seconds: 35,
-            status: MovementStatus::Caution,
-            mobility: false,
-            sidedness: MovementSidedness::Bilateral,
-        },
-    ]
-}
-
 fn status_to_str(status: MovementStatus) -> &'static str {
     match status {
         MovementStatus::Allowed => "allowed",
@@ -1832,15 +1851,15 @@ mod tests {
         let store = store();
         store.seed_movements().unwrap();
         let mut rec = recommendation();
-        rec.movement_id = "seated_curl".into();
-        rec.movement_name = "seated curls".into();
+        rec.movement_id = "Bodyweight_Squat".into();
+        rec.movement_name = "Bodyweight Squat".into();
         rec.id = Some(store.insert_recommendation(&rec).unwrap());
         store.record_set(&rec, SetStatus::Pain).unwrap();
         let mut movement = store
             .movements()
             .unwrap()
             .into_iter()
-            .find(|movement| movement.id == "seated_curl")
+            .find(|movement| movement.id == "Bodyweight_Squat")
             .unwrap();
         movement.status = MovementStatus::Allowed;
 
@@ -1850,7 +1869,7 @@ mod tests {
             .movements()
             .unwrap()
             .into_iter()
-            .find(|movement| movement.id == "seated_curl")
+            .find(|movement| movement.id == "Bodyweight_Squat")
             .unwrap();
         assert_eq!(refreshed.status, MovementStatus::Blocked);
     }
@@ -2052,5 +2071,60 @@ mod tests {
         assert!(promoted.is_none());
         assert_eq!(store.queued_recommendation_count().unwrap(), 1);
         assert_eq!(store.state().unwrap().kind, AppStateKind::Cooldown);
+    }
+
+    #[test]
+    fn excluding_an_exercise_hides_it_and_retires_queued_copies() {
+        let store = store();
+        store.seed_movements().unwrap();
+        let movement = store
+            .movements()
+            .unwrap()
+            .into_iter()
+            .find(|movement| movement.id == "Dead_Bug")
+            .unwrap();
+        let mut rec = recommendation();
+        rec.movement_id = movement.id.clone();
+        rec.movement_name = movement.name;
+        rec.primary_muscle = movement.primary_muscle;
+        rec.muscles = movement.muscles;
+        store.insert_queued_recommendation(&rec).unwrap();
+
+        store.exclude_exercise("Dead_Bug").unwrap();
+
+        assert!(!store
+            .movements()
+            .unwrap()
+            .iter()
+            .any(|movement| movement.id == "Dead_Bug"));
+        assert!(store.queued_recommendations().unwrap().is_empty());
+        assert_eq!(store.removed_exercise_ids().unwrap(), vec!["Dead_Bug"]);
+        assert!(store.restore_exercise("Dead_Bug").unwrap());
+        assert!(store
+            .movements()
+            .unwrap()
+            .iter()
+            .any(|movement| movement.id == "Dead_Bug"));
+    }
+
+    #[test]
+    fn canonical_pool_migration_retires_open_legacy_items_but_keeps_history() {
+        let store = store();
+        let mut legacy = recommendation();
+        legacy.id = Some(store.insert_recommendation(&legacy).unwrap());
+        store.record_set(&legacy, SetStatus::Skipped).unwrap();
+        store
+            .mark_recommendation(legacy.id.unwrap(), "active")
+            .unwrap();
+
+        let equipment = vec!["bodyweight".to_string()];
+        store
+            .replace_movement_pool(&crate::exercise_catalog::movements_for_equipment(
+                &equipment,
+            ))
+            .unwrap();
+
+        assert!(store.latest_open_recommendation().unwrap().is_none());
+        assert_eq!(store.recent_forge_history(10).unwrap().len(), 1);
     }
 }

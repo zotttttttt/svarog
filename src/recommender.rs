@@ -1,4 +1,5 @@
 use crate::config::{Config, Paths, Profile, RecommenderBackend, UnitSystem};
+use crate::exercise_catalog::{self, ExerciseCatalogEntry};
 use crate::models::{
     AgentEvent, Movement, MovementSidedness, MovementStatus, Recommendation, RecommendationSide,
     RecommenderTokenProvider, RecommenderTokenUsage,
@@ -44,7 +45,7 @@ struct RecommendationContext {
     today_stats: TodayStats,
     recent_sets: Vec<ContextSet>,
     app_state: ContextAppState,
-    movements: Vec<Movement>,
+    movements: Vec<ExerciseCatalogEntry>,
 }
 
 #[derive(Debug, Serialize)]
@@ -97,7 +98,7 @@ struct ContextSet {
     created_at: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct EquipmentCapability {
     kind: String,
     weights_kg: Vec<f32>,
@@ -120,14 +121,11 @@ struct ContextAppState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LlmRecommendation {
     action: LlmAction,
-    movement_name: Option<String>,
+    exercise_id: Option<String>,
     reps: Option<u32>,
     sets: Option<u32>,
     weight_text: Option<String>,
     duration_sec: Option<u32>,
-    primary_muscle: Option<String>,
-    muscles: Option<Vec<String>>,
-    equipment_used: Option<String>,
     safety_notes: Option<String>,
     rationale: Option<String>,
     #[serde(default)]
@@ -141,21 +139,13 @@ struct LlmRecommendationBatch {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LlmExerciseProfile {
-    movements: Vec<LlmExerciseMovement>,
+    equipment: Vec<LlmEquipmentCapability>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct LlmExerciseMovement {
-    name: String,
-    primary_muscle: String,
-    muscles: Vec<String>,
-    equipment: Vec<String>,
-    base_reps: u32,
-    estimated_seconds: u32,
-    status: MovementStatus,
-    mobility: bool,
-    #[serde(default)]
-    sidedness: MovementSidedness,
+struct LlmEquipmentCapability {
+    kind: String,
+    weights_kg: Vec<f32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -264,7 +254,7 @@ fn generate_recommendation_queue_with_existing(
             }
         };
 
-    recommendations = schedule_equipment_batch(config, store.movements()?, recommendations);
+    recommendations = schedule_equipment_batch(store.movements()?, recommendations);
     recommendations.truncate(needed as usize);
     Ok(QueueGeneration {
         recommendations,
@@ -443,7 +433,6 @@ fn is_opposite_side_pair(left: &Recommendation, right: &Recommendation) -> bool 
 }
 
 fn schedule_equipment_batch(
-    config: &Config,
     movements: Vec<Movement>,
     recommendations: Vec<Recommendation>,
 ) -> Vec<Recommendation> {
@@ -459,7 +448,6 @@ fn schedule_equipment_batch(
                     .equipment
                     .iter()
                     .any(|equipment| equipment != "bodyweight")
-                    && equipment_available(&config.profile.equipment_text, movement)
             })
     };
     let equipment_count = recommendations
@@ -524,7 +512,9 @@ pub fn initial_exercise_profile(
         config.recommender.backend,
         RecommenderBackend::Off | RecommenderBackend::Local
     ) {
-        return (local_initial_movements(config), None);
+        let (movements, equipment) = local_resolved_movements(config);
+        let _ = store.save_exercise_filter(&equipment);
+        return (movements, None);
     }
 
     let result = PromptRenderer::new(&paths.config_dir)
@@ -534,17 +524,29 @@ pub fn initial_exercise_profile(
             RecommenderBackend::Openai => call_openai_exercise_profile(store, config, &prompt),
             RecommenderBackend::Local | RecommenderBackend::Off => unreachable!(),
         })
-        .and_then(|profile| validate_exercise_profile(config, profile));
+        .and_then(validate_exercise_profile)
+        .and_then(|(movements, equipment)| {
+            store.save_exercise_filter(&equipment)?;
+            Ok(movements)
+        });
 
     match result {
         Ok(movements) if !movements.is_empty() => (movements, None),
-        Ok(_) => (local_initial_movements(config), None),
+        Ok(_) => {
+            let (movements, equipment) = local_resolved_movements(config);
+            let _ = store.save_exercise_filter(&equipment);
+            (movements, None)
+        }
         Err(err) => (
-            local_initial_movements(config),
+            {
+                let (movements, equipment) = local_resolved_movements(config);
+                let _ = store.save_exercise_filter(&equipment);
+                movements
+            },
             config
                 .recommender
                 .show_llm_failures
-                .then(|| format!("Using conservative automatic exercise selection: {err}")),
+                .then(|| format!("Using conservative local equipment filtering: {err}")),
         ),
     }
 }
@@ -573,11 +575,20 @@ fn normalize_equipment(text: &str) -> Vec<EquipmentCapability> {
             "medicine_ball",
             ["medicine ball", "medical ball", "medicine_ball"].as_slice(),
         ),
+        ("barbell", ["barbell"].as_slice()),
+        ("e_z_curl_bar", ["e-z curl bar", "ez curl bar"].as_slice()),
+        (
+            "exercise_ball",
+            ["exercise ball", "stability ball"].as_slice(),
+        ),
+        ("foam_roll", ["foam roll", "foam roller"].as_slice()),
+        ("cable", ["cable machine", "cable"].as_slice()),
+        ("machine", ["gym machine", "machines"].as_slice()),
     ] {
         if matches.iter().any(|needle| normalized.contains(needle)) {
             capabilities.push(EquipmentCapability {
                 kind: kind.to_string(),
-                weights_kg: if kind == "kettlebell" || kind == "dumbbell" {
+                weights_kg: if matches!(kind, "kettlebell" | "dumbbell" | "barbell") {
                     weights.clone()
                 } else {
                     Vec::new()
@@ -614,17 +625,6 @@ fn extract_weight_values_kg(text: &str) -> Vec<f32> {
     weights
 }
 
-fn equipment_available(equipment_text: &str, movement: &Movement) -> bool {
-    let capabilities = normalize_equipment(equipment_text);
-    movement.equipment.iter().any(|equipment| {
-        let kind = equipment.replace(' ', "_");
-        capabilities.iter().any(|capability| {
-            capability.kind == kind
-                || (kind == "medicine_ball" && capability.kind == "medicine_ball")
-        })
-    })
-}
-
 fn build_context(
     store: &Store,
     config: &Config,
@@ -634,6 +634,9 @@ fn build_context(
     let state = store.state()?;
     let profile = &config.profile;
     let preferences = &config.preferences;
+    let available_equipment = store
+        .exercise_filter::<Vec<EquipmentCapability>>()?
+        .unwrap_or_else(|| normalize_equipment(&profile.equipment_text));
     Ok(RecommendationContext {
         profile: ContextProfile {
             unit_system: profile.unit_system,
@@ -642,7 +645,7 @@ fn build_context(
             age: profile.age,
             goals: profile.goals.clone(),
             equipment_text: profile.equipment_text.clone(),
-            available_equipment: normalize_equipment(&profile.equipment_text),
+            available_equipment,
             exercise_preferences: profile.exercise_preferences.clone(),
             work_setup: profile.work_setup.clone(),
             one_hand_available: profile.one_hand_available,
@@ -668,7 +671,7 @@ fn build_context(
             cooldown_muscle: state.cooldown_muscle,
             cooldown_until: state.cooldown_until.map(|dt| dt.to_rfc3339()),
         },
-        movements: store.movements()?,
+        movements: exercise_catalog::entries_for_movements(&store.movements()?),
     })
 }
 
@@ -1007,23 +1010,17 @@ fn recommendation_schema() -> serde_json::Value {
         "type": "object",
         "additionalProperties": false,
         "required": [
-            "action", "movement_name", "reps", "sets", "weight_text", "duration_sec",
-            "primary_muscle", "muscles", "equipment_used", "safety_notes", "rationale"
+            "action", "exercise_id", "reps", "sets", "weight_text", "duration_sec",
+            "safety_notes", "rationale"
             , "side"
         ],
         "properties": {
             "action": { "type": "string", "enum": ["recommend", "no_recommendation"] },
-            "movement_name": { "type": ["string", "null"] },
+            "exercise_id": { "type": ["string", "null"] },
             "reps": { "type": ["integer", "null"], "minimum": 1, "maximum": 30 },
             "sets": { "type": ["integer", "null"], "minimum": 1, "maximum": 3 },
             "weight_text": { "type": ["string", "null"] },
             "duration_sec": { "type": ["integer", "null"], "minimum": 1, "maximum": 600 },
-            "primary_muscle": { "type": ["string", "null"] },
-            "muscles": {
-                "type": ["array", "null"],
-                "items": { "type": "string" }
-            },
-            "equipment_used": { "type": ["string", "null"] },
             "safety_notes": { "type": ["string", "null"] },
             "rationale": { "type": ["string", "null"] }
             , "side": { "type": ["string", "null"], "enum": ["left", "right", "bilateral", null] }
@@ -1077,39 +1074,30 @@ fn exercise_profile_schema() -> serde_json::Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["movements"],
+        "required": ["equipment"],
         "properties": {
-            "movements": {
+            "equipment": {
                 "type": "array",
-                "minItems": 4,
-                "maxItems": 16,
+                "minItems": 0,
+                "maxItems": 11,
                 "items": {
                     "type": "object",
                     "additionalProperties": false,
-                    "required": [
-                        "name", "primary_muscle", "muscles", "equipment", "base_reps",
-                        "estimated_seconds", "status", "mobility", "sidedness"
-                    ],
+                    "required": ["kind", "weights_kg"],
                     "properties": {
-                        "name": { "type": "string" },
-                        "primary_muscle": { "type": "string" },
-                        "muscles": {
-                            "type": "array",
-                            "items": { "type": "string" },
-                            "minItems": 1,
-                            "maxItems": 6
+                        "kind": {
+                            "type": "string",
+                            "enum": [
+                                "bodyweight", "dumbbell", "kettlebell", "band",
+                                "medicine_ball", "barbell", "e_z_curl_bar",
+                                "exercise_ball", "foam_roll", "cable", "machine"
+                            ]
                         },
-                        "equipment": {
+                        "weights_kg": {
                             "type": "array",
-                            "items": { "type": "string" },
-                            "minItems": 1,
-                            "maxItems": 4
-                        },
-                        "base_reps": { "type": "integer", "minimum": 1, "maximum": 20 },
-                        "estimated_seconds": { "type": "integer", "minimum": 10, "maximum": 120 },
-                        "status": { "type": "string", "enum": ["allowed", "caution", "blocked"] },
-                        "mobility": { "type": "boolean" }
-                        , "sidedness": { "type": "string", "enum": ["bilateral", "unilateral"] }
+                            "items": { "type": "number", "minimum": 0.25, "maximum": 300 },
+                            "maxItems": 16
+                        }
                     }
                 }
             }
@@ -1135,95 +1123,51 @@ where
 }
 
 fn validate_exercise_profile(
-    config: &Config,
     profile: LlmExerciseProfile,
-) -> Result<Vec<Movement>> {
-    profile
-        .movements
-        .into_iter()
-        .map(|movement| validate_exercise_movement(config, movement))
-        .collect()
+) -> Result<(Vec<Movement>, Vec<EquipmentCapability>)> {
+    let mut seen = std::collections::HashSet::new();
+    let mut equipment = vec![EquipmentCapability {
+        kind: "bodyweight".to_string(),
+        weights_kg: Vec::new(),
+    }];
+    for capability in profile.equipment {
+        if !exercise_catalog::is_supported_equipment(&capability.kind) {
+            bail!(
+                "LLM equipment resolver returned unsupported kind {}",
+                capability.kind
+            );
+        }
+        if capability
+            .weights_kg
+            .iter()
+            .any(|weight| !weight.is_finite() || !(0.25..=300.0).contains(weight))
+        {
+            bail!("LLM equipment resolver returned an invalid weight");
+        }
+        if seen.insert(capability.kind.clone()) && capability.kind != "bodyweight" {
+            equipment.push(EquipmentCapability {
+                kind: capability.kind,
+                weights_kg: capability.weights_kg,
+            });
+        }
+    }
+    let kinds = equipment
+        .iter()
+        .map(|capability| capability.kind.clone())
+        .collect::<Vec<_>>();
+    Ok((exercise_catalog::movements_for_equipment(&kinds), equipment))
 }
 
-fn validate_exercise_movement(config: &Config, movement: LlmExerciseMovement) -> Result<Movement> {
-    if movement.name.trim().is_empty() {
-        bail!("LLM exercise profile included an unnamed movement");
-    }
-    if movement.base_reps == 0 || movement.base_reps > 20 {
-        bail!("LLM exercise profile included invalid reps");
-    }
-    if !(10..=120).contains(&movement.estimated_seconds) {
-        bail!("LLM exercise profile included invalid duration");
-    }
-    let status = if conflicts_with_limitations(config, &movement.primary_muscle, &movement.muscles)
-    {
-        MovementStatus::Blocked
-    } else {
-        movement.status
-    };
-    Ok(Movement {
-        id: slugify(&movement.name),
-        name: movement.name.trim().to_string(),
-        primary_muscle: movement.primary_muscle.trim().to_lowercase(),
-        muscles: movement
-            .muscles
-            .into_iter()
-            .map(|muscle| muscle.trim().to_lowercase())
-            .filter(|muscle| !muscle.is_empty())
-            .collect(),
-        equipment: movement
-            .equipment
-            .into_iter()
-            .map(|equipment| equipment.trim().to_lowercase().replace(' ', "_"))
-            .filter(|equipment| !equipment.is_empty())
-            .collect(),
-        base_reps: movement.base_reps,
-        estimated_seconds: movement.estimated_seconds,
-        status,
-        mobility: movement.mobility,
-        sidedness: movement.sidedness,
-    })
-}
-
-fn local_initial_movements(config: &Config) -> Vec<Movement> {
-    let preference_text = format!(
-        "{} {} {}",
-        config.profile.exercise_preferences,
-        config.profile.injuries.join(" "),
-        config.profile.cautious_body_parts.join(" ")
+fn local_resolved_movements(config: &Config) -> (Vec<Movement>, Vec<EquipmentCapability>) {
+    let kinds = exercise_catalog::locally_resolved_equipment(&config.profile.equipment_text);
+    (
+        exercise_catalog::movements_for_equipment(&kinds),
+        normalize_equipment(&config.profile.equipment_text),
     )
-    .to_lowercase();
-    let upper_body_only = preference_text.contains("upper body");
-    let posture = preference_text.contains("posture") || preference_text.contains("stretch");
-    let avoid_squats =
-        preference_text.contains("avoid squats") || preference_text.contains("no squats");
-    let no_jumping = preference_text.contains("no jumping");
-
-    crate::storage::default_movements()
-        .into_iter()
-        .map(|mut movement| {
-            if conflicts_with_limitations(config, &movement.primary_muscle, &movement.muscles)
-                || (upper_body_only
-                    && movement.muscles.iter().any(|muscle| {
-                        muscle.contains("leg")
-                            || muscle.contains("quad")
-                            || muscle.contains("glute")
-                            || muscle.contains("calf")
-                    }))
-                || (avoid_squats && movement.id.contains("sit_to_stand"))
-                || (no_jumping && movement.name.contains("jump"))
-            {
-                movement.status = MovementStatus::Blocked;
-            } else if posture && !movement.mobility && movement.primary_muscle != "upper_back" {
-                movement.status = MovementStatus::Caution;
-            }
-            movement
-        })
-        .collect()
 }
 
 fn validate_candidate(
-    config: &Config,
+    _config: &Config,
     event: &AgentEvent,
     candidate: LlmRecommendation,
     movements: &[Movement],
@@ -1232,12 +1176,10 @@ fn validate_candidate(
         return Ok(None);
     }
 
-    let movement_name = required(candidate.movement_name, "movement_name")?;
+    let exercise_id = required(candidate.exercise_id, "exercise_id")?;
     let reps = required(candidate.reps, "reps")?;
     let sets = required(candidate.sets, "sets")?;
     let duration_sec = required(candidate.duration_sec, "duration_sec")?;
-    let primary_muscle = required(candidate.primary_muscle, "primary_muscle")?;
-    let muscles = required(candidate.muscles, "muscles")?;
 
     if sets != 1 {
         bail!("LLM recommended more than one set");
@@ -1248,27 +1190,10 @@ fn validate_candidate(
     if duration_sec + 15 > event.expected_duration_sec {
         bail!("LLM recommendation does not fit downtime");
     }
-    if conflicts_with_limitations(config, &primary_muscle, &muscles) {
-        bail!("LLM recommendation conflicts with limitations");
-    }
     let movement = movements
         .iter()
-        .find(|movement| {
-            movement.id == slugify(&movement_name)
-                || slugify(&movement.name) == slugify(&movement_name)
-        })
+        .find(|movement| movement.id == exercise_id)
         .ok_or_else(|| anyhow!("LLM recommendation is not in the movement catalog"))?;
-    if !equipment_available(&config.profile.equipment_text, movement) {
-        bail!("LLM recommendation requires unavailable equipment");
-    }
-    if let Some(equipment_used) = candidate.equipment_used.as_deref() {
-        let equipment_used = equipment_used.to_lowercase().replace(' ', "_");
-        if !movement.equipment.iter().any(|equipment| {
-            equipment_used.contains(equipment) || equipment.contains(&equipment_used)
-        }) {
-            bail!("LLM recommendation uses equipment not listed for the movement");
-        }
-    }
     if movement.sidedness == MovementSidedness::Unilateral && candidate.side.is_none() {
         bail!("unilateral movement is missing a side");
     }
@@ -1291,7 +1216,7 @@ fn validate_candidate(
 
     Ok(Some(Recommendation {
         id: None,
-        movement_id: slugify(&movement_name),
+        movement_id: movement.id.clone(),
         movement_name: movement.name.clone(),
         primary_muscle: movement.primary_muscle.clone(),
         muscles: movement.muscles.clone(),
@@ -1343,18 +1268,6 @@ fn parse_weight_kg(text: Option<&str>) -> Option<f32> {
         }
     }
     previous_number
-}
-
-fn slugify(value: &str) -> String {
-    let mut out = value
-        .to_lowercase()
-        .chars()
-        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
-        .collect::<String>();
-    while out.contains("__") {
-        out = out.replace("__", "_");
-    }
-    out.trim_matches('_').to_string()
 }
 
 fn find_first_text(value: &serde_json::Value) -> Option<String> {
@@ -1443,16 +1356,14 @@ mod tests {
     fn valid_wrist_candidate() -> serde_json::Value {
         json!({
             "action": "recommend",
-            "movement_name": "wrist extensor reset",
+            "exercise_id": "Dead_Bug",
             "reps": 5,
             "sets": 1,
             "weight_text": null,
             "duration_sec": 35,
-            "primary_muscle": "mobility",
-            "muscles": ["forearms", "wrists"],
-            "equipment_used": "bodyweight",
             "safety_notes": "Move gently.",
-            "rationale": "Fits the wait."
+            "rationale": "Fits the wait.",
+            "side": "bilateral"
         })
     }
 
@@ -1574,7 +1485,7 @@ mod tests {
             .all(|set| set.get("agent").is_none() && set.get("project").is_none()));
         assert!(rendered.get("today_events").is_none());
         assert!(rendered.get("today_sets").is_none());
-        assert!(prompt.len() < 10_000, "prompt was {} bytes", prompt.len());
+        assert!(prompt.len() < 60_000, "prompt was {} bytes", prompt.len());
         assert!(prompt.contains("Return exactly 10 valid, distinct recommendations"));
         assert!(!prompt.contains("return fewer"));
     }
@@ -1599,19 +1510,64 @@ mod tests {
     }
 
     #[test]
+    fn resolved_dumbbell_profile_is_filtered_locally_without_catalog_input() {
+        let (movements, equipment) = validate_exercise_profile(LlmExerciseProfile {
+            equipment: vec![LlmEquipmentCapability {
+                kind: "dumbbell".into(),
+                weights_kg: vec![10.0],
+            }],
+        })
+        .unwrap();
+
+        assert!(equipment.iter().any(|item| item.kind == "bodyweight"));
+        assert!(equipment
+            .iter()
+            .any(|item| { item.kind == "dumbbell" && item.weights_kg == vec![10.0] }));
+        assert!(movements
+            .iter()
+            .any(|movement| movement.equipment == ["bodyweight"]));
+        assert!(movements
+            .iter()
+            .any(|movement| movement.equipment == ["dumbbell"]));
+        assert!(movements.iter().all(|movement| {
+            movement.equipment == ["bodyweight"] || movement.equipment == ["dumbbell"]
+        }));
+    }
+
+    #[test]
+    fn queue_context_uses_only_canonical_catalog_fields() {
+        let store = test_store();
+        let context = build_context(&store, &Config::default(), &event()).unwrap();
+        let value = serde_json::to_value(context).unwrap();
+        let movement = value["movements"][0].as_object().unwrap();
+        assert_eq!(
+            movement
+                .keys()
+                .cloned()
+                .collect::<std::collections::HashSet<_>>(),
+            std::collections::HashSet::from([
+                "id".into(),
+                "force".into(),
+                "mechanic".into(),
+                "equipment".into(),
+                "primaryMuscles".into(),
+                "secondaryMuscles".into(),
+                "category".into(),
+            ])
+        );
+    }
+
+    #[test]
     fn validator_rejects_unavailable_catalog_equipment() {
         let mut config = Config::default();
         config.profile.equipment_text = "bodyweight only".into();
         let candidate: LlmRecommendation = serde_json::from_value(json!({
             "action": "recommend",
-            "movement_name": "seated curls",
+            "exercise_id": "Dumbbell_Bicep_Curl",
             "reps": 8,
             "sets": 1,
             "weight_text": null,
             "duration_sec": 35,
-            "primary_muscle": "biceps",
-            "muscles": ["biceps"],
-            "equipment_used": "kettlebell",
             "safety_notes": "Move gently.",
             "rationale": "Fits the wait.",
             "side": "left"
@@ -1624,14 +1580,14 @@ mod tests {
             &test_store().movements().unwrap(),
         )
         .unwrap_err();
-        assert!(error.to_string().contains("unavailable equipment"));
+        assert!(error.to_string().contains("not in the movement catalog"));
     }
 
     #[test]
     fn parses_json_from_noisy_codex_output() {
         let parsed: LlmRecommendation = parse_llm_json(
             r#"thinking...
-            {"action":"no_recommendation","movement_name":null,"reps":null,"sets":null,"weight_text":null,"duration_sec":null,"primary_muscle":null,"muscles":null,"equipment_used":null,"safety_notes":null,"rationale":null}"#,
+            {"action":"no_recommendation","exercise_id":null,"reps":null,"sets":null,"weight_text":null,"duration_sec":null,"safety_notes":null,"rationale":null,"side":null}"#,
         )
         .unwrap();
         assert_eq!(parsed.action, LlmAction::NoRecommendation);
@@ -1977,31 +1933,29 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1000,"cached_inp
     }
 
     #[test]
-    fn validator_rejects_injury_conflict() {
+    fn validator_keeps_injuries_advisory_for_the_llm() {
         let mut config = Config::default();
         config.profile.injuries = vec!["legs and spine".to_string()];
         let candidate = LlmRecommendation {
             action: LlmAction::Recommend,
-            movement_name: Some("squat".into()),
+            exercise_id: Some("Bodyweight_Squat".into()),
             reps: Some(5),
             sets: Some(1),
             weight_text: None,
             duration_sec: Some(30),
-            primary_muscle: Some("legs".into()),
-            muscles: Some(vec!["legs".into()]),
-            equipment_used: None,
             safety_notes: Some("stop if pain appears".into()),
             rationale: Some("short movement".into()),
             side: None,
         };
-        let err = validate_candidate(
+        let recommendation = validate_candidate(
             &config,
             &event(),
             candidate,
             &test_store().movements().unwrap(),
         )
-        .unwrap_err();
-        assert!(err.to_string().contains("limitations"));
+        .unwrap()
+        .unwrap();
+        assert_eq!(recommendation.movement_id, "Bodyweight_Squat");
     }
 
     #[test]
@@ -2125,8 +2079,9 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1000,"cached_inp
             .movements()
             .unwrap()
             .into_iter()
-            .find(|movement| movement.primary_muscle == "mobility")
+            .find(|movement| movement.mobility)
             .unwrap();
+        let cooling_muscle = movement.primary_muscle.clone();
         let completed = Recommendation {
             id: None,
             movement_id: movement.id,
@@ -2150,19 +2105,18 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1000,"cached_inp
 
         let queued = local_queue(&store, &Config::default(), &event(), 20, &[]).unwrap();
 
-        assert_ne!(queued.first().unwrap().primary_muscle, "mobility");
+        assert_ne!(queued.first().unwrap().primary_muscle, cooling_muscle);
         assert!(queued
             .iter()
-            .any(|recommendation| recommendation.primary_muscle == "mobility"));
+            .any(|recommendation| recommendation.primary_muscle == cooling_muscle));
     }
 
     #[test]
     fn invalid_codex_candidates_are_skipped_before_local_top_up() {
         let store = test_store();
         let mut invalid = valid_wrist_candidate();
-        invalid["movement_name"] = json!("unsafe duplicate");
+        invalid["exercise_id"] = json!("not-a-canonical-id");
         invalid["reps"] = json!(99);
-        invalid["primary_muscle"] = json!("other");
         let message = json!({
             "recommendations": [valid_wrist_candidate(), invalid]
         })
@@ -2178,7 +2132,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1000,"cached_inp
         assert!(!generated
             .recommendations
             .iter()
-            .any(|recommendation| recommendation.movement_name == "unsafe duplicate"));
+            .any(|recommendation| recommendation.movement_id == "not-a-canonical-id"));
     }
 
     #[test]
@@ -2225,7 +2179,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1000,"cached_inp
     }
 
     #[test]
-    fn local_initial_profile_blocks_limited_body_parts() {
+    fn local_initial_profile_keeps_injuries_advisory() {
         let mut config = Config {
             recommender: Recommender {
                 backend: RecommenderBackend::Local,
@@ -2237,12 +2191,12 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1000,"cached_inp
 
         let store = test_store();
         let (movements, notice) = initial_exercise_profile(&store, &config, &test_paths());
-        let short_walk = movements
+        let squat = movements
             .iter()
-            .find(|movement| movement.id == "short_walk")
+            .find(|movement| movement.id == "Bodyweight_Squat")
             .unwrap();
 
-        assert_eq!(short_walk.status, MovementStatus::Blocked);
+        assert_eq!(squat.status, MovementStatus::Allowed);
         assert!(notice.is_none());
     }
 }

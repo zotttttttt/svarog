@@ -62,17 +62,12 @@ pub enum MovementStatus {
     Blocked,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MovementSidedness {
+    #[default]
     Bilateral,
     Unilateral,
-}
-
-impl Default for MovementSidedness {
-    fn default() -> Self {
-        Self::Bilateral
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

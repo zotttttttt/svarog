@@ -2,6 +2,7 @@ mod cli;
 mod config;
 mod daemon;
 mod engine;
+mod exercise_catalog;
 mod hooks;
 mod models;
 mod notifications;

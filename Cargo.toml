@@ -13,6 +13,7 @@ include = [
     "LICENSE",
     "README.md",
     "build.rs",
+    "data/**",
     "prompts/**",
     "scripts/**",
     "src/**",

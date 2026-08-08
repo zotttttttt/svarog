@@ -31,7 +31,7 @@ source_fingerprint="$({
       cksum "$file"
     fi
   done
-  for directory in "$repo_root/src" "$repo_root/prompts"; do
+  for directory in "$repo_root/src" "$repo_root/prompts" "$repo_root/data"; do
     if [[ -d "$directory" ]]; then
       find "$directory" -type f -print | LC_ALL=C sort | while IFS= read -r file; do
         cksum "$file"

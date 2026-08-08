@@ -53,7 +53,7 @@ When a movement session appears, do the movement and record the outcome:
 | --- | --- |
 | `d` or Enter | Finish the movement session |
 | `+` (`=`) / `-` | Adjust the reps you completed |
-| `s` | Skip and optionally report fatigue |
+| `s` | Skip, report fatigue, or remove the exercise |
 | `p` | Report pain and block that movement |
 | `q` | Quit Svarog |
 | `Esc` | Cancel the current prompt or return to waiting |
@@ -70,6 +70,11 @@ While waiting:
 
 A movement session remains available until you finish, skip, or report pain—even if the
 Codex turn that triggered it has already ended.
+
+From the Skip panel, press `Backspace` to remove that exercise from future recommendations.
+Use `svarog exercises removed`, `svarog exercises restore <exercise-id>`, or
+`svarog exercises restore-all` to review or undo removals. Completing onboarding again resets
+the removed list.
 
 ## Work beside your coding agent
 
@@ -227,6 +232,16 @@ Svarog reloads overrides for every recommendation, so you do not need to
 rebuild or restart it. The queue template receives `context` and `needed`; the
 profile template receives `config`. Structured values support
 `|tojson(indent=2)`.
+
+## Exercise data
+
+Exercise identities and metadata come from
+[free-exercise-db](https://github.com/yuhonas/free-exercise-db), pinned at commit
+[`b0eed061`](https://github.com/yuhonas/free-exercise-db/commit/b0eed061e1c832b3ed815fbaa4b45b3cdc14df49).
+The project releases the dataset into the public domain under the
+[Unlicense](https://github.com/yuhonas/free-exercise-db/blob/main/LICENSE.md). Svarog bundles a
+compact copy and sends only `id`, `force`, `mechanic`, `equipment`, `primaryMuscles`,
+`secondaryMuscles`, and `category` to its recommendation model.
 
 ## Update a development install
 

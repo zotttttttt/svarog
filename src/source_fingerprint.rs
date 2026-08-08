@@ -30,6 +30,7 @@ pub fn source_files(root: &Path) -> io::Result<Vec<PathBuf>> {
 
     collect_files(&root.join("src"), &mut files)?;
     collect_files(&root.join("prompts"), &mut files)?;
+    collect_files(&root.join("data"), &mut files)?;
     files.sort_by(|left, right| {
         left.strip_prefix(root)
             .unwrap_or(left)
@@ -70,10 +71,12 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         fs::create_dir(root.path().join("src")).unwrap();
         fs::create_dir(root.path().join("prompts")).unwrap();
+        fs::create_dir(root.path().join("data")).unwrap();
         fs::write(root.path().join("Cargo.toml"), "[package]\n").unwrap();
         fs::write(root.path().join("Cargo.lock"), "# lock\n").unwrap();
         fs::write(root.path().join("src/main.rs"), "fn main() {}\n").unwrap();
         fs::write(root.path().join("prompts/queue.j2"), "{{ context }}\n").unwrap();
+        fs::write(root.path().join("data/exercises.json"), "[]\n").unwrap();
 
         let first = fingerprint(root.path()).unwrap();
         assert_eq!(first, fingerprint(root.path()).unwrap());
@@ -84,6 +87,10 @@ mod tests {
         let before_prompt_change = fingerprint(root.path()).unwrap();
         fs::write(root.path().join("prompts/queue.j2"), "{{ context.name }}\n").unwrap();
         assert_ne!(before_prompt_change, fingerprint(root.path()).unwrap());
+
+        let before_data_change = fingerprint(root.path()).unwrap();
+        fs::write(root.path().join("data/exercises.json"), "[{}]\n").unwrap();
+        assert_ne!(before_data_change, fingerprint(root.path()).unwrap());
     }
 
     #[test]

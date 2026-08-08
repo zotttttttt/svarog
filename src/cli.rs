@@ -73,6 +73,21 @@ enum Command {
     Done,
     Skip,
     Pain,
+    /// List or restore exercises removed from recommendations.
+    Exercises {
+        #[command(subcommand)]
+        command: ExerciseCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ExerciseCommand {
+    /// List removed canonical exercise IDs.
+    Removed,
+    /// Restore one removed exercise ID.
+    Restore { exercise_id: String },
+    /// Restore every removed exercise.
+    RestoreAll,
 }
 
 pub async fn run() -> Result<()> {
@@ -136,6 +151,7 @@ pub async fn run() -> Result<()> {
         Some(Command::Done) => action(&env, SetStatus::Done),
         Some(Command::Skip) => action(&env, SetStatus::Skipped),
         Some(Command::Pain) => action(&env, SetStatus::Pain),
+        Some(Command::Exercises { command }) => exercises(&env, command),
     }
 }
 
@@ -212,8 +228,8 @@ fn finish_setup(env: &RuntimeEnv, config: &Config, destroy_all: bool) -> Result<
         store.reset_all_data()?;
     }
     store.clear_queued_recommendations()?;
+    store.clear_exercise_exclusions()?;
     store.save_user_profile(config)?;
-    store.seed_movements()?;
     println!();
     println!(
         "{} {}",
@@ -223,9 +239,7 @@ fn finish_setup(env: &RuntimeEnv, config: &Config, destroy_all: bool) -> Result<
     let mut recommender_notices = 0;
     let (movements, profile_notice) =
         recommender::initial_exercise_profile(&store, config, &env.paths);
-    for movement in movements {
-        store.upsert_movement(&movement)?;
-    }
+    store.replace_movement_pool(&movements)?;
     if let Some(notice) = profile_notice {
         recommender_notices += 1;
         print_recommender_notice(config, env, &notice);
@@ -457,7 +471,11 @@ fn init(env: &RuntimeEnv) -> Result<()> {
     config::save(paths, &config)?;
     let store = Store::open(&paths.database_file)?;
     store.save_user_profile(&config)?;
-    store.seed_movements()?;
+    let equipment =
+        crate::exercise_catalog::locally_resolved_equipment(&config.profile.equipment_text);
+    store.replace_movement_pool(&crate::exercise_catalog::movements_for_equipment(
+        &equipment,
+    ))?;
     println!("Config: {}", paths.config_file.display());
     println!("Database: {}", paths.database_file.display());
     Ok(())
@@ -809,6 +827,52 @@ pub fn tui_action_with_reps(env: &RuntimeEnv, status: SetStatus, reps: u32) -> R
 
 pub fn tui_action_skip_fatigued(env: &RuntimeEnv) -> Result<()> {
     action_with_options(env, SetStatus::Skipped, None, true, false)
+}
+
+pub fn tui_action_remove_exercise(env: &RuntimeEnv) -> Result<()> {
+    let store = Store::open(&env.paths.database_file)?;
+    let Some(rec) = store.latest_open_recommendation()? else {
+        bail!("no active recommendation");
+    };
+    store.record_set(&rec, SetStatus::Skipped)?;
+    if let Some(id) = rec.id {
+        store.mark_recommendation(id, "skipped")?;
+    }
+    store.exclude_exercise(&rec.movement_id)?;
+    daemon::regenerate_queue_best_effort(env);
+    Ok(())
+}
+
+fn exercises(env: &RuntimeEnv, command: ExerciseCommand) -> Result<()> {
+    let store = Store::open(&env.paths.database_file)?;
+    match command {
+        ExerciseCommand::Removed => {
+            let removed = store.removed_exercise_ids()?;
+            if removed.is_empty() {
+                println!("No exercises removed.");
+            } else {
+                for id in removed {
+                    let name = crate::exercise_catalog::find(&id)
+                        .map(|entry| entry.id.as_str())
+                        .unwrap_or(&id);
+                    println!("{name}");
+                }
+            }
+        }
+        ExerciseCommand::Restore { exercise_id } => {
+            if store.restore_exercise(&exercise_id)? {
+                println!("restored {exercise_id}");
+            } else {
+                bail!("exercise is not removed: {exercise_id}");
+            }
+        }
+        ExerciseCommand::RestoreAll => {
+            let count = store.removed_exercise_ids()?.len();
+            store.clear_exercise_exclusions()?;
+            println!("restored {count} exercise(s)");
+        }
+    }
+    Ok(())
 }
 
 fn action_with_options(
@@ -1250,6 +1314,24 @@ mod tests {
     }
 
     #[test]
+    fn cli_parses_exercise_restore_commands() {
+        let removed = Cli::try_parse_from(["svarog", "exercises", "removed"]).unwrap();
+        assert!(matches!(
+            removed.command,
+            Some(Command::Exercises {
+                command: ExerciseCommand::Removed
+            })
+        ));
+        let restore = Cli::try_parse_from(["svarog", "exercises", "restore", "Dead_Bug"]).unwrap();
+        assert!(matches!(
+            restore.command,
+            Some(Command::Exercises {
+                command: ExerciseCommand::Restore { exercise_id }
+            }) if exercise_id == "Dead_Bug"
+        ));
+    }
+
+    #[test]
     fn cli_accepts_no_subcommand_for_default_launch() {
         let cli = Cli::try_parse_from(["svarog"]).unwrap();
 
@@ -1343,10 +1425,10 @@ mod tests {
         store.insert_event(&event).unwrap();
         let current = crate::models::Recommendation {
             id: None,
-            movement_id: "desk_posture_reset".into(),
-            movement_name: "desk posture reset".into(),
-            primary_muscle: "mobility".into(),
-            muscles: vec!["neck".into()],
+            movement_id: "Dead_Bug".into(),
+            movement_name: "Dead Bug".into(),
+            primary_muscle: "abdominals".into(),
+            muscles: vec!["abdominals".into()],
             reps: 4,
             weight_kg: None,
             estimated_seconds: 35,
@@ -1357,6 +1439,7 @@ mod tests {
         };
         let current_id = store.insert_recommendation(&current).unwrap();
         store.insert_queued_recommendation(&current).unwrap();
+        store.exclude_exercise("Plank").unwrap();
         drop(store);
 
         finish_setup(&env, &config, false).unwrap();
@@ -1368,6 +1451,7 @@ mod tests {
             Some(current_id)
         );
         assert_eq!(store.queued_recommendation_count().unwrap(), 0);
+        assert!(store.removed_exercise_ids().unwrap().is_empty());
         assert!(env.codex_home.join("hooks.json").exists());
     }
 

@@ -5,11 +5,12 @@ Prepare exactly {{ needed }} short movement sessions for future coding-agent bre
 Rules:
 - Return exactly {{ needed }} valid, distinct recommendations, ordered from next to later.
 - Each recommendation is one brief movement session for an AI coding-agent break.
-- Choose only from the supplied movement catalog; do not invent movements or equipment.
+- Choose only IDs from the supplied movement catalog; copy the exact canonical `id` into `exercise_id`. Do not invent, rename, or alter movements or equipment.
+- The movement catalog intentionally contains only canonical source metadata: id, force, mechanic, equipment, primaryMuscles, secondaryMuscles, and category.
 - Treat the catalog and normalized equipment inventory as authoritative. Use compatible available equipment deliberately; do not default to bodyweight when a safe catalog movement uses the user's equipment.
 - This queue is prepared in advance and may be used over future days.
 - Work comes first: every movement must comfortably fit the expected downtime.
-- Never train to failure, prescribe medical treatment, or ignore pain and limitations.
+- Never train to failure, prescribe medical treatment, or ignore pain and limitations. Injuries and cautious body parts are advisory context for selecting a safe movement and conservative load; they do not mean the entire muscle group is absent from the catalog.
 - Recent completed exercises are reference data for recovery and repetition avoidance only. They are not a whitelist and must not bias the batch away from safe catalog movements the user can do now.
 - Prefer safety, available equipment, user preferences, recovery, and then variety—in that order.
 - For bilateral equipment movements, target equipment sessions 2, 4, 6, 8, and 10 when enough compatible movements exist.

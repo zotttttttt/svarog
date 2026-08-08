@@ -327,6 +327,20 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
                             SkipConfirmationAction::Normal => {
                                 let _ = cli::tui_action(env, SetStatus::Skipped);
                             }
+                            SkipConfirmationAction::Remove => {
+                                match cli::tui_action_remove_exercise(env) {
+                                    Ok(()) => {
+                                        ui.status_message = Some(
+                                            "Exercise removed. Run `svarog exercises restore <id>` to restore it."
+                                                .into(),
+                                        );
+                                    }
+                                    Err(error) => {
+                                        ui.status_message =
+                                            Some(format!("Could not remove exercise: {error}"));
+                                    }
+                                }
+                            }
                             SkipConfirmationAction::Cancel => {}
                         }
                         ui.skip_check = false;
@@ -565,6 +579,7 @@ fn screen_lines(view: &ViewModel, ui: &TuiState, in_tmux: bool) -> Vec<Line<'sta
     lines
 }
 
+#[allow(clippy::too_many_arguments)]
 fn idle_lines(
     backend: &BackendView,
     activity: &ForgeActivitySummary,
@@ -603,6 +618,7 @@ fn idle_lines(
     lines
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cooldown_lines(
     backend: &BackendView,
     activity: &ForgeActivitySummary,
@@ -1012,6 +1028,7 @@ fn history_entry_line(entry: &ForgeHistoryEntry) -> Line<'static> {
 enum SkipConfirmationAction {
     Fatigued,
     Normal,
+    Remove,
     Cancel,
 }
 
@@ -1019,6 +1036,7 @@ fn skip_confirmation_action(code: KeyCode) -> Option<SkipConfirmationAction> {
     match code {
         KeyCode::Char('y') => Some(SkipConfirmationAction::Fatigued),
         KeyCode::Char('n') => Some(SkipConfirmationAction::Normal),
+        KeyCode::Backspace => Some(SkipConfirmationAction::Remove),
         KeyCode::Esc => Some(SkipConfirmationAction::Cancel),
         _ => None,
     }
@@ -1059,6 +1077,10 @@ fn forge_lines(rec: &Recommendation, ui: &TuiState) -> Vec<Line<'static>> {
                 Span::styled("[y] Yes  ", accent_bold()),
                 Span::styled("[n] No", muted()),
             ]),
+            Line::from(Span::styled(
+                "[backspace] Skip and remove this exercise",
+                muted(),
+            )),
             Line::from(Span::styled("[esc] Cancel", muted())),
         ];
     }
@@ -2150,6 +2172,10 @@ mod tests {
             skip_confirmation_action(KeyCode::Char('y')),
             Some(SkipConfirmationAction::Fatigued)
         );
+        assert_eq!(
+            skip_confirmation_action(KeyCode::Backspace),
+            Some(SkipConfirmationAction::Remove)
+        );
     }
 
     #[test]
@@ -2170,5 +2196,6 @@ mod tests {
         assert!(text.contains("Are you fatigued?"));
         assert!(text.contains("[y] Yes"));
         assert!(text.contains("[n] No"));
+        assert!(text.contains("[backspace] Skip and remove this exercise"));
     }
 }

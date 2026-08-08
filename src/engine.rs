@@ -251,7 +251,14 @@ mod tests {
         config.preferences.forge_intensity = 3;
 
         let rec = recommend(&store, &config, &event(90)).unwrap().unwrap();
-        assert_eq!(rec.reps, 6);
+        let base_reps = store
+            .movements()
+            .unwrap()
+            .into_iter()
+            .find(|movement| movement.id == rec.movement_id)
+            .unwrap()
+            .base_reps;
+        assert_eq!(rec.reps, base_reps + 2);
     }
 
     #[test]
