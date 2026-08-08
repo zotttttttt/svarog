@@ -5,7 +5,6 @@ use crate::models::{
     AppStateKind, ForgeActivitySummary, Recommendation, RecommenderTokenProvider,
     RecommenderTokenUsageByProvider, SetStatus,
 };
-use crate::recommender::QueueGenerationSource;
 use crate::storage::{ForgeHistoryEntry, Store};
 use anyhow::Result;
 use chrono::{Datelike, Duration as ChronoDuration, Local};
@@ -165,21 +164,15 @@ struct TuiState {
     queue_regeneration: Option<Receiver<QueueRegenerationResult>>,
     queue_regeneration_started_at: Option<Instant>,
     queue_regeneration_feedback: Option<QueueRegenerationFeedback>,
+    queue_regeneration_feedback_started_at: Option<Instant>,
     forge_now_feedback: Option<String>,
     demo: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum QueueRegenerationFeedback {
-    Success {
-        source: QueueGenerationSource,
-        notice: Option<String>,
-        llm_count: usize,
-        local_count: usize,
-    },
-    Failure {
-        no_safe_forges: bool,
-    },
+    Success,
+    Failure { no_safe_forges: bool },
 }
 
 #[derive(Debug)]
@@ -367,6 +360,7 @@ fn apply_queue_regeneration_start(ui: &mut TuiState, start: QueueRegenerationSta
             ui.queue_regeneration = Some(receiver);
             ui.queue_regeneration_started_at = Some(Instant::now());
             ui.queue_regeneration_feedback = None;
+            ui.queue_regeneration_feedback_started_at = None;
             ui.forge_now_feedback = None;
         }
         QueueRegenerationStart::Busy => {}
@@ -483,6 +477,23 @@ fn sync_reps(ui: &mut TuiState, recommendation: Option<&Recommendation>) {
 }
 
 fn poll_queue_regeneration(ui: &mut TuiState) {
+    poll_queue_regeneration_at(ui, Instant::now());
+}
+
+fn poll_queue_regeneration_at(ui: &mut TuiState, now: Instant) {
+    if matches!(
+        ui.queue_regeneration_feedback,
+        Some(QueueRegenerationFeedback::Success)
+    ) && ui
+        .queue_regeneration_feedback_started_at
+        .is_some_and(|started_at| {
+            now.saturating_duration_since(started_at) >= Duration::from_secs(3)
+        })
+    {
+        ui.queue_regeneration_feedback = None;
+        ui.queue_regeneration_feedback_started_at = None;
+    }
+
     let result = match ui.queue_regeneration.as_ref().map(Receiver::try_recv) {
         Some(Ok(result)) => Some(result),
         Some(Err(TryRecvError::Disconnected)) => Some(Err(String::new())),
@@ -493,28 +504,28 @@ fn poll_queue_regeneration(ui: &mut TuiState) {
     };
     ui.queue_regeneration = None;
     ui.queue_regeneration_started_at = None;
-    ui.queue_regeneration_feedback = Some(match result {
-        Ok(outcome) => QueueRegenerationFeedback::Success {
-            source: outcome.source,
-            notice: outcome.notice,
-            llm_count: outcome.llm_count,
-            local_count: outcome.local_count,
-        },
-        Err(error) => QueueRegenerationFeedback::Failure {
-            no_safe_forges: error.contains(crate::daemon::NO_SAFE_FORGES_ERROR),
-        },
-    });
+    match result {
+        Ok(_) => {
+            ui.queue_regeneration_feedback = Some(QueueRegenerationFeedback::Success);
+            ui.queue_regeneration_feedback_started_at = Some(now);
+        }
+        Err(error) => {
+            ui.queue_regeneration_feedback = Some(QueueRegenerationFeedback::Failure {
+                no_safe_forges: error.contains(crate::daemon::NO_SAFE_FORGES_ERROR),
+            });
+            ui.queue_regeneration_feedback_started_at = None;
+        }
+    }
 }
 
-fn queue_regeneration_spinner(ui: &TuiState) -> Option<&'static str> {
+fn queue_regeneration_loader(ui: &TuiState) -> Option<usize> {
     ui.queue_regeneration.as_ref()?;
     let elapsed = ui.queue_regeneration_started_at?.elapsed().as_millis();
-    Some(queue_regeneration_spinner_frame(elapsed))
+    Some(queue_regeneration_loader_frame(elapsed))
 }
 
-fn queue_regeneration_spinner_frame(elapsed_ms: u128) -> &'static str {
-    const FRAMES: [&str; 4] = ["◐", "◓", "◑", "◒"];
-    FRAMES[(elapsed_ms / 200) as usize % FRAMES.len()]
+fn queue_regeneration_loader_frame(elapsed_ms: u128) -> usize {
+    (elapsed_ms / 200) as usize % 6
 }
 
 fn view_lines(view: &ViewModel, ui: &TuiState) -> Vec<Line<'static>> {
@@ -525,7 +536,7 @@ fn view_lines(view: &ViewModel, ui: &TuiState) -> Vec<Line<'static>> {
         return next_forge_lines(
             &view.next_forges,
             ui.demo,
-            queue_regeneration_spinner(ui),
+            queue_regeneration_loader(ui),
             ui.queue_regeneration_feedback.as_ref(),
             ui.forge_now_feedback.as_deref(),
         );
@@ -541,7 +552,7 @@ fn view_lines(view: &ViewModel, ui: &TuiState) -> Vec<Line<'static>> {
                     &view.activity,
                     &view.token_usage,
                     ui.status_message.as_deref(),
-                    queue_regeneration_spinner(ui),
+                    queue_regeneration_loader(ui),
                     ui.queue_regeneration_feedback.as_ref(),
                     ui.forge_now_feedback.as_deref(),
                     ui.demo,
@@ -552,7 +563,7 @@ fn view_lines(view: &ViewModel, ui: &TuiState) -> Vec<Line<'static>> {
             &view.activity,
             &view.token_usage,
             ui.status_message.as_deref(),
-            queue_regeneration_spinner(ui),
+            queue_regeneration_loader(ui),
             ui.queue_regeneration_feedback.as_ref(),
             ui.forge_now_feedback.as_deref(),
             ui.demo,
@@ -562,7 +573,7 @@ fn view_lines(view: &ViewModel, ui: &TuiState) -> Vec<Line<'static>> {
             &view.activity,
             &view.token_usage,
             ui.status_message.as_deref(),
-            queue_regeneration_spinner(ui),
+            queue_regeneration_loader(ui),
             ui.queue_regeneration_feedback.as_ref(),
             ui.forge_now_feedback.as_deref(),
             ui.demo,
@@ -585,7 +596,7 @@ fn idle_lines(
     activity: &ForgeActivitySummary,
     token_usage: &RecommenderTokenUsageByProvider,
     status_message: Option<&str>,
-    queue_spinner: Option<&str>,
+    queue_loader_frame: Option<usize>,
     queue_feedback: Option<&QueueRegenerationFeedback>,
     forge_now_feedback: Option<&str>,
     demo: bool,
@@ -594,11 +605,12 @@ fn idle_lines(
         title_line(demo),
         Line::from(""),
         Line::from(Span::styled("Waiting for the next forge.", muted())),
+        Line::from(""),
         forge_now_control_line(),
         forge_list_controls_line(),
     ];
     lines.extend(waiting_forge_now_lines(
-        queue_spinner,
+        queue_loader_frame,
         queue_feedback,
         forge_now_feedback,
     ));
@@ -624,7 +636,7 @@ fn cooldown_lines(
     activity: &ForgeActivitySummary,
     token_usage: &RecommenderTokenUsageByProvider,
     status_message: Option<&str>,
-    queue_spinner: Option<&str>,
+    queue_loader_frame: Option<usize>,
     queue_feedback: Option<&QueueRegenerationFeedback>,
     forge_now_feedback: Option<&str>,
     demo: bool,
@@ -636,11 +648,12 @@ fn cooldown_lines(
             Span::styled("Forged. ", accent_bold()),
             Span::styled("Waiting for the next forge.", muted()),
         ]),
+        Line::from(""),
         forge_now_control_line(),
         forge_list_controls_line(),
     ];
     lines.extend(waiting_forge_now_lines(
-        queue_spinner,
+        queue_loader_frame,
         queue_feedback,
         forge_now_feedback,
     ));
@@ -822,7 +835,7 @@ fn regenerate_queue_requested(code: KeyCode, kind: ViewKind, next_visible: bool)
 }
 
 fn forge_list_controls_line() -> Line<'static> {
-    Line::from(Span::styled("[l] Latest forges  [n] Next forges", muted()))
+    Line::from(Span::styled("[l] Latest forges [n] Next forges", muted()))
 }
 
 fn forge_now_control_line() -> Line<'static> {
@@ -830,16 +843,13 @@ fn forge_now_control_line() -> Line<'static> {
 }
 
 fn waiting_forge_now_lines(
-    queue_spinner: Option<&str>,
+    queue_loader_frame: Option<usize>,
     queue_feedback: Option<&QueueRegenerationFeedback>,
     forge_now_feedback: Option<&str>,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    if let Some(spinner) = queue_spinner {
-        lines.push(Line::from(Span::styled(
-            format!("{spinner} Generating forges…"),
-            muted(),
-        )));
+    if let Some(frame) = queue_loader_frame {
+        lines.push(queue_regeneration_loader_line(frame));
         return lines;
     }
     if let Some(message) = forge_now_feedback {
@@ -847,16 +857,8 @@ fn waiting_forge_now_lines(
         return lines;
     }
     match queue_feedback {
-        Some(QueueRegenerationFeedback::Success { source, notice, .. }) => {
-            let message = if *source == QueueGenerationSource::LocalFallback {
-                "✓ Forges generated locally"
-            } else {
-                "✓ Forges generated"
-            };
-            lines.push(Line::from(Span::styled(message, muted())));
-            if let Some(notice) = notice {
-                lines.push(Line::from(Span::styled(notice.clone(), muted())));
-            }
+        Some(QueueRegenerationFeedback::Success) => {
+            lines.push(Line::from(Span::styled("✓ Forges generated", accent())))
         }
         Some(QueueRegenerationFeedback::Failure { no_safe_forges }) => {
             let message = if *no_safe_forges {
@@ -871,10 +873,26 @@ fn waiting_forge_now_lines(
     lines
 }
 
+fn queue_regeneration_loader_line(filled_segments: usize) -> Line<'static> {
+    let mut spans = Vec::with_capacity(9);
+    for segment in 0..5 {
+        if segment > 0 {
+            spans.push(Span::raw(" "));
+        }
+        let style = if segment < filled_segments {
+            accent()
+        } else {
+            muted()
+        };
+        spans.push(Span::styled("━━━━", style));
+    }
+    Line::from(spans)
+}
+
 fn next_forge_lines(
     next_forges: &[Recommendation],
     demo: bool,
-    regeneration_spinner: Option<&str>,
+    regeneration_loader_frame: Option<usize>,
     feedback: Option<&QueueRegenerationFeedback>,
     forge_now_feedback: Option<&str>,
 ) -> Vec<Line<'static>> {
@@ -904,26 +922,15 @@ fn next_forge_lines(
         }
     }
     lines.push(Line::from(""));
-    if let Some(spinner) = regeneration_spinner {
-        lines.push(Line::from(Span::styled(
-            format!("{spinner} Regenerating forges…"),
-            muted(),
-        )));
+    if let Some(frame) = regeneration_loader_frame {
+        lines.push(queue_regeneration_loader_line(frame));
     } else {
         if let Some(message) = forge_now_feedback {
             lines.push(Line::from(Span::styled(message.to_string(), muted())));
         }
         match feedback {
-            Some(QueueRegenerationFeedback::Success { source, notice, .. }) => {
-                let message = if *source == QueueGenerationSource::LocalFallback {
-                    "✓ Forges regenerated locally"
-                } else {
-                    "✓ Forges regenerated"
-                };
-                lines.push(Line::from(Span::styled(message, muted())));
-                if let Some(notice) = notice {
-                    lines.push(Line::from(Span::styled(notice.clone(), muted())));
-                }
+            Some(QueueRegenerationFeedback::Success) => {
+                lines.push(Line::from(Span::styled("✓ Forges generated", accent())))
             }
             Some(QueueRegenerationFeedback::Failure { no_safe_forges }) => {
                 let message = if *no_safe_forges {
@@ -1219,6 +1226,7 @@ mod tests {
     use crate::models::{
         Agent, ForgeActivityTotals, RecommenderTokenUsageSummary, TokenUsageTotals,
     };
+    use crate::recommender::QueueGenerationSource;
     use chrono::{TimeZone, Utc};
     use tempfile::tempdir;
 
@@ -1282,7 +1290,7 @@ mod tests {
         assert!(text.contains("[l] Latest forges"));
         assert!(text.contains("[n] Next forges"));
         assert!(text.contains(
-            "[f] Forge now\n[l] Latest forges  [n] Next forges\n\nRecommender: [Codex]  ← →"
+            "Waiting for the next forge.\n\n[f] Forge now\n[l] Latest forges [n] Next forges\n\nRecommender: [Codex]  ← →"
         ));
         assert!(text.contains("Recommender: [Codex]  ← →"));
         assert!(!text.contains("[r] Change recommender"));
@@ -1376,11 +1384,12 @@ mod tests {
 
         assert_eq!(status.spans[0].style.fg, Some(colors::EMBER));
         assert_eq!(status.spans[1].style.fg, Some(colors::MUTED));
-        assert!(lines.windows(4).any(|window| {
-            window[0].to_string() == "[f] Forge now"
-                && window[1].to_string() == "[l] Latest forges  [n] Next forges"
-                && window[2].to_string().is_empty()
-                && window[3].to_string().starts_with("Recommender:")
+        assert!(lines.windows(5).any(|window| {
+            window[0].to_string() == "Forged. Waiting for the next forge."
+                && window[1].to_string().is_empty()
+                && window[2].to_string() == "[f] Forge now"
+                && window[3].to_string() == "[l] Latest forges [n] Next forges"
+                && window[4].to_string().is_empty()
         }));
     }
 
@@ -1576,28 +1585,22 @@ mod tests {
 
     #[test]
     fn next_forge_lines_show_regeneration_states() {
-        let loading = next_forge_lines(&[rec()], false, Some("◐"), None, None)
+        let loading = next_forge_lines(&[rec()], false, Some(3), None, None)
             .into_iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(loading.contains("Regenerating forges…"));
-        assert!(loading.contains("◐"));
+        assert!(loading.contains("━━━━ ━━━━ ━━━━ ━━━━ ━━━━"));
         assert!(!loading.contains("[r] Regenerate forges"));
 
-        let success_feedback = QueueRegenerationFeedback::Success {
-            source: QueueGenerationSource::LocalFallback,
-            notice: Some("LLM unavailable; used local fallback.".into()),
-            llm_count: 0,
-            local_count: 5,
-        };
+        let success_feedback = QueueRegenerationFeedback::Success;
         let success = next_forge_lines(&[], false, None, Some(&success_feedback), None)
             .into_iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(success.contains("✓ Forges regenerated locally"));
-        assert!(success.contains("LLM unavailable; used local fallback."));
+        assert!(success.contains("✓ Forges generated"));
+        assert!(!success.contains("local fallback"));
         assert!(success.contains("[r] Regenerate forges"));
 
         let failure_feedback = QueueRegenerationFeedback::Failure {
@@ -1649,8 +1652,13 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n")
         };
-        let loading = render(waiting_forge_now_lines(Some("◐"), None, None));
-        assert_eq!(loading, "◐ Generating forges…");
+        let loading = render(waiting_forge_now_lines(Some(3), None, None));
+        assert_eq!(loading, "━━━━ ━━━━ ━━━━ ━━━━ ━━━━");
+
+        let success =
+            waiting_forge_now_lines(None, Some(&QueueRegenerationFeedback::Success), None);
+        assert_eq!(render(success.clone()), "✓ Forges generated");
+        assert_eq!(success[0].spans[0].style.fg, Some(colors::EMBER));
 
         let no_safe = render(waiting_forge_now_lines(
             None,
@@ -1676,41 +1684,52 @@ mod tests {
             }))
             .unwrap();
 
-        poll_queue_regeneration(&mut ui);
+        let completed_at = Instant::now();
+        poll_queue_regeneration_at(&mut ui, completed_at);
 
         assert!(ui.queue_regeneration.is_none());
         assert_eq!(
             ui.queue_regeneration_feedback,
-            Some(QueueRegenerationFeedback::Success {
-                source: QueueGenerationSource::LocalFallback,
-                notice: Some("using local fallback".into()),
-                llm_count: 0,
-                local_count: 5,
-            })
+            Some(QueueRegenerationFeedback::Success)
         );
+        assert_eq!(
+            ui.queue_regeneration_feedback_started_at,
+            Some(completed_at)
+        );
+
+        poll_queue_regeneration_at(&mut ui, completed_at + Duration::from_millis(2_999));
+        assert_eq!(
+            ui.queue_regeneration_feedback,
+            Some(QueueRegenerationFeedback::Success)
+        );
+        poll_queue_regeneration_at(&mut ui, completed_at + Duration::from_secs(3));
+        assert!(ui.queue_regeneration_feedback.is_none());
+        assert!(ui.queue_regeneration_feedback_started_at.is_none());
 
         let (failure_sender, failure_receiver) = std::sync::mpsc::channel();
         ui.queue_regeneration = Some(failure_receiver);
         failure_sender.send(Err("failed".into())).unwrap();
-        poll_queue_regeneration(&mut ui);
+        poll_queue_regeneration_at(&mut ui, completed_at + Duration::from_secs(4));
         assert_eq!(
             ui.queue_regeneration_feedback,
             Some(QueueRegenerationFeedback::Failure {
                 no_safe_forges: false
             })
         );
+        poll_queue_regeneration_at(&mut ui, completed_at + Duration::from_secs(10));
+        assert!(matches!(
+            ui.queue_regeneration_feedback,
+            Some(QueueRegenerationFeedback::Failure { .. })
+        ));
     }
 
     #[test]
     fn busy_regeneration_request_is_a_true_noop() {
-        let feedback = QueueRegenerationFeedback::Success {
-            source: QueueGenerationSource::Codex,
-            notice: None,
-            llm_count: 5,
-            local_count: 0,
-        };
+        let feedback = QueueRegenerationFeedback::Success;
+        let feedback_started_at = Instant::now();
         let mut ui = TuiState {
             queue_regeneration_feedback: Some(feedback.clone()),
+            queue_regeneration_feedback_started_at: Some(feedback_started_at),
             ..TuiState::default()
         };
 
@@ -1719,15 +1738,29 @@ mod tests {
         assert!(ui.queue_regeneration.is_none());
         assert!(ui.queue_regeneration_started_at.is_none());
         assert_eq!(ui.queue_regeneration_feedback, Some(feedback));
+        assert_eq!(
+            ui.queue_regeneration_feedback_started_at,
+            Some(feedback_started_at)
+        );
     }
 
     #[test]
-    fn regeneration_spinner_advances_on_the_tui_refresh_clock() {
-        assert_eq!(queue_regeneration_spinner_frame(0), "◐");
-        assert_eq!(queue_regeneration_spinner_frame(200), "◓");
-        assert_eq!(queue_regeneration_spinner_frame(400), "◑");
-        assert_eq!(queue_regeneration_spinner_frame(600), "◒");
-        assert_eq!(queue_regeneration_spinner_frame(800), "◐");
+    fn regeneration_loader_pulses_in_twenty_percent_steps() {
+        assert_eq!(queue_regeneration_loader_frame(0), 0);
+        assert_eq!(queue_regeneration_loader_frame(200), 1);
+        assert_eq!(queue_regeneration_loader_frame(400), 2);
+        assert_eq!(queue_regeneration_loader_frame(600), 3);
+        assert_eq!(queue_regeneration_loader_frame(800), 4);
+        assert_eq!(queue_regeneration_loader_frame(1_000), 5);
+        assert_eq!(queue_regeneration_loader_frame(1_200), 0);
+
+        let line = queue_regeneration_loader_line(3);
+        assert_eq!(line.to_string(), "━━━━ ━━━━ ━━━━ ━━━━ ━━━━");
+        assert_eq!(line.spans[0].style.fg, Some(colors::EMBER));
+        assert_eq!(line.spans[2].style.fg, Some(colors::EMBER));
+        assert_eq!(line.spans[4].style.fg, Some(colors::EMBER));
+        assert_eq!(line.spans[6].style.fg, Some(colors::MUTED));
+        assert_eq!(line.spans[8].style.fg, Some(colors::MUTED));
     }
 
     #[test]
