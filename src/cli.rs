@@ -505,8 +505,11 @@ fn collect_profile(config: &mut Config, paths: &config::Paths, all: bool) -> Res
         || !config.onboarding.is_completed(config::STEP_HEIGHT)
         || !config.onboarding.is_completed(config::STEP_WEIGHT);
     if collecting_measurements {
-        config.profile.unit_system =
-            prompt_parse("Unit system", Some(config.profile.unit_system))?.unwrap();
+        let use_metric = prompt_bool(
+            "Use metric system",
+            config.profile.unit_system == UnitSystem::Metric,
+        )?;
+        config.profile.unit_system = unit_system_from_metric(use_metric);
         config::save(paths, config)?;
     }
 
@@ -1210,6 +1213,14 @@ fn prompt_bool(label: &str, default: bool) -> Result<bool> {
     ))
 }
 
+fn unit_system_from_metric(use_metric: bool) -> UnitSystem {
+    if use_metric {
+        UnitSystem::Metric
+    } else {
+        UnitSystem::Imperial
+    }
+}
+
 fn prompt_list(label: &str, default: &[String]) -> Result<Vec<String>> {
     let default_text = default.join(", ");
     let value = prompt_string(label, &default_text)?;
@@ -1237,6 +1248,12 @@ mod tests {
     use crate::config::{Paths, RuntimeMode};
     use clap::CommandFactory;
     use tempfile::tempdir;
+
+    #[test]
+    fn metric_prompt_choice_selects_unit_system() {
+        assert_eq!(unit_system_from_metric(true), UnitSystem::Metric);
+        assert_eq!(unit_system_from_metric(false), UnitSystem::Imperial);
+    }
 
     #[test]
     fn imperial_height_converts_to_canonical_centimeters() {
