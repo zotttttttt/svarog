@@ -20,6 +20,33 @@ can install missing prerequisites with rustup and Homebrew. On Linux, install
 `tmux` with your distribution package manager and Rust from
 [rustup.rs](https://rustup.rs/).
 
+### Install a released binary
+
+Download the archive for your computer from the
+[latest GitHub release](../../releases/latest):
+
+| Platform | Archive target |
+| --- | --- |
+| Apple Silicon macOS | `aarch64-apple-darwin` |
+| Intel macOS | `x86_64-apple-darwin` |
+| 64-bit Intel/AMD Linux | `x86_64-unknown-linux-gnu` |
+
+Each archive contains `svarog`, this README, and the license. Extract it and
+move `svarog` to a directory on your `PATH`, for example:
+
+```bash
+archive="svarog-VERSION-TARGET"
+tar -xzf "$archive.tar.gz"
+mkdir -p "$HOME/.local/bin"
+install -m 755 "$archive/svarog" "$HOME/.local/bin/svarog"
+```
+
+Replace `VERSION` and `TARGET` with the values in the downloaded filename.
+Compare the archive with `SHA256SUMS` from the same release before installing.
+Release binaries are not currently code-signed or notarized.
+
+### Install from a checkout
+
 From this checkout:
 
 ```bash

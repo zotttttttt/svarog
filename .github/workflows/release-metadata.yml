@@ -1,0 +1,116 @@
+name: Release metadata
+
+on:
+  pull_request_target:
+    types: [opened, reopened, edited, synchronize, labeled, unlabeled]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+  statuses: write
+
+jobs:
+  semver:
+    name: SemVer label and title
+    runs-on: ubuntu-latest
+    steps:
+      - name: Synchronize release label and squash title
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const status = async (state, description) => {
+              await github.rest.repos.createCommitStatus({
+                owner,
+                repo,
+                sha: pr.head.sha,
+                state,
+                context: "release-metadata",
+                description,
+                target_url: `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`,
+              });
+            };
+
+            const releasePleaseBranch = pr.head.ref.startsWith("release-please--branches--");
+            const releasePleaseLabel = pr.labels.some(({ name }) => name === "autorelease: pending");
+            if (releasePleaseBranch || releasePleaseLabel) {
+              core.info("Release Please PRs manage their own title and labels.");
+              await status("success", "Release Please PR metadata is managed automatically");
+              return;
+            }
+
+            await status("pending", "Synchronizing SemVer label and squash title");
+            const issue_number = pr.number;
+            const labels = {
+              "semver:breaking": {
+                color: "b60205",
+                description: "Breaking API or behavior change",
+                prefix: "feat!:",
+              },
+              "semver:minor": {
+                color: "1d76db",
+                description: "Backward-compatible feature",
+                prefix: "feat:",
+              },
+              "semver:patch": {
+                color: "0e8a16",
+                description: "Backward-compatible fix or improvement",
+                prefix: "fix:",
+              },
+              "semver:none": {
+                color: "ededed",
+                description: "No published release required",
+                prefix: "chore:",
+              },
+            };
+
+            for (const [name, properties] of Object.entries(labels)) {
+              try {
+                await github.rest.issues.createLabel({
+                  owner,
+                  repo,
+                  name,
+                  color: properties.color,
+                  description: properties.description,
+                });
+              } catch (error) {
+                if (error.status !== 422) throw error;
+              }
+            }
+
+            const eventLabel = context.payload.label?.name;
+            const selectedEventLabel =
+              context.payload.action === "labeled" && eventLabel && labels[eventLabel]
+                ? eventLabel
+                : null;
+            const currentLabels = pr.labels.map(({ name }) => name).filter((name) => labels[name]);
+            let selected = selectedEventLabel ?? currentLabels[0] ?? "semver:patch";
+
+            for (const name of currentLabels) {
+              if (name !== selected) {
+                await github.rest.issues.removeLabel({ owner, repo, issue_number, name });
+              }
+            }
+            if (!currentLabels.includes(selected)) {
+              await github.rest.issues.addLabels({ owner, repo, issue_number, labels: [selected] });
+            }
+
+            const conventionalPrefix = /^(?:feat!|feat|fix|chore)(?:\([^)]*\))?:\s*/i;
+            const subject = pr.title.replace(conventionalPrefix, "").trim();
+            const title = `${labels[selected].prefix} ${subject}`;
+            if (title !== pr.title) {
+              await github.rest.pulls.update({ owner, repo, pull_number: issue_number, title });
+            }
+
+            await status("success", `${selected} selects ${labels[selected].prefix}`);
+
+            await core.summary
+              .addHeading("Release metadata")
+              .addTable([
+                [{ data: "Label", header: true }, { data: "Squash title", header: true }],
+                [selected, title],
+              ])
+              .write();
