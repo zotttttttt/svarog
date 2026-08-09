@@ -506,7 +506,7 @@ fn collect_profile(config: &mut Config, paths: &config::Paths, all: bool) -> Res
         || !config.onboarding.is_completed(config::STEP_WEIGHT);
     if collecting_measurements {
         let use_metric = prompt_bool(
-            "Use metric system",
+            "Use metric units? (n = imperial)",
             config.profile.unit_system == UnitSystem::Metric,
         )?;
         config.profile.unit_system = unit_system_from_metric(use_metric);
