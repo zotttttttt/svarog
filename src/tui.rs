@@ -1,6 +1,8 @@
 use crate::cli;
 use crate::config::{self, Paths, RecommenderBackend, RuntimeEnv, RuntimeMode};
 use crate::daemon::{self, ForgeNowResult, QueueRegenerationResult, QueueRegenerationStart};
+use crate::exercise_catalog::{self, ExerciseCatalogEntry};
+use crate::exercise_media::{self, PreparedGallery};
 use crate::models::{
     AppStateKind, ForgeActivitySummary, Recommendation, RecommenderTokenProvider,
     RecommenderTokenUsageByProvider, SetStatus,
@@ -17,7 +19,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Alignment;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::Terminal;
 use std::io;
 use std::path::Path;
@@ -159,6 +161,11 @@ struct TuiState {
     skip_check: bool,
     animation_frame: usize,
     status_message: Option<String>,
+    show_help: bool,
+    help_scroll: u16,
+    exercise_media: Option<Receiver<Result<PreparedGallery, String>>>,
+    exercise_media_id: Option<String>,
+    exercise_media_feedback: Option<String>,
     show_history: bool,
     show_next: bool,
     queue_regeneration: Option<Receiver<QueueRegenerationResult>>,
@@ -223,18 +230,23 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
         }
 
         poll_queue_regeneration(&mut ui);
-
         let view = load_view(&env.paths);
         if view.kind == ViewKind::Forge {
             ui.show_history = false;
             ui.show_next = false;
         }
         sync_reps(&mut ui, view.recommendation.as_ref());
+        poll_exercise_media(&mut ui, view.recommendation.as_ref());
         terminal.draw(|frame| {
             let lines = screen_lines(&view, &ui, in_tmux);
-            let paragraph = Paragraph::new(lines)
+            let mut paragraph = Paragraph::new(lines)
                 .style(Style::default().bg(colors::BG).fg(colors::TEXT))
                 .alignment(Alignment::Left);
+            if ui.show_help && view.kind == ViewKind::Forge {
+                paragraph = paragraph
+                    .wrap(Wrap { trim: false })
+                    .scroll((ui.help_scroll, 0));
+            }
             frame.render_widget(paragraph, frame.area());
         })?;
 
@@ -242,6 +254,57 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
             if let Event::Key(key) = event::read()? {
                 if quit_requested(key) {
                     break Ok(());
+                }
+                if view.kind == ViewKind::Forge && ui.show_help {
+                    match key.code {
+                        KeyCode::Esc => {
+                            ui.show_help = false;
+                            ui.help_scroll = 0;
+                        }
+                        KeyCode::Up => ui.help_scroll = ui.help_scroll.saturating_sub(1),
+                        KeyCode::Down => {
+                            let area = terminal.size()?;
+                            let limit =
+                                help_scroll_limit(&view, &ui, in_tmux, area.width, area.height);
+                            ui.help_scroll = ui.help_scroll.saturating_add(1).min(limit);
+                        }
+                        KeyCode::PageUp => {
+                            ui.help_scroll = ui.help_scroll.saturating_sub(5);
+                        }
+                        KeyCode::PageDown => {
+                            let area = terminal.size()?;
+                            let limit =
+                                help_scroll_limit(&view, &ui, in_tmux, area.width, area.height);
+                            ui.help_scroll = ui.help_scroll.saturating_add(5).min(limit);
+                        }
+                        KeyCode::Home => ui.help_scroll = 0,
+                        KeyCode::End => {
+                            let area = terminal.size()?;
+                            ui.help_scroll =
+                                help_scroll_limit(&view, &ui, in_tmux, area.width, area.height);
+                        }
+                        KeyCode::Char('o') if ui.exercise_media.is_none() => {
+                            if let Some(entry) = view
+                                .recommendation
+                                .as_ref()
+                                .and_then(|rec| exercise_catalog::find(&rec.movement_id))
+                            {
+                                start_exercise_media(&mut ui, &env.paths, entry.clone());
+                            } else {
+                                ui.exercise_media_feedback =
+                                    Some("No reference images are available.".into());
+                            }
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+                if exercise_help_requested(key.code, view.kind) {
+                    ui.show_help = true;
+                    ui.help_scroll = 0;
+                    ui.skip_check = false;
+                    ui.exercise_media_feedback = None;
+                    continue;
                 }
                 if regenerate_queue_requested(key.code, view.kind, ui.show_next) {
                     if ui.queue_regeneration.is_none() {
@@ -473,7 +536,55 @@ fn sync_reps(ui: &mut TuiState, recommendation: Option<&Recommendation>) {
         ui.recommendation_id = rec_id;
         ui.actual_reps = recommendation.map(|rec| rec.reps).unwrap_or(0);
         ui.skip_check = false;
+        ui.show_help = false;
+        ui.help_scroll = 0;
+        ui.exercise_media_feedback = None;
     }
+}
+
+fn start_exercise_media(ui: &mut TuiState, paths: &Paths, entry: ExerciseCatalogEntry) {
+    let exercise_id = entry.id.clone();
+    let data_dir = paths.data_dir.clone();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = exercise_media::prepare_gallery(&data_dir, &entry)
+            .map_err(|error| format!("Could not prepare images: {error:#}"));
+        let _ = sender.send(result);
+    });
+    ui.exercise_media = Some(receiver);
+    ui.exercise_media_id = Some(exercise_id);
+    ui.exercise_media_feedback = None;
+}
+
+fn poll_exercise_media(ui: &mut TuiState, recommendation: Option<&Recommendation>) {
+    let result = match ui.exercise_media.as_ref().map(Receiver::try_recv) {
+        Some(Ok(result)) => Some(result),
+        Some(Err(TryRecvError::Disconnected)) => Some(Err(
+            "Could not prepare images: download worker stopped.".into(),
+        )),
+        Some(Err(TryRecvError::Empty)) | None => None,
+    };
+    let Some(result) = result else {
+        return;
+    };
+    ui.exercise_media = None;
+    let requested_id = ui.exercise_media_id.take();
+    let active_id = recommendation.map(|rec| rec.movement_id.as_str());
+    let still_viewing = ui.show_help && requested_id.as_deref() == active_id;
+    if !still_viewing {
+        return;
+    }
+
+    ui.exercise_media_feedback = Some(match result {
+        Ok(gallery) => match exercise_media::open_gallery(&gallery.path) {
+            Ok(()) => "Opened reference images in your browser.".into(),
+            Err(error) => format!(
+                "Images cached at {} but could not be opened: {error}",
+                gallery.path.display()
+            ),
+        },
+        Err(error) => error,
+    });
 }
 
 fn poll_queue_regeneration(ui: &mut TuiState) {
@@ -541,6 +652,22 @@ fn view_lines(view: &ViewModel, ui: &TuiState) -> Vec<Line<'static>> {
             ui.forge_now_feedback.as_deref(),
         );
     }
+    if ui.show_help && view.kind == ViewKind::Forge {
+        return view
+            .recommendation
+            .as_ref()
+            .map(|rec| {
+                exercise_help_lines(
+                    rec,
+                    exercise_catalog::find(&rec.movement_id),
+                    ui.exercise_media.is_some()
+                        && ui.exercise_media_id.as_deref() == Some(rec.movement_id.as_str()),
+                    ui.exercise_media_feedback.as_deref(),
+                    ui.demo,
+                )
+            })
+            .unwrap_or_default();
+    }
     match view.kind {
         ViewKind::Forge => view
             .recommendation
@@ -587,6 +714,70 @@ fn screen_lines(view: &ViewModel, ui: &TuiState, in_tmux: bool) -> Vec<Line<'sta
         lines.extend(tmux_control_lines());
     }
     lines.extend(quit_control_lines());
+    lines
+}
+
+fn help_scroll_limit(
+    view: &ViewModel,
+    ui: &TuiState,
+    in_tmux: bool,
+    area_width: u16,
+    area_height: u16,
+) -> u16 {
+    let width = usize::from(area_width.max(1));
+    let rendered_height = screen_lines(view, ui, in_tmux)
+        .iter()
+        .map(|line| line.width().max(1).div_ceil(width))
+        .sum::<usize>();
+    rendered_height
+        .saturating_sub(usize::from(area_height))
+        .min(usize::from(u16::MAX)) as u16
+}
+
+fn exercise_help_lines(
+    rec: &Recommendation,
+    entry: Option<&ExerciseCatalogEntry>,
+    downloading: bool,
+    feedback: Option<&str>,
+    demo: bool,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        title_line(demo),
+        Line::from(""),
+        Line::from(Span::styled(rec.display_name(), accent_bold())),
+        Line::from(Span::styled("How to", text_bold())),
+        Line::from(""),
+    ];
+    match entry {
+        Some(entry) if !entry.instructions.is_empty() => {
+            for (index, instruction) in entry.instructions.iter().enumerate() {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{}. ", index + 1), accent_bold()),
+                    Span::styled(instruction.clone(), text()),
+                ]));
+                lines.push(Line::from(""));
+            }
+        }
+        _ => {
+            lines.push(Line::from(Span::styled(
+                "No written instructions are available for this exercise.",
+                muted(),
+            )));
+            lines.push(Line::from(""));
+        }
+    }
+    if downloading {
+        lines.push(Line::from(Span::styled(
+            "Downloading reference images…",
+            accent(),
+        )));
+    } else if let Some(feedback) = feedback {
+        lines.push(Line::from(Span::styled(feedback.to_string(), muted())));
+    }
+    lines.push(Line::from(Span::styled(
+        "[o] Open images  [↑/↓] Scroll  [esc] Back",
+        muted(),
+    )));
     lines
 }
 
@@ -792,6 +983,10 @@ fn quit_control_lines() -> Vec<Line<'static>> {
 
 fn quit_requested(key: KeyEvent) -> bool {
     key.code == KeyCode::Char('q') && key.modifiers == KeyModifiers::NONE
+}
+
+fn exercise_help_requested(code: KeyCode, kind: ViewKind) -> bool {
+    kind == ViewKind::Forge && matches!(code, KeyCode::Char('i') | KeyCode::Char('?'))
 }
 
 fn increase_reps_requested(code: KeyCode) -> bool {
@@ -1121,6 +1316,7 @@ fn forge_lines(rec: &Recommendation, ui: &TuiState) -> Vec<Line<'static>> {
             Span::styled(format!("{}", ui.actual_reps.max(1)), accent_bold()),
             Span::styled("  [+/-]", muted()),
         ]),
+        Line::from(Span::styled("[i] How to", muted())),
     ]);
     lines
 }
@@ -2066,6 +2262,98 @@ mod tests {
         assert!(text.contains("12 kg"));
         assert!(text.contains("10 reps"));
         assert!(text.contains("15"));
+        assert!(text.contains("[i] How to"));
+    }
+
+    #[test]
+    fn exercise_help_shows_numbered_instructions_and_controls() {
+        let mut recommendation = rec();
+        recommendation.movement_id = "Goblet_Squat".into();
+        recommendation.movement_name = "Goblet Squat".into();
+        let entry = exercise_catalog::find("Goblet_Squat").unwrap();
+
+        let text = exercise_help_lines(&recommendation, Some(entry), false, None, false)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("Goblet Squat\nHow to"));
+        assert!(text.contains("1. Stand holding a light kettlebell"));
+        assert!(text.contains("2. Squat down between your legs"));
+        assert!(text.contains("3. At the bottom position"));
+        assert!(text.contains("[o] Open images"));
+        assert!(text.contains("[↑/↓] Scroll"));
+        assert!(text.contains("[esc] Back"));
+    }
+
+    #[test]
+    fn exercise_help_handles_missing_instructions_and_download_feedback() {
+        let mut recommendation = rec();
+        recommendation.movement_id = "One-Arm_Kettlebell_Swings".into();
+        let entry = exercise_catalog::find("One-Arm_Kettlebell_Swings").unwrap();
+        assert!(entry.instructions.is_empty());
+
+        let loading = exercise_help_lines(&recommendation, Some(entry), true, None, false)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(loading.contains("No written instructions are available"));
+        assert!(loading.contains("Downloading reference images…"));
+
+        let failed = exercise_help_lines(
+            &recommendation,
+            Some(entry),
+            false,
+            Some("Could not prepare images: offline"),
+            false,
+        )
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        assert!(failed.contains("Could not prepare images: offline"));
+    }
+
+    #[test]
+    fn exercise_help_shortcut_is_only_active_during_a_forge() {
+        assert!(exercise_help_requested(KeyCode::Char('i'), ViewKind::Forge));
+        assert!(exercise_help_requested(KeyCode::Char('?'), ViewKind::Forge));
+        assert!(!exercise_help_requested(KeyCode::Char('i'), ViewKind::Idle));
+        assert!(!exercise_help_requested(
+            KeyCode::Char('i'),
+            ViewKind::Cooldown
+        ));
+    }
+
+    #[test]
+    fn media_worker_failure_is_reported_only_while_same_help_is_open() {
+        let recommendation = rec();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let mut ui = TuiState {
+            show_help: true,
+            exercise_media: Some(receiver),
+            exercise_media_id: Some(recommendation.movement_id.clone()),
+            ..TuiState::default()
+        };
+        sender.send(Err("offline".into())).unwrap();
+
+        poll_exercise_media(&mut ui, Some(&recommendation));
+
+        assert!(ui.exercise_media.is_none());
+        assert_eq!(ui.exercise_media_feedback.as_deref(), Some("offline"));
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        ui.show_help = false;
+        ui.exercise_media = Some(receiver);
+        ui.exercise_media_id = Some(recommendation.movement_id.clone());
+        ui.exercise_media_feedback = None;
+        sender.send(Err("offline again".into())).unwrap();
+
+        poll_exercise_media(&mut ui, Some(&recommendation));
+
+        assert!(ui.exercise_media_feedback.is_none());
     }
 
     #[test]

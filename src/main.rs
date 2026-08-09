@@ -3,6 +3,7 @@ mod config;
 mod daemon;
 mod engine;
 mod exercise_catalog;
+mod exercise_media;
 mod hooks;
 mod models;
 mod notifications;

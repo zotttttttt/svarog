@@ -90,6 +90,7 @@ When a movement session appears, do the movement and record the outcome:
 | --- | --- |
 | `d` or Enter | Finish the movement session |
 | `+` (`=`) / `-` | Adjust the reps you completed |
+| `i` or `?` | Show instructions and reference images |
 | `s` | Skip, report fatigue, or remove the exercise |
 | `p` | Report pain and block that movement |
 | `q` | Quit Svarog |
@@ -277,8 +278,10 @@ Exercise identities and metadata come from
 [`b0eed061`](https://github.com/yuhonas/free-exercise-db/commit/b0eed061e1c832b3ed815fbaa4b45b3cdc14df49).
 The project releases the dataset into the public domain under the
 [Unlicense](https://github.com/yuhonas/free-exercise-db/blob/main/LICENSE.md). Svarog bundles a
-compact copy and sends only `id`, `force`, `mechanic`, `equipment`, `primaryMuscles`,
-`secondaryMuscles`, and `category` to its recommendation model.
+compact copy. Instructions and image paths stay local; only `id`, `force`, `mechanic`,
+`equipment`, `primaryMuscles`, `secondaryMuscles`, and `category` are sent to the
+recommendation model. Reference images are downloaded on demand and cached under
+Svarog's data directory.
 
 ## Update a development install
 

@@ -18,6 +18,10 @@ pub struct ExerciseCatalogEntry {
     pub primary_muscles: Vec<String>,
     pub secondary_muscles: Vec<String>,
     pub category: String,
+    #[serde(default, skip_serializing)]
+    pub instructions: Vec<String>,
+    #[serde(default, skip_serializing)]
+    pub images: Vec<String>,
 }
 
 pub fn all() -> &'static [ExerciseCatalogEntry] {
@@ -159,6 +163,9 @@ pub fn validate() -> Result<()> {
         if entry.category.trim().is_empty() {
             anyhow::bail!("exercise {} has no category", entry.id);
         }
+        if entry.images.iter().any(|image| image.trim().is_empty()) {
+            anyhow::bail!("exercise {} has an empty image path", entry.id);
+        }
     }
     serde_json::from_str::<Vec<ExerciseCatalogEntry>>(CATALOG_JSON)
         .context("validating bundled exercise catalog")?;
@@ -221,7 +228,7 @@ fn normalize_equipment(value: &str) -> Option<&'static str> {
     }
 }
 
-fn display_name(id: &str) -> String {
+pub fn display_name(id: &str) -> String {
     id.replace(['_', '-'], " ")
         .split_whitespace()
         .map(|word| {
@@ -243,6 +250,20 @@ mod tests {
     fn bundled_catalog_is_valid_and_large() {
         validate().unwrap();
         assert_eq!(all().len(), 873);
+        assert!(all().iter().all(|entry| entry.images.len() == 2));
+        assert_eq!(
+            all()
+                .iter()
+                .filter(|entry| !entry.instructions.is_empty())
+                .count(),
+            868
+        );
+        let goblet_squat = find("Goblet_Squat").unwrap();
+        assert_eq!(goblet_squat.instructions.len(), 3);
+        assert_eq!(
+            goblet_squat.images,
+            ["Goblet_Squat/0.jpg", "Goblet_Squat/1.jpg"]
+        );
     }
 
     #[test]
