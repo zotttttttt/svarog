@@ -68,6 +68,16 @@ Bare `svarog` does the same thing. Keep one dashboard running while you work in
 Codex. Prompts from all your Codex terminals feed that dashboard; prompt text is
 not collected.
 
+To erase your profile and all Svarog activity data and begin onboarding again,
+stop any running dashboard and use:
+
+```bash
+svarog setup --reset
+```
+
+The command requires you to type `destroy all` before it changes anything. It
+preserves the Svarog installation and Codex integration files.
+
 The event collector listens only on a loopback address. Svarog rejects
 non-loopback `SVAROG_DAEMON_ADDR` values because the local API is not
 authenticated.

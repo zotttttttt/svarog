@@ -29,6 +29,9 @@ enum Command {
         dev: bool,
         #[arg(long)]
         dry_run: bool,
+        /// Erase all user data and restart onboarding.
+        #[arg(long, conflicts_with = "dry_run")]
+        reset: bool,
     },
     #[command(hide = true)]
     Init,
@@ -96,9 +99,13 @@ pub async fn run() -> Result<()> {
 
     match cli.command {
         None => launch(&env).await,
-        Some(Command::Setup { dev, dry_run }) => {
+        Some(Command::Setup {
+            dev,
+            dry_run,
+            reset,
+        }) => {
             let setup_env = RuntimeEnv::load_with_options(dev, dry_run)?;
-            setup(&setup_env)
+            setup(&setup_env, reset)
         }
         Some(Command::Init) => init(&env),
         Some(Command::Calibrate) => calibrate(&env),
@@ -155,29 +162,35 @@ pub async fn run() -> Result<()> {
     }
 }
 
-fn setup(env: &RuntimeEnv) -> Result<()> {
+fn setup(env: &RuntimeEnv, reset: bool) -> Result<()> {
     if env.dry_run {
         return setup_dry_run(env);
     }
     let paths = &env.paths;
     let existing_config = paths.config_file.exists();
-    let mut config = if existing_config {
+    let mut config = if reset {
+        confirm_full_reset()?;
+        daemon::ensure_tui_available(env)?;
+        reset_user_data(env)?;
+        println!();
+        Config::default()
+    } else if existing_config {
         config::load_or_default(paths)?
     } else {
         Config::default()
     };
-    let mut destroy_all = false;
     print_setup_intro(env);
 
-    if existing_config {
+    if existing_config && !reset {
         match prompt_existing_profile_action()? {
             ExistingProfileAction::Continue => {}
             ExistingProfileAction::DestroyProfile => {
                 config = Config::default();
             }
             ExistingProfileAction::DestroyAll => {
+                daemon::ensure_tui_available(env)?;
+                reset_user_data(env)?;
                 config = Config::default();
-                destroy_all = true;
             }
         }
         println!();
@@ -185,7 +198,7 @@ fn setup(env: &RuntimeEnv) -> Result<()> {
 
     collect_profile(&mut config, paths, true)?;
 
-    finish_setup(env, &config, destroy_all)
+    finish_setup(env, &config)
 }
 
 fn setup_pending(env: &RuntimeEnv) -> Result<()> {
@@ -217,16 +230,22 @@ fn setup_pending(env: &RuntimeEnv) -> Result<()> {
     }
 
     collect_profile(&mut config, paths, false)?;
-    finish_setup(env, &config, false)
+    finish_setup(env, &config)
 }
 
-fn finish_setup(env: &RuntimeEnv, config: &Config, destroy_all: bool) -> Result<()> {
+fn reset_user_data(env: &RuntimeEnv) -> Result<()> {
+    let config = Config::default();
+    config::save(&env.paths, &config)?;
+    let store = Store::open(&env.paths.database_file)?;
+    store.reset_all_data()?;
+    println!("All Svarog user data was reset. Starting onboarding from the beginning.");
+    Ok(())
+}
+
+fn finish_setup(env: &RuntimeEnv, config: &Config) -> Result<()> {
     let paths = &env.paths;
     config::save(paths, config)?;
     let store = Store::open(&paths.database_file)?;
-    if destroy_all {
-        store.reset_all_data()?;
-    }
     store.clear_queued_recommendations()?;
     store.clear_exercise_exclusions()?;
     store.save_user_profile(config)?;
@@ -348,7 +367,7 @@ async fn run_demo(_remove_data: bool) -> Result<()> {
             println!("This cannot be recovered. Production data was not changed.");
             println!();
         }
-        setup(&env)?;
+        setup(&env, false)?;
         wait_for_tui("Press Enter to open the demo TUI: ")?;
     } else if production_needs_setup(&env)? {
         setup_pending(&env)?;
@@ -956,6 +975,23 @@ enum ExistingProfileAction {
     DestroyAll,
 }
 
+fn confirm_full_reset() -> Result<()> {
+    println!("This permanently removes your Svarog profile and all activity history.");
+    print!("Type \"destroy all\" to reset all user data and restart onboarding: ");
+    io::stdout().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    parse_full_reset_confirmation(input.trim())
+}
+
+fn parse_full_reset_confirmation(value: &str) -> Result<()> {
+    if value == "destroy all" {
+        Ok(())
+    } else {
+        bail!("reset cancelled; type exactly \"destroy all\" to confirm")
+    }
+}
+
 fn prompt_existing_profile_action() -> Result<ExistingProfileAction> {
     println!("{}", ember("Existing Svarog profile found."));
     print!(
@@ -1279,6 +1315,31 @@ mod tests {
     }
 
     #[test]
+    fn cli_parses_explicit_setup_reset() {
+        let production = Cli::try_parse_from(["svarog", "setup", "--reset"]).unwrap();
+        assert!(matches!(
+            production.command,
+            Some(Command::Setup {
+                dev: false,
+                dry_run: false,
+                reset: true
+            })
+        ));
+
+        let dev = Cli::try_parse_from(["svarog", "setup", "--dev", "--reset"]).unwrap();
+        assert!(matches!(
+            dev.command,
+            Some(Command::Setup {
+                dev: true,
+                dry_run: false,
+                reset: true
+            })
+        ));
+
+        assert!(Cli::try_parse_from(["svarog", "setup", "--reset", "--dry-run"]).is_err());
+    }
+
+    #[test]
     fn cli_parses_demo_commands() {
         let plain = Cli::try_parse_from(["svarog", "demo"]).unwrap();
         assert!(matches!(
@@ -1442,7 +1503,7 @@ mod tests {
         store.exclude_exercise("Plank").unwrap();
         drop(store);
 
-        finish_setup(&env, &config, false).unwrap();
+        finish_setup(&env, &config).unwrap();
 
         let store = Store::open(&env.paths.database_file).unwrap();
         assert_eq!(store.event_count().unwrap(), 1);
@@ -1453,6 +1514,49 @@ mod tests {
         assert_eq!(store.queued_recommendation_count().unwrap(), 0);
         assert!(store.removed_exercise_ids().unwrap().is_empty());
         assert!(env.codex_home.join("hooks.json").exists());
+    }
+
+    #[test]
+    fn explicit_reset_clears_history_and_restarts_onboarding() {
+        let root = tempdir().unwrap();
+        let env = RuntimeEnv {
+            mode: RuntimeMode::Production,
+            paths: Paths::from_root(root.path().join("svarog")),
+            codex_home: root.path().join("codex"),
+            daemon_addr: "127.0.0.1:8787".parse().unwrap(),
+            dry_run: false,
+        };
+        let mut config = Config::default();
+        config.profile.height_cm = Some(197);
+        for step in config::CURRENT_ONBOARDING_STEPS {
+            config.onboarding.mark_completed(step);
+        }
+        config::save(&env.paths, &config).unwrap();
+        let store = Store::open(&env.paths.database_file).unwrap();
+        store
+            .insert_event(&crate::models::AgentEvent {
+                agent: Agent::Codex,
+                event: "user_prompt_submit".into(),
+                expected_duration_sec: 60,
+                project: Some("svarog".into()),
+                created_at: chrono::Utc::now(),
+            })
+            .unwrap();
+        store.exclude_exercise("Plank").unwrap();
+        drop(store);
+
+        reset_user_data(&env).unwrap();
+
+        let reset_config = config::load_or_default(&env.paths).unwrap();
+        assert_eq!(reset_config.profile.height_cm, None);
+        assert_eq!(
+            reset_config.onboarding.pending_steps(),
+            config::CURRENT_ONBOARDING_STEPS
+        );
+        let store = Store::open(&env.paths.database_file).unwrap();
+        assert_eq!(store.event_count().unwrap(), 0);
+        assert!(store.removed_exercise_ids().unwrap().is_empty());
+        assert_eq!(store.state().unwrap().kind, AppStateKind::Idle);
     }
 
     #[test]
@@ -1551,5 +1655,13 @@ mod tests {
         );
         assert!(parse_existing_profile_action("delete all").is_err());
         assert!(parse_existing_profile_action("DESTROY ALL").is_err());
+    }
+
+    #[test]
+    fn full_reset_confirmation_requires_exact_destroy_phrase() {
+        assert!(parse_full_reset_confirmation("destroy all").is_ok());
+        assert!(parse_full_reset_confirmation("").is_err());
+        assert!(parse_full_reset_confirmation("delete all").is_err());
+        assert!(parse_full_reset_confirmation("DESTROY ALL").is_err());
     }
 }
