@@ -300,6 +300,7 @@ fn print_setup_intro(env: &RuntimeEnv) {
 }
 
 async fn run_tui(env: &RuntimeEnv) -> Result<()> {
+    daemon::refresh_exercise_pool(env)?;
     let collector = daemon::Collector::start(env).await?;
     let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let tui_shutdown = std::sync::Arc::clone(&shutdown);

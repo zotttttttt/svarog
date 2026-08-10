@@ -221,6 +221,10 @@ same primary muscle, adds an 18-minute cooldown after a completed forge, blocks
 a movement immediately after pain, and suppresses the next five opportunities
 when you report fatigue.
 
+Svarog is designed for one-person exercise sessions. Exercises that require a
+partner for positioning, resistance, or assistance are excluded from every
+recommender.
+
 Recommendations are not medical advice. Stop if a movement hurts or feels
 unsafe for you.
 

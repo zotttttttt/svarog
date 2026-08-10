@@ -571,7 +571,7 @@ impl Store {
                 updated_at = excluded.updated_at
             "#,
             params![
-                crate::exercise_catalog::CATALOG_REVISION,
+                crate::exercise_catalog::movement_pool_revision(),
                 serde_json::to_string(&equipment)?,
                 Utc::now().to_rfc3339(),
             ],
@@ -615,7 +615,7 @@ impl Store {
                 |row| row.get::<_, String>(0),
             )
             .optional()?;
-        Ok(revision.as_deref() == Some(crate::exercise_catalog::CATALOG_REVISION))
+        Ok(revision.as_deref() == Some(crate::exercise_catalog::movement_pool_revision()))
     }
 
     pub fn save_exercise_filter<T: serde::Serialize>(&self, filter: &T) -> Result<()> {
