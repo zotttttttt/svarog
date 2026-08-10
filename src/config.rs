@@ -43,7 +43,7 @@ pub const STEP_FORGE_FREQUENCY: &str = "preferences.forge_frequency";
 pub const STEP_DESKTOP_NOTIFICATIONS: &str = "preferences.desktop_notifications";
 pub const STEP_CODEX_COMMAND: &str = "agents.codex_command";
 pub const STEP_EXERCISE_PREFERENCES: &str = "profile.exercise_preferences";
-pub const STEP_RECOMMENDER_BACKEND: &str = "recommender.backend";
+const LEGACY_STEP_RECOMMENDER_BACKEND: &str = "recommender.backend";
 
 // Keep this frozen for configs written before onboarding metadata existed.
 pub const ORIGINAL_ONBOARDING_STEPS: [&str; 14] = [
@@ -60,11 +60,11 @@ pub const ORIGINAL_ONBOARDING_STEPS: [&str; 14] = [
     STEP_FORGE_FREQUENCY,
     STEP_CODEX_COMMAND,
     STEP_EXERCISE_PREFERENCES,
-    STEP_RECOMMENDER_BACKEND,
+    LEGACY_STEP_RECOMMENDER_BACKEND,
 ];
 
 // Add every new question here with a stable ID and increment the version above.
-pub const CURRENT_ONBOARDING_STEPS: [&str; 15] = [
+pub const CURRENT_ONBOARDING_STEPS: [&str; 14] = [
     STEP_HEIGHT,
     STEP_WEIGHT,
     STEP_AGE,
@@ -78,7 +78,6 @@ pub const CURRENT_ONBOARDING_STEPS: [&str; 15] = [
     STEP_FORGE_FREQUENCY,
     STEP_CODEX_COMMAND,
     STEP_EXERCISE_PREFERENCES,
-    STEP_RECOMMENDER_BACKEND,
     STEP_DESKTOP_NOTIFICATIONS,
 ];
 
@@ -205,44 +204,32 @@ pub struct Recommender {
 pub enum RecommenderBackend {
     Codex,
     Openai,
+    #[serde(alias = "off")]
     Local,
-    Off,
 }
 
 impl RecommenderBackend {
-    pub fn as_config_value(self) -> &'static str {
-        match self {
-            Self::Codex => "codex",
-            Self::Openai => "openai",
-            Self::Local => "local",
-            Self::Off => "off",
-        }
-    }
-
     pub fn label(self) -> &'static str {
         match self {
             Self::Codex => "Codex",
             Self::Openai => "OpenAI API",
             Self::Local => "Local",
-            Self::Off => "Off",
         }
     }
 
     pub fn next(self) -> Self {
         match self {
-            Self::Codex => Self::Openai,
-            Self::Openai => Self::Local,
-            Self::Local => Self::Off,
-            Self::Off => Self::Codex,
+            Self::Local => Self::Openai,
+            Self::Openai => Self::Codex,
+            Self::Codex => Self::Local,
         }
     }
 
     pub fn previous(self) -> Self {
         match self {
-            Self::Codex => Self::Off,
-            Self::Openai => Self::Codex,
-            Self::Local => Self::Openai,
-            Self::Off => Self::Local,
+            Self::Local => Self::Codex,
+            Self::Codex => Self::Openai,
+            Self::Openai => Self::Local,
         }
     }
 }
@@ -255,8 +242,7 @@ impl FromStr for RecommenderBackend {
             "codex" => Ok(Self::Codex),
             "openai" | "openai api" | "openai_api" => Ok(Self::Openai),
             "local" => Ok(Self::Local),
-            "off" | "none" | "disabled" => Ok(Self::Off),
-            _ => Err("use one of: codex, openai, local, off".to_string()),
+            _ => Err("use one of: codex, openai, local".to_string()),
         }
     }
 }
@@ -312,7 +298,7 @@ impl Default for Config {
 impl Default for Recommender {
     fn default() -> Self {
         Self {
-            backend: RecommenderBackend::Codex,
+            backend: RecommenderBackend::Local,
             timeout_ms: 60_000,
             local_fallback: true,
             show_llm_failures: true,
@@ -769,6 +755,7 @@ mod tests {
         assert_eq!(config.preferences.forge_frequency, 2);
         assert!(config.preferences.desktop_notifications);
         assert_eq!(config.profile.exercise_preferences, "automatic");
+        assert_eq!(config.recommender.backend, RecommenderBackend::Local);
         for feature in [
             "apps",
             "plugins",
@@ -790,6 +777,25 @@ mod tests {
         assert_eq!(config.recommender.codex.model, "gpt-5.6-luna");
         assert_eq!(config.recommender.timeout_ms, 60_000);
         assert_eq!(config.onboarding.pending_steps(), CURRENT_ONBOARDING_STEPS);
+    }
+
+    #[test]
+    fn legacy_off_recommender_migrates_to_local() {
+        let root = tempdir().unwrap();
+        let paths = Paths::from_root(root.path().join("svarog"));
+        let serialized = toml::to_string_pretty(&Config::default())
+            .unwrap()
+            .replace("backend = \"local\"", "backend = \"off\"");
+        paths.ensure().unwrap();
+        fs::write(&paths.config_file, serialized).unwrap();
+
+        let config = load_or_default(&paths).unwrap();
+
+        assert_eq!(config.recommender.backend, RecommenderBackend::Local);
+        save(&paths, &config).unwrap();
+        let migrated = fs::read_to_string(&paths.config_file).unwrap();
+        assert!(migrated.contains("backend = \"local\""));
+        assert!(!migrated.contains("backend = \"off\""));
     }
 
     #[test]

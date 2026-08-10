@@ -503,7 +503,7 @@ fn backend_available(config: &config::Config) -> bool {
         RecommenderBackend::Codex => command_available(&config.recommender.codex.command),
         RecommenderBackend::Openai => std::env::var(&config.recommender.openai.api_key_env)
             .is_ok_and(|value| !value.trim().is_empty()),
-        RecommenderBackend::Local | RecommenderBackend::Off => true,
+        RecommenderBackend::Local => true,
     }
 }
 
@@ -2044,24 +2044,19 @@ mod tests {
 
     #[test]
     fn backend_cycle_order_matches_tui_shortcut() {
-        assert_eq!(RecommenderBackend::Codex.next(), RecommenderBackend::Openai);
-        assert_eq!(RecommenderBackend::Openai.next(), RecommenderBackend::Local);
-        assert_eq!(RecommenderBackend::Local.next(), RecommenderBackend::Off);
-        assert_eq!(RecommenderBackend::Off.next(), RecommenderBackend::Codex);
+        assert_eq!(RecommenderBackend::Local.next(), RecommenderBackend::Openai);
+        assert_eq!(RecommenderBackend::Openai.next(), RecommenderBackend::Codex);
+        assert_eq!(RecommenderBackend::Codex.next(), RecommenderBackend::Local);
         assert_eq!(
-            RecommenderBackend::Codex.previous(),
-            RecommenderBackend::Off
-        );
-        assert_eq!(
-            RecommenderBackend::Openai.previous(),
+            RecommenderBackend::Local.previous(),
             RecommenderBackend::Codex
         );
         assert_eq!(
-            RecommenderBackend::Local.previous(),
+            RecommenderBackend::Codex.previous(),
             RecommenderBackend::Openai
         );
         assert_eq!(
-            RecommenderBackend::Off.previous(),
+            RecommenderBackend::Openai.previous(),
             RecommenderBackend::Local
         );
     }
@@ -2101,11 +2096,16 @@ mod tests {
         let paths = Paths::from_root(root);
         let config = Config::default();
         config::save(&paths, &config).unwrap();
+        let store = Store::open(&paths.database_file).unwrap();
+        let mut queued = rec();
+        queued.id = None;
+        store.insert_queued_recommendation(&queued).unwrap();
 
         cycle_recommender_backend(&paths, CycleDirection::Forward).unwrap();
 
         let saved = config::load_or_default(&paths).unwrap();
         assert_eq!(saved.recommender.backend, RecommenderBackend::Openai);
+        assert_eq!(store.queued_recommendation_count().unwrap(), 1);
     }
 
     #[test]
@@ -2118,7 +2118,7 @@ mod tests {
         cycle_recommender_backend(&paths, CycleDirection::Backward).unwrap();
 
         let saved = config::load_or_default(&paths).unwrap();
-        assert_eq!(saved.recommender.backend, RecommenderBackend::Off);
+        assert_eq!(saved.recommender.backend, RecommenderBackend::Codex);
     }
 
     #[test]
@@ -2208,14 +2208,12 @@ mod tests {
         assert!(!text.contains("12.4k / 320"));
         assert!(!text.contains("Use fewer Codex tokens"));
 
-        for label in ["Local", "Off"] {
-            let backend = BackendView {
-                label: label.into(),
-                unavailable: false,
-                config_file: "/tmp/svarog/config.toml".into(),
-            };
-            assert!(recommender_usage_lines(&backend, &usage).is_empty());
-        }
+        let local = BackendView {
+            label: "Local".into(),
+            unavailable: false,
+            config_file: "/tmp/svarog/config.toml".into(),
+        };
+        assert!(recommender_usage_lines(&local, &usage).is_empty());
     }
 
     #[test]

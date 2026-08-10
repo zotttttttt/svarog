@@ -204,7 +204,6 @@ fn generate_recommendation_queue_with_existing(
     };
     let (mut recommendations, notice, source, llm_count, local_count) =
         match config.recommender.backend {
-            RecommenderBackend::Off => (Vec::new(), None, QueueGenerationSource::Local, 0, 0),
             RecommenderBackend::Local => {
                 let local = local_queue(store, config, &event, needed, existing)?;
                 let local_count = local.len();
@@ -391,7 +390,7 @@ fn llm_queue(
     let batch = match config.recommender.backend {
         RecommenderBackend::Codex => call_codex_queue(store, config, &prompt, needed),
         RecommenderBackend::Openai => call_openai_queue(store, config, &prompt, needed),
-        RecommenderBackend::Local | RecommenderBackend::Off => unreachable!(),
+        RecommenderBackend::Local => unreachable!(),
     }?;
     let movements = store.movements()?;
     let mut recommendations: Vec<Recommendation> = existing.to_vec();
@@ -508,10 +507,7 @@ pub fn initial_exercise_profile(
     config: &Config,
     paths: &Paths,
 ) -> (Vec<Movement>, Option<String>) {
-    if matches!(
-        config.recommender.backend,
-        RecommenderBackend::Off | RecommenderBackend::Local
-    ) {
+    if config.recommender.backend == RecommenderBackend::Local {
         let (movements, equipment) = local_resolved_movements(config);
         let _ = store.save_exercise_filter(&equipment);
         return (movements, None);
@@ -522,7 +518,7 @@ pub fn initial_exercise_profile(
         .and_then(|prompt| match config.recommender.backend {
             RecommenderBackend::Codex => call_codex_exercise_profile(store, config, &prompt),
             RecommenderBackend::Openai => call_openai_exercise_profile(store, config, &prompt),
-            RecommenderBackend::Local | RecommenderBackend::Off => unreachable!(),
+            RecommenderBackend::Local => unreachable!(),
         })
         .and_then(validate_exercise_profile)
         .and_then(|(movements, equipment)| {
@@ -1347,6 +1343,7 @@ mod tests {
         permissions.set_mode(0o755);
         fs::set_permissions(&command, permissions).unwrap();
         let mut config = Config::default();
+        config.recommender.backend = RecommenderBackend::Codex;
         config.recommender.codex.command = command.display().to_string();
         config.recommender.codex.args.clear();
         config.recommender.timeout_ms = 5_000;
@@ -1604,7 +1601,8 @@ mod tests {
 
     #[test]
     fn fallback_notices_hide_internal_parser_details() {
-        let config = Config::default();
+        let mut config = Config::default();
+        config.recommender.backend = RecommenderBackend::Codex;
         let invalid = anyhow!("parsing codex JSON: invalid recommendation JSON");
         let timeout = anyhow!("codex recommender timed out after 60 seconds");
 

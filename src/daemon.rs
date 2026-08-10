@@ -478,7 +478,9 @@ mod tests {
     fn failed_regeneration_preserves_the_existing_queue() {
         let env = test_env();
         let mut config = Config::default();
-        config.recommender.backend = RecommenderBackend::Off;
+        config.recommender.backend = RecommenderBackend::Codex;
+        config.recommender.codex.command = "missing-codex-for-test".into();
+        config.recommender.local_fallback = false;
         crate::config::save(&env.paths, &config).unwrap();
         let store = Store::open(&env.paths.database_file).unwrap();
         let old = Recommendation {
@@ -568,7 +570,7 @@ mod tests {
         let env = test_env();
         let mut config = Config {
             recommender: Recommender {
-                backend: RecommenderBackend::Off,
+                backend: RecommenderBackend::Local,
                 ..Recommender::default()
             },
             ..Config::default()
@@ -631,7 +633,7 @@ mod tests {
     fn duplicate_codex_prompt_is_one_opportunity() {
         let env = test_env();
         let mut config = Config::default();
-        config.recommender.backend = RecommenderBackend::Off;
+        config.recommender.backend = RecommenderBackend::Local;
         config.preferences.forge_frequency = 1;
         crate::config::save(&env.paths, &config).unwrap();
 
@@ -648,7 +650,7 @@ mod tests {
     fn execution_turn_recommends_another_muscle_during_cooldown() {
         let env = test_env();
         let mut config = Config::default();
-        config.recommender.backend = RecommenderBackend::Off;
+        config.recommender.backend = RecommenderBackend::Local;
         config.preferences.forge_frequency = 1;
         crate::config::save(&env.paths, &config).unwrap();
 
@@ -679,7 +681,7 @@ mod tests {
     fn codex_stop_does_not_clear_open_forge() {
         let env = test_env();
         let mut config = Config::default();
-        config.recommender.backend = RecommenderBackend::Off;
+        config.recommender.backend = RecommenderBackend::Local;
         config.preferences.forge_frequency = 1;
         crate::config::save(&env.paths, &config).unwrap();
 
@@ -695,7 +697,7 @@ mod tests {
     async fn collector_serializes_concurrent_codex_prompts() {
         let env = test_env();
         let mut config = Config::default();
-        config.recommender.backend = RecommenderBackend::Off;
+        config.recommender.backend = RecommenderBackend::Local;
         config.preferences.forge_frequency = 1;
         crate::config::save(&env.paths, &config).unwrap();
         let state = Arc::new(AppState {
@@ -746,7 +748,7 @@ mod tests {
         let mut env = test_env();
         env.daemon_addr = "127.0.0.1:0".parse().unwrap();
         let mut config = Config::default();
-        config.recommender.backend = RecommenderBackend::Off;
+        config.recommender.backend = RecommenderBackend::Local;
         config.preferences.forge_frequency = 1;
         crate::config::save(&env.paths, &config).unwrap();
         let collector = match Collector::start(&env).await {

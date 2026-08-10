@@ -1,4 +1,4 @@
-use crate::config::{self, Config, RecommenderBackend, RuntimeEnv, UnitSystem};
+use crate::config::{self, Config, RuntimeEnv, UnitSystem};
 use crate::daemon;
 use crate::hooks;
 use crate::models::{Agent, AppStateKind, IncomingEvent, MovementStatus, SetStatus};
@@ -268,12 +268,7 @@ fn finish_setup(env: &RuntimeEnv, config: &Config) -> Result<()> {
         print_recommender_notice(config, env, &notice);
     }
     if recommender_notices == 0 {
-        let message = if config.recommender.backend == RecommenderBackend::Off {
-            "Recommendation generation disabled"
-        } else {
-            "Recommendation engine ready"
-        };
-        println!("{} {}", ember("✓"), text(message));
+        println!("{} {}", ember("✓"), text("Recommendation engine ready"));
     }
 
     println!();
@@ -610,7 +605,7 @@ fn collect_profile(config: &mut Config, paths: &config::Paths, all: bool) -> Res
         all,
         |config| {
             config.preferences.desktop_notifications = prompt_bool(
-                "Notify when a new forge is ready?",
+                "Notify you when your next exercise is ready?",
                 config.preferences.desktop_notifications,
             )?;
             Ok(())
@@ -631,16 +626,6 @@ fn collect_profile(config: &mut Config, paths: &config::Paths, all: bool) -> Res
                     "Exercise preferences (leave automatic, or enter preferences such as \"posture and stretching\" or \"no jumping\")",
                     &config.profile.exercise_preferences,
                 )?;
-            Ok(())
-        },
-    )?;
-    onboarding_step(
-        config,
-        paths,
-        config::STEP_RECOMMENDER_BACKEND,
-        all,
-        |config| {
-            config.recommender.backend = prompt_recommender_backend(config.recommender.backend)?;
             Ok(())
         },
     )?;
@@ -1232,20 +1217,10 @@ fn prompt_list(label: &str, default: &[String]) -> Result<Vec<String>> {
         .collect())
 }
 
-fn prompt_recommender_backend(default: RecommenderBackend) -> Result<RecommenderBackend> {
-    loop {
-        let value = prompt_string("Recommendation engine", default.as_config_value())?;
-        match value.parse::<RecommenderBackend>() {
-            Ok(backend) => return Ok(backend),
-            Err(err) => println!("{}", muted(err)),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Paths, RuntimeMode};
+    use crate::config::{Paths, RecommenderBackend, RuntimeMode};
     use clap::CommandFactory;
     use tempfile::tempdir;
 
@@ -1488,7 +1463,7 @@ mod tests {
             dry_run: false,
         };
         let mut config = Config::default();
-        config.recommender.backend = RecommenderBackend::Off;
+        config.recommender.backend = RecommenderBackend::Local;
         for step in config::CURRENT_ONBOARDING_STEPS {
             config.onboarding.mark_completed(step);
         }
@@ -1528,7 +1503,10 @@ mod tests {
             store.latest_open_recommendation().unwrap().unwrap().id,
             Some(current_id)
         );
-        assert_eq!(store.queued_recommendation_count().unwrap(), 0);
+        assert_eq!(
+            store.queued_recommendation_count().unwrap(),
+            recommender::QUEUE_TARGET
+        );
         assert!(store.removed_exercise_ids().unwrap().is_empty());
         assert!(env.codex_home.join("hooks.json").exists());
     }
@@ -1653,10 +1631,7 @@ mod tests {
             "local".parse::<RecommenderBackend>().unwrap(),
             RecommenderBackend::Local
         );
-        assert_eq!(
-            "off".parse::<RecommenderBackend>().unwrap(),
-            RecommenderBackend::Off
-        );
+        assert!("off".parse::<RecommenderBackend>().is_err());
         assert!("bad".parse::<RecommenderBackend>().is_err());
     }
 

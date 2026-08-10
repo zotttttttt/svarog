@@ -136,15 +136,14 @@ Stopping a Svarog-created tmux session also closes the coding agent inside it.
 
 ## Choose recommendations
 
-Setup asks which recommendation engine you want. You can switch later with the
+Svarog starts with its built-in Local recommender. Switch recommenders with the
 arrow keys while Svarog is waiting.
 
 | Recommender | What you get |
 | --- | --- |
-| Codex | Uses your installed Codex CLI; no separate API key |
-| OpenAI API | Uses your API key and keeps usage separate from Codex |
 | Local | Uses Svarog’s conservative built-in rules without an LLM |
-| Off | Stops generating recommendations |
+| OpenAI API | Uses your API key and keeps usage separate from Codex |
+| Codex | Uses your installed Codex CLI; no separate API key |
 
 To use the OpenAI API:
 
@@ -162,8 +161,8 @@ remains, Svarog prepares another batch of ten and keeps the current session
 available.
 
 The waiting screen shows input/output token totals for the currently selected
-remote recommender. Codex and OpenAI API usage are stored separately. Local and
-Off do not show a token panel.
+remote recommender. Codex and OpenAI API usage are stored separately. Local does
+not show a token panel.
 
 ## Notifications and safety
 
@@ -213,7 +212,7 @@ Recommendation data flow depends on the backend:
 
 | Backend | Data leaves your machine? |
 | --- | --- |
-| Local / Off | No |
+| Local | No |
 | Codex | The exercise profile or bounded workout context is passed to your installed Codex CLI |
 | OpenAI API | The exercise profile or bounded workout context is sent to the OpenAI Responses API |
 
