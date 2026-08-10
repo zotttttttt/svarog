@@ -2,6 +2,15 @@
 
 Notable changes to Svarog are recorded here by the automated release process.
 
+## [0.3.2](https://github.com/zotttttttt/svarog/compare/v0.3.1...v0.3.2) (2026-08-10)
+
+
+### Fixes
+
+* add third-party notices ([13f5272](https://github.com/zotttttttt/svarog/commit/13f5272050d6409df755da84eb8e1692a1bca609))
+* make notice verification reproducible ([f760da6](https://github.com/zotttttttt/svarog/commit/f760da6b4334c4bc51e3ea11c6c8df8c4887d574))
+* validate notices across platforms ([0485cfc](https://github.com/zotttttttt/svarog/commit/0485cfcad784e1eb369bb3bf3a7e4ba93bdfd1e0))
+
 ## [0.3.1](https://github.com/zotttttttt/svarog/compare/v0.3.0...v0.3.1) (2026-08-10)
 
 

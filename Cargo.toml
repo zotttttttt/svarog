@@ -1,6 +1,6 @@
 [package]
 name = "svarog"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 license = "MIT"
 description = "A CLI sidecar that turns AI-agent waiting time into tiny, adaptive workouts."
@@ -13,6 +13,9 @@ include = [
     "Cargo.lock",
     "LICENSE",
     "README.md",
+    "THIRD_PARTY_NOTICES.html",
+    "about.hbs",
+    "about.toml",
     "svarog.png",
     "build.rs",
     "data/**",

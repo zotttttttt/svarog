@@ -28,6 +28,15 @@ cargo test --locked
 Keep changes focused, add tests for behavior changes, and update the README
 when a command, platform requirement, privacy behavior, or data flow changes.
 
+When `Cargo.lock` changes, regenerate the bundled license notices before
+opening the pull request:
+
+```bash
+cargo install cargo-about --version 0.9.1 --locked --features cli
+cargo fetch --locked
+cargo about generate --frozen about.hbs > THIRD_PARTY_NOTICES.html
+```
+
 ## Release labels
 
 Every pull request gets one release label. New pull requests default to

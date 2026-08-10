@@ -49,8 +49,9 @@ Download the archive for your computer from the
 | Intel macOS | `x86_64-apple-darwin` |
 | 64-bit Intel/AMD Linux | `x86_64-unknown-linux-gnu` |
 
-Each archive contains `svarog`, this README, and the license. Extract it and
-move `svarog` to a directory on your `PATH`, for example:
+Each archive contains `svarog`, this README, the Svarog license, third-party
+notices, and the logo. Extract it and move `svarog` to a directory on your
+`PATH`, for example:
 
 ```bash
 archive="svarog-VERSION-TARGET"
@@ -318,23 +319,27 @@ profile template receives `config`. Structured values support
 
 ## Exercise data
 
-Svarog is built with deep appreciation for
-[free-exercise-db](https://github.com/yuhonas/free-exercise-db). Its generous,
-well-structured exercise library gives us clear movement identities, muscle and
-equipment metadata, instructions, and image references—the foundation that lets
-Svarog make recommendations that are understandable, practical, and grounded in
-real movements rather than opaque names.
+| Source | Used for | Terms |
+| --- | --- | --- |
+| [free-exercise-db](https://github.com/yuhonas/free-exercise-db) | Exercise catalog, instructions, and reference-image paths | [Unlicense](https://github.com/yuhonas/free-exercise-db/blob/main/LICENSE.md) |
+| [Pinned revision `b0eed061`](https://github.com/yuhonas/free-exercise-db/commit/b0eed061e1c832b3ed815fbaa4b45b3cdc14df49) | Reproducible recommendations | Bundled as a compact local copy |
 
-We pin the dataset at commit
-[`b0eed061`](https://github.com/yuhonas/free-exercise-db/commit/b0eed061e1c832b3ed815fbaa4b45b3cdc14df49)
-so recommendations stay reproducible, and bundle a compact copy for fast local
-use. The project releases its data into the public domain under the
-[Unlicense](https://github.com/yuhonas/free-exercise-db/blob/main/LICENSE.md).
+Reference images download on demand and are cached locally. Instructions and
+image paths stay local; remote recommenders receive only `id`, `force`,
+`mechanic`, `equipment`, `primaryMuscles`, `secondaryMuscles`, and `category`.
 
-Instructions and image paths stay local. Only `id`, `force`, `mechanic`,
-`equipment`, `primaryMuscles`, `secondaryMuscles`, and `category` are sent to the
-recommendation model. Reference images are downloaded on demand and cached under
-Svarog's data directory.
+## Built with
+
+| Library | Role |
+| --- | --- |
+| [Ratatui](https://ratatui.rs/) and [Crossterm](https://github.com/crossterm-rs/crossterm) | Terminal interface |
+| [Tokio](https://tokio.rs/), [Axum](https://github.com/tokio-rs/axum), and [Reqwest](https://github.com/seanmonstar/reqwest) | Local collector and networking |
+| [Rusqlite](https://github.com/rusqlite/rusqlite) and SQLite | Local workout history |
+| [Clap](https://github.com/clap-rs/clap) | Command-line interface |
+| [Serde](https://serde.rs/), [TOML](https://github.com/toml-rs/toml), and [MiniJinja](https://github.com/mitsuhiko/minijinja) | Configuration and recommendation templates |
+
+See [third-party notices](THIRD_PARTY_NOTICES.html) for the complete dependency
+and license inventory.
 
 ## Update a development install
 
