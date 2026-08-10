@@ -44,4 +44,4 @@ receives `config`. Structured values support `|tojson(indent=2)`.
 
 Keep the output and safety constraints intact: remote results must match
 Svarog's schemas, use canonical exercise IDs, respect available equipment, and
-remain short enough for coding-agent pauses.
+remain short enough to complete while your coding agent works.

@@ -24,16 +24,16 @@
 
 Your coding agent is working. You should move.
 
-Svarog is a local Rust CLI and terminal dashboard that turns natural pauses in
-AI-assisted work into tiny workouts. It learns from your equipment,
-preferences, recent activity, fatigue, and pain—then keeps each movement short
-enough to fit the wait.
+Svarog is a local Rust CLI and terminal dashboard that turns the time your
+coding agent spends executing a task into tiny workouts. It learns from your
+equipment, preferences, recent activity, fatigue, and pain—then keeps each
+movement short enough to finish while the agent works.
 
 The loop is simple:
 
-1. Your coding agent reaches a natural pause.
-2. Svarog prepares a safe, short movement.
-3. You finish, skip, or report pain.
+1. You give your coding agent a spec or prompt to execute.
+2. As the agent starts working, Svarog prepares a safe, short movement.
+3. You finish, skip, or report pain while the agent works.
 4. Your history shapes what comes next.
 
 Use the conservative built-in recommender, your installed Codex CLI, or the
@@ -128,7 +128,8 @@ During a movement:
 | --- | --- |
 | `d` or Enter | Finish and record the displayed reps |
 | `+` / `-` | Adjust the reps you completed |
-| `i` or `?` | Read instructions and access reference images |
+| `i` or `?` | Read step-by-step instructions |
+| `o` | Open the visual guide with reference images from the instructions screen |
 | `s` | Skip, report fatigue, or remove the exercise |
 | `p` | Report pain and block the exercise |
 
