@@ -15,6 +15,23 @@ cargo run -- demo
 The demo stores all state under `./.svarog-dev`; it does not use production
 Svarog data or hooks.
 
+## Update a development install
+
+Run the project launcher after changing the checkout. It detects source
+changes, offers to reinstall the binary, and then continues with the command
+you passed:
+
+```bash
+scripts/svarog run
+```
+
+Control that prompt with `SVAROG_UPDATE=always`, `ask`, or `never`. You can also
+install directly:
+
+```bash
+cargo install --locked --path . --force
+```
+
 ## Before opening a pull request
 
 Run the same checks as CI:
