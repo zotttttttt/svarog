@@ -33,7 +33,8 @@ opening the pull request:
 
 ```bash
 cargo install cargo-about --version 0.9.1 --locked --features cli
-cargo about generate --locked about.hbs > THIRD_PARTY_NOTICES.html
+cargo fetch --locked
+cargo about generate --frozen about.hbs > THIRD_PARTY_NOTICES.html
 ```
 
 ## Release labels
