@@ -2,6 +2,15 @@
 
 Notable changes to Svarog are recorded here by the automated release process.
 
+## [0.3.4](https://github.com/zotttttttt/svarog/compare/v0.3.3...v0.3.4) (2026-08-10)
+
+
+### Fixes
+
+* docs: clarify agent workflow and visual guide ([e6b865b](https://github.com/zotttttttt/svarog/commit/e6b865bacee347d80beab465368729c859e4272e))
+* docs/readme and release fix ([fd9fbe4](https://github.com/zotttttttt/svarog/commit/fd9fbe4ec016531d8210ba72f799a57d87c29894))
+* target repository for release upload ([5a84679](https://github.com/zotttttttt/svarog/commit/5a846790f6016c6de66235ff3769eda1589543a8))
+
 ## [0.3.3](https://github.com/zotttttttt/svarog/compare/v0.3.2...v0.3.3) (2026-08-10)
 
 
