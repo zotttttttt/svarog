@@ -389,6 +389,12 @@ fn regenerate_queue_now(env: &RuntimeEnv) -> Result<QueueRegenerationOutcome> {
     })
 }
 
+pub fn refresh_exercise_pool(env: &RuntimeEnv) -> Result<()> {
+    let config = load_or_default(&env.paths)?;
+    let store = Store::open(&env.paths.database_file)?;
+    ensure_exercise_pool(&store, &config)
+}
+
 fn ensure_exercise_pool(store: &Store, config: &Config) -> Result<()> {
     if store.exercise_catalog_is_current()? {
         return Ok(());
@@ -403,7 +409,7 @@ fn ensure_exercise_pool(store: &Store, config: &Config) -> Result<()> {
 mod tests {
     use super::*;
     use crate::config::{Config, Paths, Recommender, RecommenderBackend, RuntimeMode};
-    use crate::models::Agent;
+    use crate::models::{Agent, Movement, MovementSidedness, MovementStatus, SetStatus};
     use tempfile::tempdir;
 
     fn test_env() -> RuntimeEnv {
@@ -435,6 +441,61 @@ mod tests {
         assert!(!begin_queue_job(&flag));
         flag.store(false, Ordering::Release);
         assert!(begin_queue_job(&flag));
+    }
+
+    #[test]
+    fn solo_policy_refresh_retires_partner_exercises_and_preserves_history() {
+        let env = test_env();
+        crate::config::save(&env.paths, &Config::default()).unwrap();
+        let store = Store::open(&env.paths.database_file).unwrap();
+        store
+            .replace_movement_pool(&[Movement {
+                id: "Seated_Biceps".into(),
+                name: "Seated Biceps".into(),
+                primary_muscle: "biceps".into(),
+                muscles: vec!["biceps".into()],
+                equipment: vec!["bodyweight".into()],
+                base_reps: 4,
+                estimated_seconds: 35,
+                status: MovementStatus::Allowed,
+                mobility: true,
+                sidedness: MovementSidedness::Bilateral,
+            }])
+            .unwrap();
+        store.save_exercise_filter(&Vec::<String>::new()).unwrap();
+        let mut partner = Recommendation {
+            id: None,
+            movement_id: "Seated_Biceps".into(),
+            movement_name: "Seated Biceps".into(),
+            primary_muscle: "biceps".into(),
+            muscles: vec!["biceps".into()],
+            reps: 4,
+            weight_kg: None,
+            estimated_seconds: 35,
+            agent: Agent::Codex,
+            project: Some("svarog".into()),
+            side: None,
+            created_at: chrono::Utc::now(),
+        };
+        partner.id = Some(store.insert_recommendation(&partner).unwrap());
+        store.record_set(&partner, SetStatus::Skipped).unwrap();
+        store
+            .mark_recommendation(partner.id.unwrap(), "active")
+            .unwrap();
+        assert!(!store.exercise_catalog_is_current().unwrap());
+        drop(store);
+
+        refresh_exercise_pool(&env).unwrap();
+
+        let store = Store::open(&env.paths.database_file).unwrap();
+        assert!(store.exercise_catalog_is_current().unwrap());
+        assert!(store
+            .movements()
+            .unwrap()
+            .iter()
+            .all(|movement| movement.id != "Seated_Biceps"));
+        assert!(store.latest_open_recommendation().unwrap().is_none());
+        assert_eq!(store.recent_forge_history(10).unwrap().len(), 1);
     }
 
     #[test]

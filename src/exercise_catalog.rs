@@ -7,6 +7,32 @@ use std::sync::OnceLock;
 
 const CATALOG_JSON: &str = include_str!("../data/free-exercise-db.compact.json");
 pub const CATALOG_REVISION: &str = "b0eed061e1c832b3ed815fbaa4b45b3cdc14df49";
+const MOVEMENT_POOL_POLICY_REVISION: &str = "solo-v1";
+const PARTNER_REQUIRED_EXERCISE_IDS: &[&str] = &[
+    "Adductor_Groin",
+    "Barbell_Seated_Calf_Raise",
+    "Behind_Head_Chest_Stretch",
+    "Cable_Preacher_Curl",
+    "Cable_Seated_Lateral_Raise",
+    "Flat_Bench_Cable_Flyes",
+    "Lying_Bent_Leg_Groin",
+    "Lying_Crossover",
+    "Lying_Glute",
+    "Lying_Hamstring",
+    "Lying_Prone_Quadriceps",
+    "Medicine_Ball_Full_Twist",
+    "One_Arm_Floor_Press",
+    "Overhead_Lat",
+    "Overhead_Triceps",
+    "Prone_Manual_Hamstring",
+    "Return_Push_from_Stance",
+    "Seated_Biceps",
+    "Seated_Front_Deltoid",
+    "Seated_Glute",
+    "Seated_Hamstring",
+    "Standing_Towel_Triceps_Extension",
+    "Weighted_Bench_Dip",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -27,8 +53,16 @@ pub struct ExerciseCatalogEntry {
 pub fn all() -> &'static [ExerciseCatalogEntry] {
     static CATALOG: OnceLock<Vec<ExerciseCatalogEntry>> = OnceLock::new();
     CATALOG.get_or_init(|| {
-        serde_json::from_str(CATALOG_JSON).expect("bundled exercise catalog must be valid JSON")
+        let mut catalog: Vec<ExerciseCatalogEntry> = serde_json::from_str(CATALOG_JSON)
+            .expect("bundled exercise catalog must be valid JSON");
+        catalog.retain(|entry| !PARTNER_REQUIRED_EXERCISE_IDS.contains(&entry.id.as_str()));
+        catalog
     })
+}
+
+pub fn movement_pool_revision() -> &'static str {
+    static REVISION: OnceLock<String> = OnceLock::new();
+    REVISION.get_or_init(|| format!("{CATALOG_REVISION}:{MOVEMENT_POOL_POLICY_REVISION}"))
 }
 
 pub fn find(id: &str) -> Option<&'static ExerciseCatalogEntry> {
@@ -249,20 +283,74 @@ mod tests {
     #[test]
     fn bundled_catalog_is_valid_and_large() {
         validate().unwrap();
-        assert_eq!(all().len(), 873);
+        assert_eq!(all().len(), 850);
         assert!(all().iter().all(|entry| entry.images.len() == 2));
         assert_eq!(
             all()
                 .iter()
                 .filter(|entry| !entry.instructions.is_empty())
                 .count(),
-            868
+            845
         );
         let goblet_squat = find("Goblet_Squat").unwrap();
         assert_eq!(goblet_squat.instructions.len(), 3);
         assert_eq!(
             goblet_squat.images,
             ["Goblet_Squat/0.jpg", "Goblet_Squat/1.jpg"]
+        );
+    }
+
+    #[test]
+    fn partner_required_exercises_are_removed_from_every_catalog_view() {
+        let raw: Vec<ExerciseCatalogEntry> = serde_json::from_str(CATALOG_JSON).unwrap();
+        let all_equipment = [
+            "bodyweight",
+            "dumbbell",
+            "kettlebell",
+            "band",
+            "medicine_ball",
+            "barbell",
+            "e_z_curl_bar",
+            "exercise_ball",
+            "foam_roll",
+            "cable",
+            "machine",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        let movements = movements_for_equipment(&all_equipment);
+
+        assert_eq!(raw.len(), 873);
+        assert_eq!(PARTNER_REQUIRED_EXERCISE_IDS.len(), 23);
+        for id in PARTNER_REQUIRED_EXERCISE_IDS {
+            assert!(raw.iter().any(|entry| entry.id == *id), "missing raw {id}");
+            assert!(find(id).is_none(), "catalog exposed {id}");
+            assert!(
+                movements.iter().all(|movement| movement.id != *id),
+                "movement pool exposed {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn exercises_with_solo_alternatives_remain_available() {
+        for id in [
+            "Backward_Medicine_Ball_Throw",
+            "Floor_Glute-Ham_Raise",
+            "Medicine_Ball_Chest_Pass",
+            "Russian_Twist",
+        ] {
+            assert!(find(id).is_some(), "solo-capable exercise missing: {id}");
+        }
+    }
+
+    #[test]
+    fn movement_pool_policy_does_not_change_the_image_source_revision() {
+        assert_eq!(CATALOG_REVISION, "b0eed061e1c832b3ed815fbaa4b45b3cdc14df49");
+        assert_eq!(
+            movement_pool_revision(),
+            "b0eed061e1c832b3ed815fbaa4b45b3cdc14df49:solo-v1"
         );
     }
 
