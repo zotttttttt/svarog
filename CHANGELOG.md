@@ -2,6 +2,13 @@
 
 Notable changes to Svarog are recorded here by the automated release process.
 
+## [0.3.3](https://github.com/zotttttttt/svarog/compare/v0.3.2...v0.3.3) (2026-08-10)
+
+
+### Fixes
+
+* Exclude partner-required exercises ([343751c](https://github.com/zotttttttt/svarog/commit/343751c866c1dde41b09d8349e38c9803a2ea3f9))
+
 ## [0.3.2](https://github.com/zotttttttt/svarog/compare/v0.3.1...v0.3.2) (2026-08-10)
 
 
