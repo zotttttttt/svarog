@@ -109,6 +109,13 @@ finish, skip, or report pain—even if the Codex turn that triggered it has
 already ended. The waiting screen also shows your completed sessions and reps
 for today and the last seven days.
 
+<p align="center">
+  <a href="./assets/1-tui-idle.png">
+    <img width="420" src="./assets/1-tui-idle.png" alt="Svarog waiting dashboard showing the current recommender, completed exercises, reps, and token usage">
+  </a>
+</p>
+<p align="center"><sub>The waiting dashboard keeps the next movement and recent progress within reach.</sub></p>
+
 ### While waiting
 
 You can inspect or shape what happens next without waiting for another agent
@@ -129,6 +136,17 @@ totals are shown on the waiting screen.
 ### During a movement session
 
 Do the movement, adjust the recorded reps if needed, then record what happened:
+
+<p align="center">
+  <a href="./assets/2-tui-forging.png">
+    <img width="44%" src="./assets/2-tui-forging.png" alt="Svarog movement session showing a kettlebell sumo high pull target and session controls">
+  </a>
+  &nbsp;
+  <a href="./assets/3-tui-how-to.png">
+    <img width="44%" src="./assets/3-tui-how-to.png" alt="Svarog terminal instructions for performing a kettlebell sumo high pull">
+  </a>
+</p>
+<p align="center"><sub>Track the active session, then open step-by-step instructions without leaving the dashboard.</sub></p>
 
 | Key | Action |
 | --- | --- |
@@ -152,6 +170,13 @@ From the skip options:
 In the instructions view, use `↑` / `↓`, Page Up / Page Down, Home, and End to
 read longer instructions. Press `o` to download and open reference images when
 they are available, then `Esc` to return to the movement session.
+
+<p align="center">
+  <a href="./assets/4-local-html-how-to.png">
+    <img width="760" src="./assets/4-local-html-how-to.png" alt="Local Svarog visual guide with kettlebell sumo high pull instructions and two reference positions">
+  </a>
+</p>
+<p align="center"><sub>Reference images open in a local visual guide when they are available.</sub></p>
 
 Use `svarog exercises removed`, `svarog exercises restore <exercise-id>`, or
 `svarog exercises restore-all` to review or undo removals. Completing onboarding again resets
