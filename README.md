@@ -1,6 +1,24 @@
-# Svarog
+<p align="center">
+  <img width="280" src="./svarog.png" alt="Svarog logo: an ember-lit smith at an anvil">
+</p>
 
-Turn AI-agent waiting time into short, adaptive exercise sessions.
+<h1 align="center">Svarog</h1>
+
+<p align="center">
+  Turn AI-agent waiting time into short, adaptive exercise sessions.
+</p>
+
+<p align="center">
+  <a href="https://github.com/zotttttttt/svarog/releases"><img src="https://img.shields.io/badge/version-v0.2.0-FF8C00?style=flat-square&amp;labelColor=070808" alt="Version v0.2.0"></a>
+  &nbsp;
+  <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/built%20with-Rust-FF8C00?style=flat-square&amp;labelColor=070808" alt="Built with Rust"></a>
+  &nbsp;
+  <a href="https://github.com/zotttttttt/svarog/actions/workflows/ci.yml?query=branch%3Amain"><img src="https://github.com/zotttttttt/svarog/actions/workflows/ci.yml/badge.svg?branch=main&amp;style=flat-square&amp;label=build" alt="Build status"></a>
+  &nbsp;
+  <a href="https://github.com/zotttttttt/svarog/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-888888?style=flat-square&amp;labelColor=070808" alt="MIT license"></a>
+  &nbsp;
+  <a href="https://github.com/zotttttttt/svarog/releases/latest"><img src="https://img.shields.io/badge/binary-11%20MB-888888?style=flat-square&amp;labelColor=070808" alt="Release binary size: 11 MB"></a>
+</p>
 
 Svarog supports macOS and Linux. Desktop notifications are currently available
 on macOS only; the TUI, local collector, and recommenders work on both.
@@ -84,32 +102,56 @@ authenticated.
 
 ## Use Svarog
 
-When a movement session appears, do the movement and record the outcome:
+Keep `svarog run` open while you work. Svarog notices natural pauses from your
+coding agent, prepares a safe short session, and leaves it ready until you
+finish, skip, or report pain—even if the Codex turn that triggered it has
+already ended. The waiting screen also shows your completed sessions and reps
+for today and the last seven days.
+
+### While waiting
+
+You can inspect or shape what happens next without waiting for another agent
+pause:
+
+| Key | Action |
+| --- | --- |
+| `f` | Start the first safe queued session now |
+| `l` | Show up to 10 recent sessions, grouped by date |
+| `n` | Preview upcoming sessions |
+| `r` | Regenerate the queue from the upcoming-sessions view |
+| `Esc` | Return from history or upcoming sessions to the waiting screen |
+| `←` / `→` | Change the recommender |
+
+The current recommender and, for remote recommenders, its input/output token
+totals are shown on the waiting screen.
+
+### During a movement session
+
+Do the movement, adjust the recorded reps if needed, then record what happened:
 
 | Key | Action |
 | --- | --- |
 | `d` or Enter | Finish the movement session |
 | `+` (`=`) / `-` | Adjust the reps you completed |
 | `i` or `?` | Show instructions and reference images |
-| `s` | Skip, report fatigue, or remove the exercise |
+| `s` | Open the skip options |
 | `p` | Report pain and block that movement |
 | `q` | Quit Svarog |
 | `Esc` | Cancel the current prompt or return to waiting |
 
-While waiting:
+From the skip options:
 
 | Key | Action |
 | --- | --- |
-| `l` | Show up to 10 latest movement sessions, grouped by date |
-| `n` | Preview the next movement sessions |
-| `f` | Open the first safe queued session |
-| `r` | Regenerate the queue from the next-sessions view |
-| `←` / `→` | Change the recommender |
+| `y` | Skip because you are fatigued; Svarog suppresses the next five opportunities |
+| `n` | Skip without reporting fatigue |
+| Backspace | Skip and remove this exercise from future recommendations |
+| `Esc` | Cancel and return to the movement session |
 
-A movement session remains available until you finish, skip, or report pain—even if the
-Codex turn that triggered it has already ended.
+In the instructions view, use `↑` / `↓`, Page Up / Page Down, Home, and End to
+read longer instructions. Press `o` to download and open reference images when
+they are available, then `Esc` to return to the movement session.
 
-From the Skip panel, press `Backspace` to remove that exercise from future recommendations.
 Use `svarog exercises removed`, `svarog exercises restore <exercise-id>`, or
 `svarog exercises restore-all` to review or undo removals. Completing onboarding again resets
 the removed list.
@@ -272,12 +314,20 @@ profile template receives `config`. Structured values support
 
 ## Exercise data
 
-Exercise identities and metadata come from
-[free-exercise-db](https://github.com/yuhonas/free-exercise-db), pinned at commit
-[`b0eed061`](https://github.com/yuhonas/free-exercise-db/commit/b0eed061e1c832b3ed815fbaa4b45b3cdc14df49).
-The project releases the dataset into the public domain under the
-[Unlicense](https://github.com/yuhonas/free-exercise-db/blob/main/LICENSE.md). Svarog bundles a
-compact copy. Instructions and image paths stay local; only `id`, `force`, `mechanic`,
+Svarog is built with deep appreciation for
+[free-exercise-db](https://github.com/yuhonas/free-exercise-db). Its generous,
+well-structured exercise library gives us clear movement identities, muscle and
+equipment metadata, instructions, and image references—the foundation that lets
+Svarog make recommendations that are understandable, practical, and grounded in
+real movements rather than opaque names.
+
+We pin the dataset at commit
+[`b0eed061`](https://github.com/yuhonas/free-exercise-db/commit/b0eed061e1c832b3ed815fbaa4b45b3cdc14df49)
+so recommendations stay reproducible, and bundle a compact copy for fast local
+use. The project releases its data into the public domain under the
+[Unlicense](https://github.com/yuhonas/free-exercise-db/blob/main/LICENSE.md).
+
+Instructions and image paths stay local. Only `id`, `force`, `mechanic`,
 `equipment`, `primaryMuscles`, `secondaryMuscles`, and `category` are sent to the
 recommendation model. Reference images are downloaded on demand and cached under
 Svarog's data directory.

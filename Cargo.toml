@@ -4,6 +4,7 @@ version = "0.2.0"
 edition = "2021"
 license = "MIT"
 description = "A CLI sidecar that turns AI-agent waiting time into tiny, adaptive workouts."
+repository = "https://github.com/zotttttttt/svarog"
 readme = "README.md"
 keywords = ["cli", "tui", "exercise", "productivity", "codex"]
 categories = ["command-line-utilities"]
@@ -12,6 +13,7 @@ include = [
     "Cargo.lock",
     "LICENSE",
     "README.md",
+    "svarog.png",
     "build.rs",
     "data/**",
     "prompts/**",
