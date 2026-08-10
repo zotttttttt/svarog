@@ -29,8 +29,8 @@ The dashboard owns a local event collector. It binds only to a loopback address;
 Svarog rejects non-loopback `SVAROG_DAEMON_ADDR` values because the event API is
 not authenticated. Closing the dashboard stops collection.
 
-Codex lifecycle events tell Svarog when a natural pause occurs. They do not
-forward the text of your coding prompts.
+Codex lifecycle events tell Svarog when you submit a task for Codex to execute.
+They do not forward the text of your coding prompts.
 
 ## Recommender data flow
 
