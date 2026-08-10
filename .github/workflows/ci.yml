@@ -36,3 +36,10 @@ jobs:
       - run: cargo install cargo-about --version 0.9.1 --locked --features cli
       - run: cargo about generate --locked about.hbs > /tmp/THIRD_PARTY_NOTICES.html
       - run: cmp -s /tmp/THIRD_PARTY_NOTICES.html THIRD_PARTY_NOTICES.html
+      - name: Upload generated notices on mismatch
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: generated-third-party-notices
+          path: /tmp/THIRD_PARTY_NOTICES.html
+          if-no-files-found: error
