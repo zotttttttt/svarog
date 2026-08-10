@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/zotttttttt/svarog/releases"><img src="https://img.shields.io/badge/version-v0.2.0-FF8C00?style=flat-square&amp;labelColor=070808" alt="Version v0.2.0"></a>
+  <a href="https://github.com/zotttttttt/svarog/releases"><img src="https://img.shields.io/github/v/release/zotttttttt/svarog?label=version&amp;style=flat-square&amp;labelColor=070808&amp;color=FF8C00" alt="Latest Svarog release version"></a>
   &nbsp;
   <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/built%20with-Rust-FF8C00?style=flat-square&amp;labelColor=070808" alt="Built with Rust"></a>
   &nbsp;
