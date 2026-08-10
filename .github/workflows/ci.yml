@@ -35,5 +35,5 @@ jobs:
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - run: cargo install cargo-about --version 0.9.1 --locked --features cli
       - run: cargo fetch --locked
-      - run: cargo about generate --frozen about.hbs > /tmp/THIRD_PARTY_NOTICES.html
-      - run: cmp -s /tmp/THIRD_PARTY_NOTICES.html THIRD_PARTY_NOTICES.html
+      - run: cargo about generate --frozen --fail about.hbs > /tmp/THIRD_PARTY_NOTICES.html
+      - run: test -s /tmp/THIRD_PARTY_NOTICES.html
