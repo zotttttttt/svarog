@@ -2,6 +2,14 @@
 
 Notable changes to Svarog are recorded here by the automated release process.
 
+## [0.3.6](https://github.com/zotttttttt/svarog/compare/v0.3.5...v0.3.6) (2026-08-11)
+
+
+### Fixes
+
+* respect Codex SessionEnd timeout limit ([fde0209](https://github.com/zotttttttt/svarog/commit/fde0209bc77ba5825a3cf1d507fe73f27f8a3f59))
+* respect Codex SessionEnd timeout limit ([531d2a2](https://github.com/zotttttttt/svarog/commit/531d2a2ac6b82571776702c6f66c28eaef6e04d2))
+
 ## [0.3.5](https://github.com/zotttttttt/svarog/compare/v0.3.4...v0.3.5) (2026-08-11)
 
 
