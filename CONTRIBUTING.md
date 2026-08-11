@@ -4,8 +4,8 @@ Thanks for helping make AI-agent waiting time healthier.
 
 ## Development setup
 
-Svarog supports macOS and Linux. Install a stable Rust toolchain and `tmux`,
-then clone the repository and run:
+Svarog supports macOS and Linux. Install a stable Rust toolchain, then clone the
+repository and run:
 
 ```bash
 cargo test --locked
@@ -14,6 +14,8 @@ cargo run -- demo
 
 The demo stores all state under `./.svarog-dev`; it does not use production
 Svarog data or hooks.
+
+`tmux` is optional and only needed to test `svarog session`.
 
 ## Update a development install
 

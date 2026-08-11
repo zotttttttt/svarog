@@ -56,14 +56,20 @@ pub fn run(agent: Agent, env: &RuntimeEnv) -> Result<()> {
 }
 
 fn ensure_tmux() -> Result<()> {
-    let status = Command::new("tmux")
+    ensure_tmux_command("tmux")
+}
+
+fn ensure_tmux_command(command: &str) -> Result<()> {
+    let status = Command::new(command)
         .arg("-V")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
     match status {
         Ok(status) if status.success() => Ok(()),
-        _ => bail!("tmux is required. Run scripts/bootstrap first."),
+        _ => bail!(
+            "`svarog session` requires tmux. Install it with Homebrew or your system package manager."
+        ),
     }
 }
 
@@ -76,4 +82,18 @@ fn run_tmux(args: &[&str]) -> Result<()> {
         bail!("tmux command failed: tmux {}", args.join(" "));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_tmux_reports_session_specific_installation_hint() {
+        let error = ensure_tmux_command("svarog-test-missing-tmux-executable").unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("`svarog session` requires tmux"));
+        assert!(message.contains("Homebrew or your system package manager"));
+    }
 }

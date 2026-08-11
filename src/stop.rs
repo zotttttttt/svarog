@@ -139,10 +139,18 @@ fn unlock(file: &File) {
 }
 
 fn stop_tmux_sessions() -> Result<usize> {
-    let output = Command::new("tmux")
+    stop_tmux_sessions_with("tmux")
+}
+
+fn stop_tmux_sessions_with(command: &str) -> Result<usize> {
+    let output = match Command::new(command)
         .args(["list-sessions", "-F", "#{session_name}"])
         .output()
-        .context("listing tmux sessions")?;
+    {
+        Ok(output) => output,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error).context("listing tmux sessions"),
+    };
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         if stderr.contains("no server running") || stderr.contains("failed to connect") {
@@ -187,6 +195,14 @@ mod tests {
         assert_eq!(
             svarog_tmux_sessions("work\nsvarog-codex\nsvarog-claude\nother\n"),
             vec!["svarog-codex", "svarog-claude"]
+        );
+    }
+
+    #[test]
+    fn missing_tmux_is_treated_as_no_sessions_to_stop() {
+        assert_eq!(
+            stop_tmux_sessions_with("svarog-test-missing-tmux-executable").unwrap(),
+            0
         );
     }
 

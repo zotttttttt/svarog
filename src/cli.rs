@@ -37,6 +37,7 @@ enum Command {
     Init,
     #[command(hide = true)]
     Calibrate,
+    /// Open a coding agent and Svarog together in an optional tmux session.
     Session {
         agent: Agent,
     },

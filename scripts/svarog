@@ -5,7 +5,7 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
 
 missing_prerequisite=false
-for command_name in rustc cargo tmux; do
+for command_name in rustc cargo; do
   if ! command -v "$command_name" >/dev/null 2>&1; then
     missing_prerequisite=true
   fi
@@ -18,7 +18,7 @@ if [[ "$missing_prerequisite" == true ]]; then
   fi
 fi
 
-for command_name in rustc cargo tmux cksum find sort; do
+for command_name in rustc cargo cksum find sort; do
   if ! command -v "$command_name" >/dev/null 2>&1; then
     echo "Missing required command after bootstrap: $command_name" >&2
     exit 1
