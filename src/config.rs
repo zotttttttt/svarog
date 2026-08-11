@@ -332,7 +332,7 @@ impl Default for Recommender {
             },
             openai: OpenAiRecommender {
                 api_key_env: "OPENAI_API_KEY".to_string(),
-                model: "gpt-5.4-nano".to_string(),
+                model: default_openai_recommender_model(),
                 reasoning_effort: "low".to_string(),
             },
         }
@@ -356,6 +356,10 @@ fn default_true() -> bool {
 }
 
 fn default_codex_recommender_model() -> String {
+    "gpt-5.6-luna".to_string()
+}
+
+fn default_openai_recommender_model() -> String {
     "gpt-5.6-luna".to_string()
 }
 
@@ -630,6 +634,9 @@ fn normalize_loaded_config(config: &mut Config) {
     if config.recommender.timeout_ms == 8_000 {
         config.recommender.timeout_ms = 60_000;
     }
+    if config.recommender.openai.model == "gpt-5.4-nano" {
+        config.recommender.openai.model = default_openai_recommender_model();
+    }
     if let Some(model) = take_codex_model_arg(&mut config.recommender.codex.args) {
         config.recommender.codex.model = model;
     }
@@ -775,8 +782,40 @@ mod tests {
                 .any(|args| args == ["--disable", feature]));
         }
         assert_eq!(config.recommender.codex.model, "gpt-5.6-luna");
+        assert_eq!(config.recommender.openai.model, "gpt-5.6-luna");
         assert_eq!(config.recommender.timeout_ms, 60_000);
         assert_eq!(config.onboarding.pending_steps(), CURRENT_ONBOARDING_STEPS);
+    }
+
+    #[test]
+    fn load_migrates_only_the_old_default_openai_model() {
+        let root = tempdir().unwrap();
+        let old_paths = Paths::from_root(root.path().join("old"));
+        let mut old = Config::default();
+        old.recommender.openai.model = "gpt-5.4-nano".into();
+        save(&old_paths, &old).unwrap();
+
+        let custom_paths = Paths::from_root(root.path().join("custom"));
+        let mut custom = Config::default();
+        custom.recommender.openai.model = "custom-openai-model".into();
+        save(&custom_paths, &custom).unwrap();
+
+        assert_eq!(
+            load_or_default(&old_paths)
+                .unwrap()
+                .recommender
+                .openai
+                .model,
+            "gpt-5.6-luna"
+        );
+        assert_eq!(
+            load_or_default(&custom_paths)
+                .unwrap()
+                .recommender
+                .openai
+                .model,
+            "custom-openai-model"
+        );
     }
 
     #[test]
