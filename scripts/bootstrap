@@ -13,22 +13,17 @@ if ! command -v cargo >/dev/null 2>&1; then
   fi
 fi
 
-if ! command -v tmux >/dev/null 2>&1; then
-  missing+=("tmux")
-fi
-
 if [[ ${#missing[@]} -eq 0 ]]; then
   echo "Svarog prerequisites are installed."
   rustc --version
   cargo --version
-  tmux -V
   exit 0
 fi
 
 echo "Missing prerequisites: ${missing[*]}"
 
 if [[ ! -t 0 ]]; then
-  echo "Non-interactive shell. Install Rust and tmux, then rerun scripts/bootstrap."
+  echo "Non-interactive shell. Install Rust, then rerun scripts/bootstrap."
   exit 1
 fi
 
@@ -36,7 +31,7 @@ read -r -p "Install missing prerequisites where possible? [y/N] " answer
 case "$answer" in
   y|Y|yes|YES) ;;
   *)
-    echo "Install Rust from https://rustup.rs and tmux with Homebrew or your package manager."
+    echo "Install Rust from https://rustup.rs."
     exit 1
     ;;
 esac
@@ -52,16 +47,6 @@ if [[ " ${missing[*]} " =~ " rust " ]]; then
   fi
 fi
 
-if [[ " ${missing[*]} " =~ " tmux " ]]; then
-  if command -v brew >/dev/null 2>&1; then
-    brew install tmux
-  else
-    echo "Homebrew is not installed. Install tmux manually, then rerun scripts/bootstrap."
-    exit 1
-  fi
-fi
-
 echo "Bootstrap complete."
 rustc --version
 cargo --version
-tmux -V

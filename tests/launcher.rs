@@ -1,4 +1,5 @@
 use std::fs;
+use std::os::unix::fs::symlink;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -22,8 +23,12 @@ impl LauncherFixture {
         let new_binary = root.path().join("new-svarog");
         fs::create_dir_all(&fake_bin).unwrap();
 
+        for command in [
+            "awk", "bash", "chmod", "cksum", "cp", "dirname", "find", "mkdir", "mv", "sed", "sort",
+        ] {
+            link_command(&fake_bin, command);
+        }
         write_executable(&fake_bin.join("rustc"), "#!/bin/sh\nexit 0\n");
-        write_executable(&fake_bin.join("tmux"), "#!/bin/sh\nexit 0\n");
         write_executable(
             &fake_bin.join("cargo"),
             r#"#!/bin/sh
@@ -78,7 +83,7 @@ done
     }
 
     fn run(&self, policy: &str, arguments: &[&str], install_fails: bool) -> Output {
-        let path = format!("{}:/usr/bin:/bin", self.fake_bin.display());
+        let path = self.fake_bin.display().to_string();
         Command::new("bash")
             .arg(format!("{}/scripts/svarog", env!("CARGO_MANIFEST_DIR")))
             .args(arguments)
@@ -103,6 +108,16 @@ fn write_executable(path: &Path, contents: &str) {
     let mut permissions = fs::metadata(path).unwrap().permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(path, permissions).unwrap();
+}
+
+fn link_command(directory: &Path, command: &str) {
+    let output = Command::new("sh")
+        .args(["-c", &format!("command -v {command}")])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "missing test command: {command}");
+    let target = String::from_utf8(output.stdout).unwrap();
+    symlink(target.trim(), directory.join(command)).unwrap();
 }
 
 #[test]

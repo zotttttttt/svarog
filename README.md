@@ -41,8 +41,8 @@ OpenAI API. Prompt text is never collected or sent in recommendation requests.
 
 ## Get started
 
-You need macOS or Linux and `tmux`. A Rust toolchain is only required when
-installing from source.
+You need macOS or Linux. A Rust toolchain is only required when installing from
+source. `tmux` is optional and only needed for `svarog session codex`.
 
 ### Install a release
 
@@ -73,9 +73,9 @@ scripts/bootstrap
 scripts/svarog
 ```
 
-The bootstrap checks Rust and `tmux`; the launcher installs Svarog, guides you
-through setup, connects Codex, and opens the dashboard. Press Enter to accept
-the conservative defaults.
+The bootstrap checks Rust; the launcher installs Svarog, guides you through
+setup, connects Codex, and opens the dashboard. Press Enter to accept the
+conservative defaults.
 
 After setup, run Svarog in its own terminal:
 
