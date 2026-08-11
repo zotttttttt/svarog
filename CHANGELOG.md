@@ -2,6 +2,13 @@
 
 Notable changes to Svarog are recorded here by the automated release process.
 
+## [0.3.7](https://github.com/zotttttttt/svarog/compare/v0.3.6...v0.3.7) (2026-08-11)
+
+
+### Fixes
+
+* use GPT-5.6 Luna for recommendations ([6d0f0e8](https://github.com/zotttttttt/svarog/commit/6d0f0e8eab629897e2a1ab520ce7bd347e6c9aab))
+
 ## [0.3.6](https://github.com/zotttttttt/svarog/compare/v0.3.5...v0.3.6) (2026-08-11)
 
 
