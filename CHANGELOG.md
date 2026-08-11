@@ -2,6 +2,13 @@
 
 Notable changes to Svarog are recorded here by the automated release process.
 
+## [0.3.5](https://github.com/zotttttttt/svarog/compare/v0.3.4...v0.3.5) (2026-08-11)
+
+
+### Fixes
+
+* make tmux optional ([6116cf6](https://github.com/zotttttttt/svarog/commit/6116cf6458ee5f2e1399d967b00dd2046e701974))
+
 ## [0.3.4](https://github.com/zotttttttt/svarog/compare/v0.3.3...v0.3.4) (2026-08-10)
 
 
