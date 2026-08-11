@@ -2,6 +2,13 @@
 
 Notable changes to Svarog are recorded here by the automated release process.
 
+## [0.3.8](https://github.com/zotttttttt/svarog/compare/v0.3.7...v0.3.8) (2026-08-11)
+
+
+### Fixes
+
+* Removed unnecessary line from README.md ([4b37824](https://github.com/zotttttttt/svarog/commit/4b3782461a32d7a6a754096e4f791cfb1b5f5ada))
+
 ## [0.3.7](https://github.com/zotttttttt/svarog/compare/v0.3.6...v0.3.7) (2026-08-11)
 
 
