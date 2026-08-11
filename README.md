@@ -22,8 +22,6 @@
   <img src="https://img.shields.io/badge/desktop%20notifications-macOS-888888?style=flat-square&amp;labelColor=070808" alt="Desktop notifications available on macOS">
 </p>
 
-Your coding agent is working. You should move.
-
 Svarog is a local Rust CLI and terminal dashboard that turns the time your
 coding agent spends executing a task into tiny workouts. It learns from your
 equipment, preferences, recent activity, fatigue, and pain—then keeps each
