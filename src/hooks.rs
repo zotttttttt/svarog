@@ -117,18 +117,24 @@ fn ensure_svarog_hook(root: &mut Value, script: &Path) {
         *hooks = json!({});
     }
     let command = format!("\"{}\"", script.display());
-    for (event, matcher) in [
-        ("SessionStart", "startup|resume|clear|compact"),
-        ("UserPromptSubmit", ""),
-        ("Stop", ""),
-        ("SessionEnd", ""),
+    for (event, matcher, timeout) in [
+        ("SessionStart", "startup|resume|clear|compact", 5),
+        ("UserPromptSubmit", "", 5),
+        ("Stop", "", 5),
+        ("SessionEnd", "", 3),
     ] {
-        ensure_codex_event_hook(hooks, event, matcher, &command);
+        ensure_codex_event_hook(hooks, event, matcher, timeout, &command);
     }
     remove_svarog_hook(hooks, "PreToolUse");
 }
 
-fn ensure_codex_event_hook(hooks: &mut Value, event: &str, matcher: &str, command: &str) {
+fn ensure_codex_event_hook(
+    hooks: &mut Value,
+    event: &str,
+    matcher: &str,
+    timeout: u64,
+    command: &str,
+) {
     let event_hooks = hooks
         .as_object_mut()
         .unwrap()
@@ -144,7 +150,7 @@ fn ensure_codex_event_hook(hooks: &mut Value, event: &str, matcher: &str, comman
             {
                 "type": "command",
                 "command": command,
-                "timeout": 5,
+                "timeout": timeout,
                 "statusMessage": "Svarog is watching for forge time"
             }
         ]
@@ -284,6 +290,8 @@ mod tests {
         assert_eq!(value["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
         assert_eq!(value["hooks"]["Stop"].as_array().unwrap().len(), 2);
         assert_eq!(value["hooks"]["SessionEnd"].as_array().unwrap().len(), 1);
+        assert_eq!(value["hooks"]["SessionEnd"][0]["hooks"][0]["timeout"], 3);
+        assert_eq!(value["hooks"]["Stop"][1]["hooks"][0]["timeout"], 5);
         assert!(value["hooks"].get("PreToolUse").is_none());
         assert_eq!(
             fs::metadata(codex_home.join("hooks.json"))
@@ -293,6 +301,32 @@ mod tests {
                 & 0o777,
             0o600
         );
+    }
+
+    #[test]
+    fn codex_hook_config_replaces_old_svarog_session_end_timeout() {
+        let root = tempdir().unwrap().keep();
+        let codex_home = root.join(".codex");
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::write(
+            codex_home.join("hooks.json"),
+            r#"{"hooks":{"SessionEnd":[{"hooks":[{"type":"command","command":"echo keep","timeout":4}]},{"hooks":[{"type":"command","command":"old codex-event.sh","timeout":5}]}]}}"#,
+        )
+        .unwrap();
+
+        let path =
+            install_codex_hook_config(&codex_home, Path::new("/tmp/codex-event.sh")).unwrap();
+        let value: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        let session_end = value["hooks"]["SessionEnd"].as_array().unwrap();
+
+        assert_eq!(session_end.len(), 2);
+        assert_eq!(session_end[0]["hooks"][0]["command"], "echo keep");
+        assert_eq!(session_end[0]["hooks"][0]["timeout"], 4);
+        assert_eq!(
+            session_end[1]["hooks"][0]["command"],
+            "\"/tmp/codex-event.sh\""
+        );
+        assert_eq!(session_end[1]["hooks"][0]["timeout"], 3);
     }
 
     #[test]
