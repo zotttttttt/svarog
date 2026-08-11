@@ -1390,7 +1390,7 @@ mod tests {
             .unwrap();
         let body = openai_queue_request_body(&config, &prompt, QUEUE_TARGET).unwrap();
 
-        assert_eq!(body["model"], "gpt-5.4-nano");
+        assert_eq!(body["model"], "gpt-5.6-luna");
         assert_eq!(body["reasoning"]["effort"], "low");
         assert_eq!(body["text"]["format"]["type"], "json_schema");
         assert_eq!(
