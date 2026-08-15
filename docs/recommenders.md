@@ -17,7 +17,7 @@ On the waiting screen, press `s`, focus **Recommender** with `↑`/`↓`, and us
 | OpenAI API | Uses the Responses API and records its token usage separately |
 | Codex | Uses your installed Codex CLI without requiring a separate API key |
 
-The choice is saved when **Apply changes** is selected. Svarog preserves the
+The choice is saved with Ctrl+S or Command+S from Settings. Svarog preserves the
 current movement and old safe queue until a newly generated replacement is
 ready.
 

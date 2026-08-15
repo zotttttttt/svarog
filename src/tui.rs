@@ -12,10 +12,14 @@ use crate::models::{
 use crate::storage::{ForgeHistoryEntry, Store};
 use anyhow::{Context, Result};
 use chrono::{Datelike, Duration as ChronoDuration, Local};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement, EnterAlternateScreen,
+    LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Alignment;
@@ -194,7 +198,7 @@ struct SettingsState {
     error: Option<String>,
 }
 
-const SETTINGS_ROWS: usize = 16;
+const SETTINGS_ROWS: usize = 15;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum QueueRegenerationFeedback {
@@ -236,6 +240,13 @@ enum ArchetypeSelectorContext {
 pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
+    let keyboard_enhancement = matches!(supports_keyboard_enhancement(), Ok(true));
+    if keyboard_enhancement {
+        execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )?;
+    }
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
@@ -283,7 +294,7 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
         if event::poll(Duration::from_millis(200))? {
             if let Event::Key(key) = event::read()? {
                 if ui.settings.is_some() {
-                    if let Err(error) = handle_settings_key(&mut ui, key.code, env) {
+                    if let Err(error) = handle_settings_key(&mut ui, key.code, key.modifiers, env) {
                         if let Some(settings) = ui.settings.as_mut() {
                             settings.error = Some(error.to_string());
                         }
@@ -453,6 +464,9 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
         }
     };
 
+    if keyboard_enhancement {
+        let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
+    }
     let _ = disable_raw_mode();
     let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
     let _ = terminal.show_cursor();
@@ -832,11 +846,13 @@ fn settings_lines(
     let values = [
         (
             "Forge archetype",
-            crate::archetypes::display_name(
-                settings.draft.forge.archetype,
-                settings.draft.forge.custom_archetype.as_deref(),
-            )
-            .into_owned(),
+            format!(
+                "{}  [enter] Choose",
+                crate::archetypes::display_name(
+                    settings.draft.forge.archetype,
+                    settings.draft.forge.custom_archetype.as_deref(),
+                )
+            ),
         ),
         (
             "Recommender",
@@ -859,7 +875,7 @@ fn settings_lines(
             if profile.unit_system == UnitSystem::Metric {
                 "Height (cm)"
             } else {
-                "Height (in)"
+                "Height (ft/in)"
             },
             profile
                 .height_cm
@@ -867,7 +883,7 @@ fn settings_lines(
                     if profile.unit_system == UnitSystem::Metric {
                         v.to_string()
                     } else {
-                        format!("{:.1}", v as f32 / 2.54)
+                        cli::format_imperial_height(v)
                     }
                 })
                 .unwrap_or_else(|| "not set".into()),
@@ -913,11 +929,13 @@ fn settings_lines(
         ),
         ("Injuries / limitations", profile.injuries.join(", ")),
         ("Exercise preferences", profile.exercise_preferences.clone()),
-        ("Apply changes", "Enter to save".into()),
     ];
     let mut lines = vec![
         with_demo(Line::from(Span::styled("Settings", text_bold())), demo),
-        Line::from(Span::styled("↑/↓ Focus  ←/→ Change  Enter Edit", muted())),
+        Line::from(Span::styled(
+            "↑/↓ Focus  ←/→ Adjust  Enter Open/Edit",
+            muted(),
+        )),
         Line::from(""),
     ];
     let footer_height =
@@ -977,7 +995,10 @@ fn settings_lines(
     } else {
         lines.extend([
             Line::from(""),
-            Line::from(Span::styled("[esc] Cancel settings", muted())),
+            Line::from(Span::styled(
+                "[ctrl/cmd+s] Apply changes  [esc] Cancel settings",
+                muted(),
+            )),
         ]);
     }
     if let Some(error) = settings.error.as_deref() {
@@ -1090,6 +1111,70 @@ fn delete_at_cursor(value: &mut String, cursor: usize) {
     }
 }
 
+fn adjusted_whole_value(current: Option<u32>, seed: u32, forward: bool) -> u32 {
+    let value = current.unwrap_or(seed);
+    if forward {
+        value.saturating_add(1)
+    } else {
+        value.saturating_sub(1).max(1)
+    }
+}
+
+fn adjust_measurement(settings: &mut SettingsState, forward: bool) {
+    match settings.row {
+        5 => match settings.draft.profile.unit_system {
+            UnitSystem::Metric => {
+                settings.draft.profile.height_cm = Some(adjusted_whole_value(
+                    settings.draft.profile.height_cm,
+                    170,
+                    forward,
+                ));
+            }
+            UnitSystem::Imperial => {
+                let current_inches = settings
+                    .draft
+                    .profile
+                    .height_cm
+                    .map(|height| (f64::from(height) / 2.54).round() as u32);
+                let inches = adjusted_whole_value(current_inches, 67, forward);
+                settings.draft.profile.height_cm =
+                    Some((f64::from(inches) * 2.54).round().min(f64::from(u32::MAX)) as u32);
+            }
+        },
+        6 => {
+            let metric = settings.draft.profile.unit_system == UnitSystem::Metric;
+            let factor = if metric { 1.0 } else { 2.204_622_6 };
+            let seed = if metric { 70.0 } else { 154.0 };
+            let current = settings
+                .draft
+                .profile
+                .weight_kg
+                .filter(|weight| weight.is_finite() && *weight > 0.0)
+                .map(|weight| weight * factor)
+                .unwrap_or(seed);
+            let adjusted = if forward {
+                current + 1.0
+            } else {
+                (current - 1.0).max(1.0)
+            };
+            settings.draft.profile.weight_kg = Some(adjusted / factor);
+        }
+        7 => {
+            settings.draft.profile.age = Some(adjusted_whole_value(
+                settings.draft.profile.age,
+                30,
+                forward,
+            ));
+        }
+        _ => return,
+    }
+    settings.error = None;
+}
+
+fn settings_apply_requested(code: KeyCode, modifiers: KeyModifiers) -> bool {
+    code == KeyCode::Char('s') && modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
+}
+
 fn comma_list(value: &str) -> Vec<String> {
     value
         .split(',')
@@ -1186,13 +1271,21 @@ fn apply_settings(env: &RuntimeEnv, draft: &Config) -> Result<Receiver<QueueRege
     Ok(daemon::regenerate_queue_after_settings(env))
 }
 
-fn handle_settings_key(ui: &mut TuiState, code: KeyCode, env: &RuntimeEnv) -> Result<()> {
+fn handle_settings_key(
+    ui: &mut TuiState,
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    env: &RuntimeEnv,
+) -> Result<()> {
     let Some(settings) = ui.settings.as_mut() else {
         return Ok(());
     };
     if settings.selecting_archetype {
         settings.error = None;
         if settings.custom_archetype {
+            if settings_apply_requested(code, modifiers) {
+                return Ok(());
+            }
             match code {
                 KeyCode::Esc => {
                     settings.custom_archetype = false;
@@ -1258,6 +1351,9 @@ fn handle_settings_key(ui: &mut TuiState, code: KeyCode, env: &RuntimeEnv) -> Re
         return Ok(());
     }
     if settings.editing {
+        if settings_apply_requested(code, modifiers) {
+            return Ok(());
+        }
         match code {
             KeyCode::Esc => settings.editing = false,
             KeyCode::Enter => {
@@ -1279,6 +1375,15 @@ fn handle_settings_key(ui: &mut TuiState, code: KeyCode, env: &RuntimeEnv) -> Re
             }
             _ => {}
         }
+        return Ok(());
+    }
+    if settings_apply_requested(code, modifiers) {
+        let draft = settings.draft.clone();
+        let receiver = apply_settings(env, &draft)?;
+        ui.settings = None;
+        ui.status_message = Some("Settings saved. Refreshing future forges…".into());
+        apply_queue_regeneration_start(ui, QueueRegenerationStart::Started(receiver));
+        ui.settings_regeneration = true;
         return Ok(());
     }
     match code {
@@ -1324,6 +1429,7 @@ fn handle_settings_key(ui: &mut TuiState, code: KeyCode, env: &RuntimeEnv) -> Re
                             UnitSystem::Metric
                         }
                 }
+                5..=7 => adjust_measurement(settings, forward),
                 10 => {
                     settings.draft.profile.work_setup =
                         if settings.draft.profile.work_setup == "sitting" {
@@ -1344,14 +1450,6 @@ fn handle_settings_key(ui: &mut TuiState, code: KeyCode, env: &RuntimeEnv) -> Re
         KeyCode::Enter if settings.row == 0 => {
             settings.archetype_original = Some(settings.draft.forge.clone());
             settings.selecting_archetype = true;
-        }
-        KeyCode::Enter if settings.row == SETTINGS_ROWS - 1 => {
-            let draft = settings.draft.clone();
-            let receiver = apply_settings(env, &draft)?;
-            ui.settings = None;
-            ui.status_message = Some("Settings saved. Refreshing future forges…".into());
-            apply_queue_regeneration_start(ui, QueueRegenerationStart::Started(receiver));
-            ui.settings_regeneration = true;
         }
         KeyCode::Enter => begin_setting_edit(settings),
         _ => {}
@@ -2141,7 +2239,10 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(text.contains("› Forge archetype"));
+        assert!(text.contains("Athlete  [enter] Choose"));
         assert!(text.contains("Apply changes"));
+        assert!(text.contains("[ctrl/cmd+s] Apply changes  [esc] Cancel settings"));
+        assert!(!text.contains("› Apply changes"));
 
         settings.selecting_archetype = true;
         let selector = settings_lines(&settings, false, 120, 40)
@@ -2191,6 +2292,26 @@ mod tests {
     }
 
     #[test]
+    fn apply_shortcut_is_ignored_while_editing_a_field() {
+        let root = tempdir().unwrap().keep();
+        let env = test_env(root);
+        let mut settings = settings_state();
+        settings.row = 8;
+        begin_setting_edit(&mut settings);
+        let original = settings.edit_value.clone();
+        let mut ui = TuiState {
+            settings: Some(settings),
+            ..TuiState::default()
+        };
+
+        handle_settings_key(&mut ui, KeyCode::Char('s'), KeyModifiers::CONTROL, &env).unwrap();
+
+        let settings = ui.settings.as_ref().unwrap();
+        assert!(settings.editing);
+        assert_eq!(settings.edit_value, original);
+    }
+
+    #[test]
     fn settings_viewport_keeps_the_focused_row_visible() {
         let mut settings = settings_state();
         let top = settings_lines(&settings, false, 60, 10)
@@ -2206,8 +2327,94 @@ mod tests {
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(bottom.contains("› Apply changes"));
+        assert!(bottom.contains("› Exercise preferences"));
+        assert!(bottom.contains("[ctrl/cmd+s] Apply changes  [esc] Cancel settings"));
         assert!(!bottom.contains("Forge archetype"));
+    }
+
+    #[test]
+    fn settings_apply_shortcut_accepts_control_and_super_only() {
+        assert!(settings_apply_requested(
+            KeyCode::Char('s'),
+            KeyModifiers::CONTROL
+        ));
+        assert!(settings_apply_requested(
+            KeyCode::Char('s'),
+            KeyModifiers::SUPER
+        ));
+        assert!(!settings_apply_requested(
+            KeyCode::Char('s'),
+            KeyModifiers::NONE
+        ));
+        assert!(!settings_apply_requested(
+            KeyCode::Char('x'),
+            KeyModifiers::CONTROL
+        ));
+    }
+
+    #[test]
+    fn measurement_arrows_adjust_display_units_and_seed_unset_values() {
+        let mut settings = settings_state();
+
+        settings.row = 5;
+        adjust_measurement(&mut settings, true);
+        assert_eq!(settings.draft.profile.height_cm, Some(171));
+        settings.draft.profile.height_cm = None;
+        adjust_measurement(&mut settings, false);
+        assert_eq!(settings.draft.profile.height_cm, Some(169));
+
+        settings.draft.profile.unit_system = UnitSystem::Imperial;
+        settings.draft.profile.height_cm = None;
+        adjust_measurement(&mut settings, true);
+        assert_eq!(
+            cli::format_imperial_height(settings.draft.profile.height_cm.unwrap()),
+            "5'8\""
+        );
+        settings.draft.profile.height_cm = None;
+        adjust_measurement(&mut settings, false);
+        assert_eq!(
+            cli::format_imperial_height(settings.draft.profile.height_cm.unwrap()),
+            "5'6\""
+        );
+
+        settings.row = 6;
+        settings.draft.profile.unit_system = UnitSystem::Metric;
+        adjust_measurement(&mut settings, true);
+        assert_eq!(settings.draft.profile.weight_kg, Some(71.0));
+        settings.draft.profile.weight_kg = None;
+        adjust_measurement(&mut settings, false);
+        assert_eq!(settings.draft.profile.weight_kg, Some(69.0));
+
+        settings.draft.profile.unit_system = UnitSystem::Imperial;
+        settings.draft.profile.weight_kg = None;
+        adjust_measurement(&mut settings, true);
+        assert!((settings.draft.profile.weight_kg.unwrap() * 2.204_622_6 - 155.0).abs() < 0.01);
+
+        settings.row = 7;
+        adjust_measurement(&mut settings, true);
+        assert_eq!(settings.draft.profile.age, Some(31));
+        settings.draft.profile.age = None;
+        adjust_measurement(&mut settings, false);
+        assert_eq!(settings.draft.profile.age, Some(29));
+    }
+
+    #[test]
+    fn measurement_arrows_saturate_at_one() {
+        let mut settings = settings_state();
+        settings.row = 5;
+        settings.draft.profile.height_cm = Some(1);
+        adjust_measurement(&mut settings, false);
+        assert_eq!(settings.draft.profile.height_cm, Some(1));
+
+        settings.row = 6;
+        settings.draft.profile.weight_kg = Some(1.0);
+        adjust_measurement(&mut settings, false);
+        assert_eq!(settings.draft.profile.weight_kg, Some(1.0));
+
+        settings.row = 7;
+        settings.draft.profile.age = Some(1);
+        adjust_measurement(&mut settings, false);
+        assert_eq!(settings.draft.profile.age, Some(1));
     }
 
     #[test]
@@ -2250,28 +2457,28 @@ mod tests {
             ..TuiState::default()
         };
         let original_archetype = ui.settings.as_ref().unwrap().draft.forge.archetype;
-        handle_settings_key(&mut ui, KeyCode::Right, &env).unwrap();
+        handle_settings_key(&mut ui, KeyCode::Right, KeyModifiers::NONE, &env).unwrap();
         assert_eq!(
             ui.settings.as_ref().unwrap().draft.forge.archetype,
             original_archetype
         );
 
-        handle_settings_key(&mut ui, KeyCode::Down, &env).unwrap();
+        handle_settings_key(&mut ui, KeyCode::Down, KeyModifiers::NONE, &env).unwrap();
         let original_backend = ui.settings.as_ref().unwrap().draft.recommender.backend;
-        handle_settings_key(&mut ui, KeyCode::Right, &env).unwrap();
+        handle_settings_key(&mut ui, KeyCode::Right, KeyModifiers::NONE, &env).unwrap();
         assert_ne!(
             ui.settings.as_ref().unwrap().draft.recommender.backend,
             original_backend
         );
 
-        handle_settings_key(&mut ui, KeyCode::Up, &env).unwrap();
-        handle_settings_key(&mut ui, KeyCode::Enter, &env).unwrap();
-        handle_settings_key(&mut ui, KeyCode::Right, &env).unwrap();
+        handle_settings_key(&mut ui, KeyCode::Up, KeyModifiers::NONE, &env).unwrap();
+        handle_settings_key(&mut ui, KeyCode::Enter, KeyModifiers::NONE, &env).unwrap();
+        handle_settings_key(&mut ui, KeyCode::Right, KeyModifiers::NONE, &env).unwrap();
         assert_ne!(
             ui.settings.as_ref().unwrap().draft.forge.archetype,
             original_archetype
         );
-        handle_settings_key(&mut ui, KeyCode::Esc, &env).unwrap();
+        handle_settings_key(&mut ui, KeyCode::Esc, KeyModifiers::NONE, &env).unwrap();
         assert_eq!(
             ui.settings.as_ref().unwrap().draft.forge.archetype,
             original_archetype
@@ -2291,7 +2498,7 @@ mod tests {
             ..TuiState::default()
         };
 
-        handle_settings_key(&mut ui, KeyCode::Esc, &env).unwrap();
+        handle_settings_key(&mut ui, KeyCode::Esc, KeyModifiers::NONE, &env).unwrap();
 
         assert!(ui.settings.is_none());
         assert_eq!(

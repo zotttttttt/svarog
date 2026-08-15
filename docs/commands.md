@@ -19,7 +19,9 @@ closes coding-agent processes inside tmux sessions created by Svarog.
 While the dashboard is waiting, press `s` to edit the Forge archetype,
 recommender, notifications, daily safety ceiling, measurements, goals,
 equipment, work setup, limitations, and exercise preferences. Changes remain
-staged until you focus **Apply changes** and press Enter; Esc cancels.
+staged until you press Ctrl+S (or Command+S when supported by the terminal);
+Esc cancels Settings. Height, weight, age, and choice fields can be adjusted
+with Left/Right, while Enter opens selectors and exact-value editors.
 
 ## Exercise controls
 
