@@ -761,11 +761,11 @@ fn archetype_lines(
     let title = crate::archetypes::display_name(forge.archetype, forge.custom_archetype.as_deref());
     let mut lines = vec![
         with_demo(
-            Line::from(Span::styled(title.to_uppercase(), text_bold())),
+            Line::from(Span::styled(title.to_uppercase(), accent_bold())),
             demo,
         ),
-        Line::from(""),
         Line::from(Span::styled(archetype.description, text())),
+        Line::from(""),
     ];
     if let Some(value) = custom_edit {
         lines.push(Line::from(Span::styled("Custom archetype", text_bold())));
@@ -2162,10 +2162,12 @@ mod tests {
         let lines = archetype_lines(&forge, None, false, ArchetypeSelectorContext::Onboarding);
 
         assert_eq!(lines[0].to_string(), "ATHLETE");
+        assert_eq!(lines[0].spans[0].style.fg, Some(colors::EMBER));
         assert_eq!(
-            lines[2].to_string(),
+            lines[1].to_string(),
             crate::archetypes::get(forge.archetype).description
         );
+        assert!(lines[2].to_string().is_empty());
         assert_eq!(
             lines[3].to_string(),
             "←/h Previous   →/l Next   [enter] Choose   [/] Custom"
