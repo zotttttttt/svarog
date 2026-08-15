@@ -40,13 +40,23 @@ the environment and never writes it to the config file or database.
 ### Saved key
 
 In Settings, focus **Saved OpenAI key**, press Enter, and type the key. The
-editor masks the value, and the change is staged until you press Ctrl+S or
-Command+S. Delete stages removal of an existing key.
+editor masks the value and saves it immediately when you press Enter, so it
+remains available after closing Settings or restarting Svarog. Delete asks for
+confirmation before immediately removing an existing key.
 
 The key is stored in macOS Keychain or Linux Secret Service, never in
 `config.toml` or the workout database. Choose **OpenAI (saved key)** as the
-recommender to use it. If Linux Secret Service is unavailable, use the
-environment-variable option instead.
+recommender and press Ctrl+S or Command+S to use it. Cancelling Settings does
+not undo a saved or removed key. If Linux Secret Service is unavailable, use
+the environment-variable option instead.
+
+Svarog retrieves the key lazily and keeps it in a synchronized, zeroized
+in-memory cache while **OpenAI (saved key)** remains the applied recommender.
+This avoids repeated credential-store prompts during forges and when reopening
+Settings. The cache is cleared when another recommender is successfully
+applied, the key is removed, or Svarog exits. Returning to the saved-key
+recommender after an applied switch requires one new credential-store
+authorization.
 
 The default OpenAI model and reasoning effort can be changed under
 `recommender.openai` in the config file.

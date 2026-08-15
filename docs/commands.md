@@ -19,11 +19,13 @@ closes coding-agent processes inside tmux sessions created by Svarog.
 While the dashboard is waiting, press `s` to edit the Forge archetype,
 recommender, notifications, daily safety ceiling, measurements, goals,
 equipment, work setup, limitations, exercise preferences, and a securely saved
-OpenAI API key. Changes remain staged until you press Ctrl+S (or Command+S when
-supported by the terminal); Esc cancels Settings. Height, weight, age, and
-choice fields can be adjusted with Left/Right, while Enter opens selectors and
-exact-value editors. API keys are masked and stored in the operating system
-credential store, not `config.toml`.
+OpenAI API key. Profile and recommender changes remain staged until you press
+Ctrl+S (or Command+S when supported by the terminal); Esc cancels those
+changes. Height, weight, age, and choice fields can be adjusted with Left/Right,
+while Enter opens selectors and exact-value editors. API keys are masked and
+saved immediately in the operating system credential store, not `config.toml`.
+Replacing or removing a key is also immediate and independent of applying the
+selected recommender.
 
 After `svarog setup` completes, press Enter at the final prompt to open the
 dashboard immediately. `svarog setup --dry-run` prints its preview and exits.

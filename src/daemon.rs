@@ -3,6 +3,7 @@ use crate::engine;
 use crate::models::{Agent, AppStateKind, CodexHookEvent, IncomingEvent, Recommendation};
 use crate::notifications;
 use crate::recommender;
+use crate::secrets;
 use crate::storage::Store;
 use anyhow::{bail, Context, Result};
 use axum::extract::State;
@@ -80,6 +81,7 @@ pub struct EventResponse {
 
 pub async fn run() -> Result<()> {
     let env = RuntimeEnv::load()?;
+    let _openai_key_cache_guard = secrets::openai_key_cache_guard(&env.paths);
     env.paths.ensure()?;
     let addr = env.daemon_addr;
     refill_queue_best_effort(&env);

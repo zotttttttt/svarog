@@ -54,9 +54,13 @@ svarog
 ```
 
 For the saved-key option, open Settings, focus **Saved OpenAI key**, press
-Enter, and enter the key. Then select the matching recommender and apply the
-changes. Neither option writes the key to Svarog's config or workout database.
-Prompt text is never collected or sent in recommendation requests. See
+Enter, and enter the key. It is saved immediately in the operating system
+credential store and remains available across Svarog restarts. When that
+recommender is active, Svarog authorizes once and keeps the key in a zeroized
+in-memory cache until you successfully apply another recommender or exit. Then
+select the matching recommender and apply the Settings changes. Neither option
+writes the key to Svarog's config or workout database. Prompt text is never
+collected or sent in recommendation requests. See
 [Recommenders](docs/recommenders.md) for configuration and fallback details.
 
 ## Get started

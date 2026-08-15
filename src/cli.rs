@@ -320,6 +320,7 @@ fn print_setup_intro(env: &RuntimeEnv) {
 }
 
 async fn run_tui(env: &RuntimeEnv) -> Result<()> {
+    let _openai_key_cache_guard = secrets::openai_key_cache_guard(&env.paths);
     daemon::refresh_exercise_pool(env)?;
     let collector = daemon::Collector::start(env).await?;
     let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));

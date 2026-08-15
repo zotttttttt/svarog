@@ -9,7 +9,7 @@ use crate::models::{
     AppStateKind, ForgeActivitySummary, Recommendation, RecommenderTokenProvider,
     RecommenderTokenUsageByProvider, SetStatus,
 };
-use crate::secrets::{self, PendingSecretChange};
+use crate::secrets;
 use crate::storage::{ForgeHistoryEntry, Store};
 use anyhow::{Context, Result};
 use chrono::{Datelike, Duration as ChronoDuration, Local};
@@ -187,9 +187,9 @@ struct TuiState {
     settings: Option<SettingsState>,
 }
 
-#[derive(Clone)]
 struct SettingsState {
     draft: Config,
+    applied_recommender_backend: RecommenderBackend,
     row: usize,
     editing: bool,
     edit_value: Zeroizing<String>,
@@ -200,7 +200,7 @@ struct SettingsState {
     archetype_original: Option<Forge>,
     saved_openai_key_present: bool,
     saved_openai_key_error: Option<String>,
-    pending_openai_key: Option<PendingSecretChange>,
+    confirming_openai_key_delete: bool,
     error: Option<String>,
 }
 
@@ -211,7 +211,10 @@ impl std::fmt::Debug for SettingsState {
             .field("row", &self.row)
             .field("editing", &self.editing)
             .field("edit_value", &"[REDACTED]")
-            .field("pending_openai_key", &self.pending_openai_key)
+            .field(
+                "confirming_openai_key_delete",
+                &self.confirming_openai_key_delete,
+            )
             .finish_non_exhaustive()
     }
 }
@@ -240,6 +243,55 @@ fn move_settings_focus(settings: &mut SettingsState, forward: bool) {
         position.saturating_sub(1)
     };
     settings.row = rows[position];
+}
+
+fn refresh_saved_openai_key_state(
+    settings: &mut SettingsState,
+    cached_availability: &mut Option<bool>,
+    paths: &Paths,
+) {
+    refresh_saved_openai_key_state_with(settings, cached_availability, || {
+        secrets::has_openai_api_key(paths)
+    });
+}
+
+fn refresh_saved_openai_key_state_with(
+    settings: &mut SettingsState,
+    cached_availability: &mut Option<bool>,
+    lookup: impl FnOnce() -> Result<bool>,
+) {
+    if settings.draft.recommender.backend != RecommenderBackend::OpenaiKeyring {
+        return;
+    }
+    let result = match *cached_availability {
+        Some(present) => Ok(present),
+        None => lookup(),
+    };
+    match result {
+        Ok(present) => {
+            *cached_availability = Some(present);
+            settings.saved_openai_key_present = present;
+            settings.saved_openai_key_error = None;
+        }
+        Err(error) => {
+            settings.saved_openai_key_present = false;
+            settings.saved_openai_key_error = Some(error.to_string());
+        }
+    }
+}
+
+fn update_saved_openai_key_cache_after_apply(
+    cached_availability: &mut Option<bool>,
+    backend: RecommenderBackend,
+    saved_key_available: bool,
+    clear: impl FnOnce(),
+) {
+    if backend == RecommenderBackend::OpenaiKeyring {
+        *cached_availability = Some(saved_key_available);
+    } else {
+        clear();
+        *cached_availability = None;
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -352,15 +404,12 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
                     && key.code == KeyCode::Char('s')
                 {
                     if let Ok(draft) = config::load_or_default(&env.paths) {
-                        let saved_openai_key = secrets::has_openai_api_key(&env.paths);
-                        let (saved_openai_key_present, saved_openai_key_error) =
-                            match saved_openai_key {
-                                Ok(present) => (present, None),
-                                Err(error) => (false, Some(error.to_string())),
-                            };
-                        ui.saved_openai_key_available = Some(saved_openai_key_present);
-                        ui.settings = Some(SettingsState {
+                        let saved_openai_key_present =
+                            ui.saved_openai_key_available.unwrap_or(false);
+                        let applied_recommender_backend = draft.recommender.backend;
+                        let mut settings = SettingsState {
                             draft,
+                            applied_recommender_backend,
                             row: 0,
                             editing: false,
                             edit_value: Zeroizing::new(String::new()),
@@ -370,10 +419,16 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
                             custom_archetype: false,
                             archetype_original: None,
                             saved_openai_key_present,
-                            saved_openai_key_error,
-                            pending_openai_key: None,
+                            saved_openai_key_error: None,
+                            confirming_openai_key_delete: false,
                             error: None,
-                        });
+                        };
+                        refresh_saved_openai_key_state(
+                            &mut settings,
+                            &mut ui.saved_openai_key_available,
+                            &env.paths,
+                        );
+                        ui.settings = Some(settings);
                     }
                     continue;
                 }
@@ -992,18 +1047,12 @@ fn settings_lines(
         ("Exercise preferences", profile.exercise_preferences.clone()),
         (
             "Saved OpenAI key",
-            match settings.pending_openai_key.as_ref() {
-                Some(PendingSecretChange::Set(_)) => {
-                    "configured (pending)  [enter] Replace  [del] Remove".into()
-                }
-                Some(PendingSecretChange::Delete) => "remove pending  [enter] Set".into(),
-                None if settings.saved_openai_key_error.is_some() => {
-                    "credential store unavailable  [enter] Retry".into()
-                }
-                None if settings.saved_openai_key_present => {
-                    "configured  [enter] Replace  [del] Remove".into()
-                }
-                None => "not set  [enter] Set".into(),
+            if settings.saved_openai_key_error.is_some() {
+                "credential store unavailable  [enter] Retry".into()
+            } else if settings.saved_openai_key_present {
+                "configured  [enter] Replace  [del] Remove".into()
+            } else {
+                "not set  [enter] Set".into()
             },
         ),
     ];
@@ -1015,8 +1064,11 @@ fn settings_lines(
         )),
         Line::from(""),
     ];
-    let footer_height =
-        if settings.editing { 3 } else { 2 } + usize::from(settings.error.is_some());
+    let footer_height = if settings.editing || settings.confirming_openai_key_delete {
+        3
+    } else {
+        2
+    } + usize::from(settings.error.is_some());
     let row_order = settings_row_order(settings);
     let visible_rows = usize::from(area_height)
         .saturating_sub(lines.len() + footer_height)
@@ -1049,7 +1101,13 @@ fn settings_lines(
             ),
         ]));
     }
-    if settings.editing {
+    if settings.confirming_openai_key_delete {
+        lines.extend([
+            Line::from(""),
+            Line::from(Span::styled("Remove saved OpenAI key?", accent())),
+            Line::from(Span::styled("[enter/y] Remove key  [esc] Cancel", muted())),
+        ]);
+    } else if settings.editing {
         let displayed_edit_value = if settings.row == 15 {
             "•".repeat(settings.edit_value.chars().count())
         } else {
@@ -1071,7 +1129,7 @@ fn settings_lines(
             )),
             Line::from(Span::styled(
                 if settings.row == 15 {
-                    "[enter] Stage key  [esc] Cancel edit"
+                    "[enter] Save key  [esc] Cancel edit"
                 } else {
                     "[enter] Set field  [esc] Cancel edit"
                 },
@@ -1326,15 +1384,6 @@ fn commit_setting_edit(settings: &mut SettingsState) -> Result<()> {
                 value.into()
             }
         }
-        15 => {
-            if value.is_empty() {
-                settings.error = Some("OpenAI API key cannot be empty".into());
-                return Ok(());
-            }
-            settings.pending_openai_key = Some(PendingSecretChange::Set(zeroize::Zeroizing::new(
-                value.to_string(),
-            )));
-        }
         _ => {}
     }
     settings.editing = false;
@@ -1343,27 +1392,50 @@ fn commit_setting_edit(settings: &mut SettingsState) -> Result<()> {
     Ok(())
 }
 
-fn apply_settings(
-    env: &RuntimeEnv,
-    draft: &Config,
-    secret_change: Option<&PendingSecretChange>,
-) -> Result<Receiver<QueueRegenerationResult>> {
+fn save_openai_key_edit(settings: &mut SettingsState, paths: &Paths) -> Result<bool> {
+    save_openai_key_edit_with(settings, |secret| {
+        secrets::save_openai_api_key(paths, secret)
+    })
+}
+
+fn save_openai_key_edit_with(
+    settings: &mut SettingsState,
+    save: impl FnOnce(&str) -> Result<()>,
+) -> Result<bool> {
+    let value = settings.edit_value.trim();
+    if value.is_empty() {
+        settings.error = Some("OpenAI API key cannot be empty".into());
+        return Ok(false);
+    }
+    save(value)?;
+    settings.saved_openai_key_present = true;
+    settings.saved_openai_key_error = None;
+    settings.editing = false;
+    settings.edit_value = Zeroizing::new(String::new());
+    settings.error = None;
+    Ok(true)
+}
+
+fn remove_saved_openai_key(settings: &mut SettingsState, paths: &Paths) -> Result<()> {
+    remove_saved_openai_key_with(settings, || secrets::remove_openai_api_key(paths))
+}
+
+fn remove_saved_openai_key_with(
+    settings: &mut SettingsState,
+    remove: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    remove()?;
+    settings.saved_openai_key_present = false;
+    settings.saved_openai_key_error = None;
+    settings.confirming_openai_key_delete = false;
+    settings.error = None;
+    Ok(())
+}
+
+fn apply_settings(env: &RuntimeEnv, draft: &Config) -> Result<Receiver<QueueRegenerationResult>> {
     let previous = config::load_or_default(&env.paths)?;
     let config_existed = env.paths.config_file.exists();
-    let previous_key = if secret_change.is_some() {
-        secrets::openai_api_key(&env.paths)?
-    } else {
-        None
-    };
-    if let Some(change) = secret_change {
-        secrets::apply_openai_api_key_change(&env.paths, change)?;
-    }
-    if let Err(error) = config::save(&env.paths, draft) {
-        if secret_change.is_some() {
-            restore_openai_key(&env.paths, previous_key.as_deref().map(String::as_str))?;
-        }
-        return Err(error);
-    }
+    config::save(&env.paths, draft)?;
     let equipment = exercise_catalog::locally_resolved_equipment(&draft.profile.equipment_text);
     let movements = exercise_catalog::movements_for_equipment(&equipment);
     let database_result = Store::open(&env.paths.database_file)
@@ -1375,34 +1447,14 @@ fn apply_settings(
             std::fs::remove_file(&env.paths.config_file)
                 .with_context(|| format!("removing {}", env.paths.config_file.display()))
         };
-        let secret_rollback = if secret_change.is_some() {
-            restore_openai_key(&env.paths, previous_key.as_deref().map(String::as_str))
-        } else {
-            Ok(())
-        };
-        return match (rollback, secret_rollback) {
-            (Ok(()), Ok(())) => {
-                Err(error.context("applying settings; previous configuration restored"))
-            }
-            (config_rollback, secret_rollback) => Err(anyhow::anyhow!(
-                "applying settings failed: {error}; config rollback: {}; credential rollback: {}",
-                config_rollback
-                    .err()
-                    .map_or_else(|| "ok".into(), |error| error.to_string()),
-                secret_rollback
-                    .err()
-                    .map_or_else(|| "ok".into(), |error| error.to_string())
+        return match rollback {
+            Ok(()) => Err(error.context("applying settings; previous configuration restored")),
+            Err(rollback_error) => Err(anyhow::anyhow!(
+                "applying settings failed: {error}; config rollback failed: {rollback_error}"
             )),
         };
     }
     Ok(daemon::regenerate_queue_after_settings(env))
-}
-
-fn restore_openai_key(paths: &Paths, previous: Option<&str>) -> Result<()> {
-    let change = previous.map_or(PendingSecretChange::Delete, |secret| {
-        PendingSecretChange::Set(Zeroizing::new(secret.to_string()))
-    });
-    secrets::apply_openai_api_key_change(paths, &change)
 }
 
 fn handle_settings_key(
@@ -1484,6 +1536,17 @@ fn handle_settings_key(
         }
         return Ok(());
     }
+    if settings.confirming_openai_key_delete {
+        match code {
+            KeyCode::Esc => settings.confirming_openai_key_delete = false,
+            KeyCode::Enter | KeyCode::Char('y') => {
+                remove_saved_openai_key(settings, &env.paths)?;
+                ui.saved_openai_key_available = Some(false);
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
     if settings.editing {
         if settings_apply_requested(code, modifiers) {
             return Ok(());
@@ -1494,7 +1557,13 @@ fn handle_settings_key(
                 settings.edit_value = Zeroizing::new(String::new());
             }
             KeyCode::Enter => {
-                commit_setting_edit(settings)?;
+                if settings.row == 15 {
+                    if save_openai_key_edit(settings, &env.paths)? {
+                        ui.saved_openai_key_available = Some(true);
+                    }
+                } else {
+                    commit_setting_edit(settings)?;
+                }
             }
             KeyCode::Backspace => {
                 backspace_at_cursor(&mut settings.edit_value, &mut settings.edit_cursor);
@@ -1515,11 +1584,7 @@ fn handle_settings_key(
         return Ok(());
     }
     if settings_apply_requested(code, modifiers) {
-        let saved_key_available = match settings.pending_openai_key.as_ref() {
-            Some(PendingSecretChange::Set(secret)) => !secret.trim().is_empty(),
-            Some(PendingSecretChange::Delete) => false,
-            None => settings.saved_openai_key_present,
-        };
+        let saved_key_available = settings.saved_openai_key_present;
         if settings.draft.recommender.backend == RecommenderBackend::OpenaiKeyring
             && !saved_key_available
         {
@@ -1529,9 +1594,13 @@ fn handle_settings_key(
             return Ok(());
         }
         let draft = settings.draft.clone();
-        let pending_openai_key = settings.pending_openai_key.clone();
-        let receiver = apply_settings(env, &draft, pending_openai_key.as_ref())?;
-        ui.saved_openai_key_available = Some(saved_key_available);
+        let receiver = apply_settings(env, &draft)?;
+        update_saved_openai_key_cache_after_apply(
+            &mut ui.saved_openai_key_available,
+            draft.recommender.backend,
+            saved_key_available,
+            || secrets::clear_cached_openai_api_key(&env.paths),
+        );
         ui.settings = None;
         ui.status_message = Some("Settings saved. Refreshing future forges…".into());
         apply_queue_regeneration_start(ui, QueueRegenerationStart::Started(receiver));
@@ -1539,11 +1608,17 @@ fn handle_settings_key(
         return Ok(());
     }
     match code {
-        KeyCode::Esc => ui.settings = None,
+        KeyCode::Esc => {
+            if settings.applied_recommender_backend != RecommenderBackend::OpenaiKeyring {
+                secrets::clear_cached_openai_api_key(&env.paths);
+                ui.saved_openai_key_available = None;
+            }
+            ui.settings = None;
+        }
         KeyCode::Up => move_settings_focus(settings, false),
         KeyCode::Down => move_settings_focus(settings, true),
-        KeyCode::Delete if settings.row == 15 => {
-            settings.pending_openai_key = Some(PendingSecretChange::Delete);
+        KeyCode::Delete if settings.row == 15 && settings.saved_openai_key_present => {
+            settings.confirming_openai_key_delete = true;
             settings.error = None;
         }
         KeyCode::Left | KeyCode::Right => {
@@ -1554,7 +1629,12 @@ fn handle_settings_key(
                         settings.draft.recommender.backend.next()
                     } else {
                         settings.draft.recommender.backend.previous()
-                    }
+                    };
+                    refresh_saved_openai_key_state(
+                        settings,
+                        &mut ui.saved_openai_key_available,
+                        &env.paths,
+                    );
                 }
                 2 => {
                     settings.draft.preferences.desktop_notifications =
@@ -2389,12 +2469,14 @@ mod tests {
     };
     use crate::recommender::QueueGenerationSource;
     use chrono::{TimeZone, Utc};
+    use std::cell::Cell;
     use std::time::Duration;
     use tempfile::tempdir;
 
     fn settings_state() -> SettingsState {
         SettingsState {
             draft: Config::default(),
+            applied_recommender_backend: RecommenderBackend::Local,
             row: 0,
             editing: false,
             edit_value: Zeroizing::new(String::new()),
@@ -2405,7 +2487,7 @@ mod tests {
             archetype_original: None,
             saved_openai_key_present: false,
             saved_openai_key_error: None,
-            pending_openai_key: None,
+            confirming_openai_key_delete: false,
             error: None,
         }
     }
@@ -2471,6 +2553,78 @@ mod tests {
         assert_eq!(settings.row, 15);
         move_settings_focus(&mut settings, true);
         assert_eq!(settings.row, 2);
+
+        settings.saved_openai_key_present = true;
+        settings.draft.recommender.backend = RecommenderBackend::Codex;
+        assert!(!settings_lines(&settings, false, 120, 40)
+            .iter()
+            .any(|line| line.to_string().contains("Saved OpenAI key")));
+        settings.draft.recommender.backend = RecommenderBackend::OpenaiKeyring;
+        assert!(settings_lines(&settings, false, 120, 40)
+            .iter()
+            .any(|line| line.to_string().contains("configured")));
+    }
+
+    #[test]
+    fn saved_key_lookup_is_lazy_cached_and_retryable() {
+        let mut settings = settings_state();
+        let mut cached = None;
+        let lookups = Cell::new(0);
+
+        refresh_saved_openai_key_state_with(&mut settings, &mut cached, || {
+            lookups.set(lookups.get() + 1);
+            Ok(true)
+        });
+        assert_eq!(lookups.get(), 0);
+        assert_eq!(cached, None);
+
+        settings.draft.recommender.backend = RecommenderBackend::OpenaiKeyring;
+        refresh_saved_openai_key_state_with(&mut settings, &mut cached, || {
+            lookups.set(lookups.get() + 1);
+            Ok(true)
+        });
+        assert_eq!(lookups.get(), 1);
+        assert_eq!(cached, Some(true));
+        assert!(settings.saved_openai_key_present);
+
+        refresh_saved_openai_key_state_with(&mut settings, &mut cached, || {
+            panic!("cached availability should avoid another lookup")
+        });
+
+        cached = None;
+        for expected in 2..=3 {
+            refresh_saved_openai_key_state_with(&mut settings, &mut cached, || {
+                lookups.set(lookups.get() + 1);
+                anyhow::bail!("credential store is locked")
+            });
+            assert_eq!(lookups.get(), expected);
+            assert_eq!(cached, None);
+            assert!(settings.saved_openai_key_error.is_some());
+        }
+    }
+
+    #[test]
+    fn applying_another_backend_clears_cached_key_state() {
+        let mut cached = Some(true);
+        let cleared = Cell::new(false);
+        update_saved_openai_key_cache_after_apply(
+            &mut cached,
+            RecommenderBackend::Codex,
+            true,
+            || cleared.set(true),
+        );
+        assert!(cleared.get());
+        assert_eq!(cached, None);
+
+        let cleared = Cell::new(false);
+        update_saved_openai_key_cache_after_apply(
+            &mut cached,
+            RecommenderBackend::OpenaiKeyring,
+            true,
+            || cleared.set(true),
+        );
+        assert!(!cleared.get());
+        assert_eq!(cached, Some(true));
     }
 
     #[test]
@@ -2508,8 +2662,9 @@ mod tests {
     }
 
     #[test]
-    fn saved_openai_key_editor_masks_and_stages_the_secret() {
+    fn saved_openai_key_editor_masks_and_saves_the_secret_immediately() {
         let mut settings = settings_state();
+        settings.draft.recommender.backend = RecommenderBackend::OpenaiKeyring;
         settings.row = 15;
         begin_setting_edit(&mut settings);
         settings.edit_value = Zeroizing::new("sk-never-render-this".into());
@@ -2522,12 +2677,16 @@ mod tests {
             .join("\n");
         assert!(!rendered.contains("sk-never-render-this"));
         assert!(rendered.contains('•'));
+        assert!(rendered.contains("[enter] Save key"));
 
-        commit_setting_edit(&mut settings).unwrap();
-        assert!(matches!(
-            settings.pending_openai_key,
-            Some(PendingSecretChange::Set(_))
-        ));
+        let mut saved = String::new();
+        assert!(save_openai_key_edit_with(&mut settings, |secret| {
+            saved = secret.to_string();
+            Ok(())
+        })
+        .unwrap());
+        assert_eq!(saved, "sk-never-render-this");
+        assert!(settings.saved_openai_key_present);
         assert!(settings.edit_value.is_empty());
         assert!(!format!("{settings:?}").contains("sk-never-render-this"));
         assert!(!toml::to_string(&settings.draft)
@@ -2536,23 +2695,79 @@ mod tests {
     }
 
     #[test]
-    fn saved_openai_key_can_be_staged_for_removal() {
+    fn saved_openai_key_removal_requires_confirmation_and_can_be_cancelled() {
         let root = tempdir().unwrap().keep();
         let env = test_env(root);
         let mut settings = settings_state();
+        settings.draft.recommender.backend = RecommenderBackend::OpenaiKeyring;
         settings.row = 15;
         settings.saved_openai_key_present = true;
         let mut ui = TuiState {
             settings: Some(settings),
+            saved_openai_key_available: Some(true),
             ..TuiState::default()
         };
 
         handle_settings_key(&mut ui, KeyCode::Delete, KeyModifiers::NONE, &env).unwrap();
+        let settings = ui.settings.as_ref().unwrap();
+        assert!(settings.confirming_openai_key_delete);
+        let rendered = settings_lines(settings, false, 120, 40)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("Remove saved OpenAI key?"));
+        assert!(rendered.contains("[enter/y] Remove key  [esc] Cancel"));
 
-        assert!(matches!(
-            ui.settings.as_ref().unwrap().pending_openai_key,
-            Some(PendingSecretChange::Delete)
-        ));
+        handle_settings_key(&mut ui, KeyCode::Esc, KeyModifiers::NONE, &env).unwrap();
+        assert!(!ui.settings.as_ref().unwrap().confirming_openai_key_delete);
+        assert!(ui.settings.as_ref().unwrap().saved_openai_key_present);
+    }
+
+    #[test]
+    fn confirmed_saved_openai_key_removal_updates_settings_state() {
+        let mut settings = settings_state();
+        settings.saved_openai_key_present = true;
+        settings.confirming_openai_key_delete = true;
+        let mut removed = false;
+
+        remove_saved_openai_key_with(&mut settings, || {
+            removed = true;
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(removed);
+        assert!(!settings.saved_openai_key_present);
+        assert!(!settings.confirming_openai_key_delete);
+    }
+
+    #[test]
+    fn credential_store_failures_preserve_safe_retry_state() {
+        let mut saving = settings_state();
+        saving.row = 15;
+        begin_setting_edit(&mut saving);
+        saving.edit_value = Zeroizing::new("sk-retry-secret".into());
+        saving.edit_cursor = saving.edit_value.chars().count();
+
+        let save_error =
+            save_openai_key_edit_with(&mut saving, |_| anyhow::bail!("credential store is locked"))
+                .unwrap_err();
+        assert_eq!(save_error.to_string(), "credential store is locked");
+        assert!(saving.editing);
+        assert_eq!(saving.edit_value.as_str(), "sk-retry-secret");
+        assert!(!format!("{saving:?}").contains("sk-retry-secret"));
+
+        let mut removing = settings_state();
+        removing.saved_openai_key_present = true;
+        removing.confirming_openai_key_delete = true;
+        let remove_error = remove_saved_openai_key_with(&mut removing, || {
+            anyhow::bail!("credential store is locked")
+        })
+        .unwrap_err();
+        assert_eq!(remove_error.to_string(), "credential store is locked");
+        assert!(removing.saved_openai_key_present);
+        assert!(removing.confirming_openai_key_delete);
     }
 
     #[test]
@@ -2780,16 +2995,36 @@ mod tests {
         settings.draft.profile.goals = vec!["not saved".into()];
         let mut ui = TuiState {
             settings: Some(settings),
+            saved_openai_key_available: Some(true),
             ..TuiState::default()
         };
 
         handle_settings_key(&mut ui, KeyCode::Esc, KeyModifiers::NONE, &env).unwrap();
 
         assert!(ui.settings.is_none());
+        assert_eq!(ui.saved_openai_key_available, None);
         assert_eq!(
             config::load_or_default(&env.paths).unwrap().profile.goals,
             original.profile.goals
         );
+    }
+
+    #[test]
+    fn cancelling_settings_keeps_cache_only_for_the_applied_saved_key_backend() {
+        let root = tempdir().unwrap().keep();
+        let env = test_env(root);
+        let mut settings = settings_state();
+        settings.applied_recommender_backend = RecommenderBackend::OpenaiKeyring;
+        let mut ui = TuiState {
+            settings: Some(settings),
+            saved_openai_key_available: Some(true),
+            ..TuiState::default()
+        };
+
+        handle_settings_key(&mut ui, KeyCode::Esc, KeyModifiers::NONE, &env).unwrap();
+
+        assert!(ui.settings.is_none());
+        assert_eq!(ui.saved_openai_key_available, Some(true));
     }
 
     fn test_env(root: std::path::PathBuf) -> RuntimeEnv {
@@ -2813,7 +3048,7 @@ mod tests {
         let mut draft = previous.clone();
         draft.profile.goals = vec!["changed".into()];
 
-        assert!(apply_settings(&env, &draft, None).is_err());
+        assert!(apply_settings(&env, &draft).is_err());
         assert_eq!(
             config::load_or_default(&env.paths).unwrap().profile.goals,
             previous.profile.goals
@@ -2828,7 +3063,7 @@ mod tests {
         draft.recommender.backend = RecommenderBackend::Local;
         draft.profile.goals = vec!["mobility".into()];
 
-        let receiver = apply_settings(&env, &draft, None).unwrap();
+        let receiver = apply_settings(&env, &draft).unwrap();
         assert!(receiver
             .recv_timeout(Duration::from_secs(5))
             .unwrap()

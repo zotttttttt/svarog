@@ -48,8 +48,11 @@ validated locally.
 
 An OpenAI API key can be read from the configured environment variable or saved
 through Settings. Saved keys are protected by macOS Keychain or Linux Secret
-Service and are never written to Svarog's config file or database. Codex and
-OpenAI token totals are tracked separately.
+Service and are never written to Svarog's config file or database. While the
+saved-key recommender is active, Svarog keeps the key in a synchronized,
+zeroized process-memory cache to avoid repeated credential-store prompts. It
+clears that copy when another recommender is applied, the key is removed, or
+Svarog exits. Codex and OpenAI token totals are tracked separately.
 
 ## Notifications
 
