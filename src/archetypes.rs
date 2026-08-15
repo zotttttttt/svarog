@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::str::FromStr;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,6 +127,54 @@ pub fn get(id: ArchetypeId) -> &'static Archetype {
     BUILT_INS.iter().find(|item| item.id == effective).unwrap()
 }
 
+pub fn display_name(id: ArchetypeId, custom_name: Option<&str>) -> Cow<'static, str> {
+    if id == ArchetypeId::Custom {
+        custom_name
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(|name| Cow::Owned(name.to_string()))
+            .unwrap_or(Cow::Borrowed("Custom"))
+    } else {
+        Cow::Borrowed(get(id).name)
+    }
+}
+
+pub fn terminal_symbol(id: ArchetypeId) -> &'static str {
+    let archetype = get(id);
+    if terminal_needs_symbol_fallback(
+        std::env::var("SVAROG_ASCII").ok().as_deref(),
+        std::env::var("TERM").ok().as_deref(),
+        std::env::var("LC_ALL")
+            .ok()
+            .or_else(|| std::env::var("LC_CTYPE").ok())
+            .or_else(|| std::env::var("LANG").ok())
+            .as_deref(),
+    ) {
+        archetype.fallback_symbol
+    } else {
+        archetype.symbol
+    }
+}
+
+fn terminal_needs_symbol_fallback(
+    ascii_override: Option<&str>,
+    term: Option<&str>,
+    locale: Option<&str>,
+) -> bool {
+    let explicitly_ascii = ascii_override.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    });
+    let dumb_terminal = term.is_some_and(|value| value.eq_ignore_ascii_case("dumb"));
+    let non_utf8_locale = locale.is_some_and(|value| {
+        let value = value.to_ascii_lowercase();
+        !value.contains("utf-8") && !value.contains("utf8")
+    });
+    explicitly_ascii || dumb_terminal || non_utf8_locale
+}
+
 pub fn index(id: ArchetypeId) -> usize {
     BUILT_INS.iter().position(|item| item.id == id).unwrap_or(5)
 }
@@ -183,5 +232,42 @@ mod tests {
                 [7, 6, 8, 8, 8, 7, 10],
             ]
         );
+    }
+
+    #[test]
+    fn custom_display_name_does_not_use_behavior_fallback() {
+        assert_eq!(display_name(ArchetypeId::Custom, Some("Goku")), "Goku");
+        assert_eq!(display_name(ArchetypeId::Custom, None), "Custom");
+        assert_eq!(display_name(ArchetypeId::Boxer, Some("ignored")), "Boxer");
+    }
+
+    #[test]
+    fn terminal_fallback_conditions_are_conservative() {
+        assert!(terminal_needs_symbol_fallback(
+            Some("1"),
+            Some("xterm"),
+            Some("en_US.UTF-8")
+        ));
+        assert!(terminal_needs_symbol_fallback(
+            None,
+            Some("dumb"),
+            Some("en_US.UTF-8")
+        ));
+        assert!(terminal_needs_symbol_fallback(
+            None,
+            Some("xterm"),
+            Some("en_US.ISO-8859-1")
+        ));
+        assert!(terminal_needs_symbol_fallback(
+            None,
+            Some("xterm"),
+            Some("C")
+        ));
+        assert!(!terminal_needs_symbol_fallback(
+            None,
+            Some("xterm"),
+            Some("en_US.UTF-8")
+        ));
+        assert!(!terminal_needs_symbol_fallback(None, Some("xterm"), None));
     }
 }

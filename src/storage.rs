@@ -7,7 +7,7 @@ use crate::models::{
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Local, TimeZone, Utc};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::Serialize;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -537,6 +537,40 @@ impl Store {
             .conn
             .unchecked_transaction()
             .context("starting exercise-pool replacement")?;
+        Self::replace_movement_pool_in_transaction(&transaction, movements)?;
+        transaction
+            .commit()
+            .context("committing exercise-pool replacement")
+    }
+
+    pub fn apply_user_profile_and_movement_pool(
+        &self,
+        config: &Config,
+        movements: &[Movement],
+    ) -> Result<()> {
+        let transaction = self
+            .conn
+            .unchecked_transaction()
+            .context("starting settings update")?;
+        transaction.execute(
+            r#"
+            INSERT INTO users (id, profile_json, created_at)
+            VALUES (1, ?1, ?2)
+            ON CONFLICT(id) DO UPDATE SET profile_json = excluded.profile_json
+            "#,
+            params![
+                serde_json::to_string(&config.profile)?,
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+        Self::replace_movement_pool_in_transaction(&transaction, movements)?;
+        transaction.commit().context("committing settings update")
+    }
+
+    fn replace_movement_pool_in_transaction(
+        transaction: &Transaction<'_>,
+        movements: &[Movement],
+    ) -> Result<()> {
         transaction.execute("DELETE FROM movements", [])?;
         {
             let mut statement = transaction.prepare(
@@ -606,9 +640,7 @@ impl Store {
             "#,
             [Utc::now().to_rfc3339()],
         )?;
-        transaction
-            .commit()
-            .context("committing exercise-pool replacement")
+        Ok(())
     }
 
     pub fn clear_exercise_exclusions(&self) -> Result<()> {
@@ -1980,6 +2012,27 @@ mod tests {
         assert!(store.movements().unwrap().is_empty());
         assert!(store.latest_open_recommendation().unwrap().is_none());
         assert_eq!(store.state().unwrap().kind, AppStateKind::Idle);
+    }
+
+    #[test]
+    fn settings_profile_and_movement_pool_update_together() {
+        let store = store();
+        let mut config = Config::default();
+        config.profile.goals = vec!["mobility".into()];
+        let movements = crate::exercise_catalog::movements_for_equipment(&["bodyweight".into()]);
+
+        store
+            .apply_user_profile_and_movement_pool(&config, &movements)
+            .unwrap();
+
+        let profile_json: String = store
+            .conn
+            .query_row("SELECT profile_json FROM users WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(profile_json.contains("mobility"));
+        assert_eq!(store.movements().unwrap().len(), movements.len());
     }
 
     #[test]

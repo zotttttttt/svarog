@@ -21,6 +21,11 @@ changes. Useful advanced settings include the daily safety ceiling,
 notification behavior, recommender selection, timeouts, fallback behavior, and
 the Codex/OpenAI model configuration.
 
+Svarog uses Unicode archetype symbols by default. If a terminal cannot render
+them cleanly, set `SVAROG_ASCII=1` before starting Svarog to use conservative
+fallback symbols. Fallback mode is also selected automatically for `TERM=dumb`
+and explicitly non-UTF-8 locales.
+
 ## Recommendation prompts
 
 The repository includes two base

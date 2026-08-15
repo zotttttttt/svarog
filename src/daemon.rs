@@ -334,18 +334,24 @@ pub fn regenerate_queue_best_effort(env: &RuntimeEnv) {
     });
 }
 
-pub fn regenerate_queue_after_settings(env: &RuntimeEnv) {
+pub fn regenerate_queue_after_settings(env: &RuntimeEnv) -> Receiver<QueueRegenerationResult> {
+    let (sender, receiver) = mpsc::channel();
     let env = env.clone();
     std::thread::spawn(move || {
         for _ in 0..300 {
             if begin_queue_job(&REFILL_IN_PROGRESS) {
                 let _guard = RefillGuard;
-                let _ = regenerate_queue_now(&env);
+                let result = regenerate_queue_now(&env).map_err(|err| err.to_string());
+                let _ = sender.send(result);
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(200));
         }
+        let _ = sender.send(Err(
+            "timed out waiting to refresh future forges; the existing queue was kept".into(),
+        ));
     });
+    receiver
 }
 
 pub fn regenerate_queue(env: &RuntimeEnv) -> QueueRegenerationStart {

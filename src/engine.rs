@@ -153,7 +153,7 @@ pub fn opportunity_allows(store: &Store, config: &Config) -> Result<bool> {
             .take(3)
             .filter(|item| item.status != "done" || item.actual_reps < item.prescribed_reps)
             .count();
-        if outcomes.first().is_some_and(|item| item.status == "pain") || adverse >= 2 {
+        if outcomes.iter().any(|item| item.status == "pain") || adverse >= 2 {
             5
         } else if adverse == 1 {
             3
@@ -275,6 +275,26 @@ mod tests {
             .unwrap();
 
         for _ in 0..2 {
+            store.insert_event(&event(90)).unwrap();
+        }
+        assert!(!opportunity_allows(&store, &config).unwrap());
+        store.insert_event(&event(90)).unwrap();
+        assert!(opportunity_allows(&store, &config).unwrap());
+    }
+
+    #[test]
+    fn pain_backoff_survives_a_later_compliant_forge() {
+        let store = test_store();
+        let config = Config::default();
+        let mut painful = recommend(&store, &config, &event(90)).unwrap().unwrap();
+        painful.id = Some(store.insert_recommendation(&painful).unwrap());
+        store.record_set(&painful, SetStatus::Pain).unwrap();
+
+        let mut completed = recommend(&store, &config, &event(90)).unwrap().unwrap();
+        completed.id = Some(store.insert_recommendation(&completed).unwrap());
+        store.record_set(&completed, SetStatus::Done).unwrap();
+
+        for _ in 0..4 {
             store.insert_event(&event(90)).unwrap();
         }
         assert!(!opportunity_allows(&store, &config).unwrap());

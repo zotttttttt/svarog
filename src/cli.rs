@@ -667,7 +667,10 @@ fn print_setup_summary(config: &Config) {
     println!("{}", muted("Forge archetype:"));
     println!(
         "{}",
-        text(crate::archetypes::get(config.forge.archetype).name)
+        text(crate::archetypes::display_name(
+            config.forge.archetype,
+            config.forge.custom_archetype.as_deref(),
+        ))
     );
     println!();
     println!("{}", muted("Notifications:"));
@@ -1098,12 +1101,12 @@ fn cm_to_feet_inches(height_cm: u32) -> (u32, u32) {
     (total_inches / 12, total_inches % 12)
 }
 
-fn format_imperial_height(height_cm: u32) -> String {
+pub(crate) fn format_imperial_height(height_cm: u32) -> String {
     let (feet, inches) = cm_to_feet_inches(height_cm);
     format!("{feet}'{inches}\"")
 }
 
-fn parse_imperial_height_inches(value: &str) -> Result<u32> {
+pub(crate) fn parse_imperial_height_inches(value: &str) -> Result<u32> {
     let compact = value
         .chars()
         .filter(|character| !character.is_whitespace())
