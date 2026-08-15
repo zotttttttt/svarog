@@ -227,6 +227,12 @@ enum ViewKind {
     Cooldown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArchetypeSelectorContext {
+    Onboarding,
+    Settings,
+}
+
 pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -745,21 +751,40 @@ fn view_lines(view: &ViewModel, ui: &TuiState) -> Vec<Line<'static>> {
     }
 }
 
-fn archetype_lines(forge: &Forge, custom_edit: Option<&str>, demo: bool) -> Vec<Line<'static>> {
+fn archetype_lines(
+    forge: &Forge,
+    custom_edit: Option<&str>,
+    demo: bool,
+    context: ArchetypeSelectorContext,
+) -> Vec<Line<'static>> {
     let archetype = crate::archetypes::get(forge.archetype);
     let title = crate::archetypes::display_name(forge.archetype, forge.custom_archetype.as_deref());
     let mut lines = vec![
-        title_line(demo),
-        Line::from(""),
-        Line::from(Span::styled(
-            crate::archetypes::terminal_symbol(forge.archetype),
-            accent_bold(),
-        )),
-        Line::from(Span::styled(title.to_uppercase(), text_bold())),
+        with_demo(
+            Line::from(Span::styled(title.to_uppercase(), text_bold())),
+            demo,
+        ),
         Line::from(""),
         Line::from(Span::styled(archetype.description, text())),
-        Line::from(""),
     ];
+    if let Some(value) = custom_edit {
+        lines.push(Line::from(Span::styled("Custom archetype", text_bold())));
+        lines.push(Line::from(Span::styled(format!("> {value}_"), accent())));
+        lines.push(Line::from(Span::styled("[enter] Set  [esc] Back", muted())));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "←/h Previous   →/l Next   [enter] Choose   [/] Custom",
+            muted(),
+        )));
+        lines.push(Line::from(Span::styled(
+            "You can change your archetype at any time.",
+            muted(),
+        )));
+        if context == ArchetypeSelectorContext::Settings {
+            lines.push(Line::from(Span::styled("[esc] Back", muted())));
+        }
+    }
+    lines.push(Line::from(""));
     for (label, score) in [
         ("Strength", archetype.stats.strength),
         ("Muscle", archetype.stats.muscle),
@@ -781,21 +806,6 @@ fn archetype_lines(forge: &Forge, custom_edit: Option<&str>, demo: bool) -> Vec<
             ),
         ]));
     }
-    lines.push(Line::from(""));
-    if let Some(value) = custom_edit {
-        lines.push(Line::from(Span::styled("Custom archetype", text_bold())));
-        lines.push(Line::from(Span::styled(format!("> {value}_"), accent())));
-        lines.push(Line::from(Span::styled("[enter] Set  [esc] Back", muted())));
-    } else {
-        lines.push(Line::from(Span::styled(
-            "←/h Previous   →/l Next   [enter] Choose   [/] Custom   [esc] Back",
-            muted(),
-        )));
-        lines.push(Line::from(Span::styled(
-            "You can change your archetype at any time.",
-            muted(),
-        )));
-    }
     lines
 }
 
@@ -813,6 +823,7 @@ fn settings_lines(
                     .custom_archetype
                     .then_some(settings.edit_value.as_str()),
                 demo,
+                ArchetypeSelectorContext::Settings,
             ),
             usize::from(area_height),
         );
@@ -905,9 +916,7 @@ fn settings_lines(
         ("Apply changes", "Enter to save".into()),
     ];
     let mut lines = vec![
-        title_line(demo),
-        Line::from(""),
-        Line::from(Span::styled("Settings", text_bold())),
+        with_demo(Line::from(Span::styled("Settings", text_bold())), demo),
         Line::from(Span::styled("↑/↓ Focus  ←/→ Change  Enter Edit", muted())),
         Line::from(""),
     ];
@@ -978,17 +987,7 @@ fn settings_lines(
 }
 
 fn fitted_modal_lines(lines: Vec<Line<'static>>, height: usize) -> Vec<Line<'static>> {
-    if lines.len() <= height || height < 4 {
-        return lines;
-    }
-    let footer = lines.len().saturating_sub(2);
-    lines
-        .into_iter()
-        .enumerate()
-        .filter_map(|(index, line)| {
-            (index < height.saturating_sub(2) || index >= footer).then_some(line)
-        })
-        .collect()
+    lines.into_iter().take(height.max(1)).collect()
 }
 
 fn begin_setting_edit(settings: &mut SettingsState) {
@@ -1360,7 +1359,7 @@ fn handle_settings_key(ui: &mut TuiState, code: KeyCode, env: &RuntimeEnv) -> Re
     Ok(())
 }
 
-pub fn select_archetype(current: &Forge) -> Result<Option<Forge>> {
+pub fn select_archetype(current: &Forge) -> Result<Forge> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -1370,10 +1369,15 @@ pub fn select_archetype(current: &Forge) -> Result<Option<Forge>> {
     let mut custom: Option<String> = None;
     let result = loop {
         terminal.draw(|frame| {
-            let paragraph = Paragraph::new(archetype_lines(&forge, custom.as_deref(), false))
-                .block(Block::default().borders(Borders::ALL).title(" SVAROG "))
-                .style(Style::default().bg(colors::BG).fg(colors::TEXT))
-                .wrap(Wrap { trim: false });
+            let paragraph = Paragraph::new(archetype_lines(
+                &forge,
+                custom.as_deref(),
+                false,
+                ArchetypeSelectorContext::Onboarding,
+            ))
+            .block(Block::default().borders(Borders::ALL).title(" SVAROG "))
+            .style(Style::default().bg(colors::BG).fg(colors::TEXT))
+            .wrap(Wrap { trim: false });
             frame.render_widget(paragraph, frame.area());
         })?;
         if let Event::Key(key) = event::read()? {
@@ -1387,7 +1391,7 @@ pub fn select_archetype(current: &Forge) -> Result<Option<Forge>> {
                     KeyCode::Enter if !value.trim().is_empty() => {
                         forge.archetype = crate::archetypes::ArchetypeId::Custom;
                         forge.custom_archetype = Some(value.trim().to_string());
-                        break Ok(Some(forge));
+                        break Ok(forge);
                     }
                     _ => {}
                 }
@@ -1402,8 +1406,8 @@ pub fn select_archetype(current: &Forge) -> Result<Option<Forge>> {
                         forge.custom_archetype = None;
                     }
                     KeyCode::Char('/') => custom = Some(String::new()),
-                    KeyCode::Enter => break Ok(Some(forge)),
-                    KeyCode::Esc => break Ok(None),
+                    KeyCode::Enter => break Ok(forge),
+                    KeyCode::Esc => {}
                     _ => {}
                 }
             }
@@ -1449,9 +1453,10 @@ fn exercise_help_lines(
     demo: bool,
 ) -> Vec<Line<'static>> {
     let mut lines = vec![
-        title_line(demo),
-        Line::from(""),
-        Line::from(Span::styled(rec.display_name(), accent_bold())),
+        with_demo(
+            Line::from(Span::styled(rec.display_name(), accent_bold())),
+            demo,
+        ),
         Line::from(Span::styled("How to", text_bold())),
         Line::from(""),
     ];
@@ -1500,9 +1505,10 @@ fn idle_lines(
     demo: bool,
 ) -> Vec<Line<'static>> {
     let mut lines = vec![
-        title_line(demo),
-        Line::from(""),
-        Line::from(Span::styled("Waiting for the next forge.", muted())),
+        with_demo(
+            Line::from(Span::styled("Waiting for the next forge.", muted())),
+            demo,
+        ),
         Line::from(""),
         forge_now_control_line(),
         forge_list_controls_line(),
@@ -1540,12 +1546,13 @@ fn cooldown_lines(
     demo: bool,
 ) -> Vec<Line<'static>> {
     let mut lines = vec![
-        title_line(demo),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("Forged. ", accent_bold()),
-            Span::styled("Waiting for the next forge.", muted()),
-        ]),
+        with_demo(
+            Line::from(vec![
+                Span::styled("Forged. ", accent_bold()),
+                Span::styled("Waiting for the next forge.", muted()),
+            ]),
+            demo,
+        ),
         Line::from(""),
         forge_now_control_line(),
         forge_list_controls_line(),
@@ -1798,11 +1805,10 @@ fn next_forge_lines(
     feedback: Option<&QueueRegenerationFeedback>,
     forge_now_feedback: Option<&str>,
 ) -> Vec<Line<'static>> {
-    let mut lines = vec![
-        title_line(demo),
-        Line::from(""),
+    let mut lines = vec![with_demo(
         Line::from(Span::styled("Next forges", text_bold())),
-    ];
+        demo,
+    )];
     if next_forges.is_empty() {
         lines.extend([
             Line::from(""),
@@ -1862,11 +1868,10 @@ fn history_lines_for_date(
     demo: bool,
     today: chrono::NaiveDate,
 ) -> Vec<Line<'static>> {
-    let mut lines = vec![
-        title_line(demo),
-        Line::from(""),
+    let mut lines = vec![with_demo(
         Line::from(Span::styled("Latest forges", text_bold())),
-    ];
+        demo,
+    )];
     if history.is_empty() {
         lines.extend([
             Line::from(""),
@@ -1954,9 +1959,10 @@ fn skip_confirmation_action(code: KeyCode) -> Option<SkipConfirmationAction> {
 fn forge_lines(rec: &Recommendation, ui: &TuiState) -> Vec<Line<'static>> {
     if ui.skip_check {
         return vec![
-            title_line(ui.demo),
-            Line::from(""),
-            Line::from(Span::styled("Skip this forge?", accent_bold())),
+            with_demo(
+                Line::from(Span::styled("Skip this forge?", accent_bold())),
+                ui.demo,
+            ),
             Line::from(""),
             Line::from(Span::styled("Are you fatigued?", text())),
             Line::from(Span::styled(
@@ -1976,14 +1982,13 @@ fn forge_lines(rec: &Recommendation, ui: &TuiState) -> Vec<Line<'static>> {
         ];
     }
 
-    let mut lines = vec![
-        title_line(ui.demo),
-        Line::from(""),
+    let mut lines = vec![with_demo(
         Line::from(Span::styled(
             rec.display_name().to_uppercase(),
             accent_bold(),
         )),
-    ];
+        ui.demo,
+    )];
     if let Some(weight) = rec.weight_kg {
         lines.push(Line::from(Span::styled(weight_label(weight), text())));
     }
@@ -2064,15 +2069,11 @@ fn animation_lines(frame: usize) -> Vec<Line<'static>> {
         .collect()
 }
 
-fn title_line(demo: bool) -> Line<'static> {
-    let mut spans = vec![
-        Span::styled("⚒ ", accent_bold()),
-        Span::styled("Svarog", text_bold()),
-    ];
+fn with_demo(mut line: Line<'static>, demo: bool) -> Line<'static> {
     if demo {
-        spans.push(Span::styled("  [demo]", muted()));
+        line.spans.push(Span::styled("  [demo]", muted()));
     }
-    Line::from(spans)
+    line
 }
 
 fn text() -> Style {
@@ -2151,6 +2152,30 @@ mod tests {
         assert!(selector.contains("ATHLETE"));
         assert!(selector.contains("Strength"));
         assert!(selector.contains("You can change your archetype at any time."));
+        assert!(selector.contains("[esc] Back"));
+        assert!(!selector.contains('★'));
+    }
+
+    #[test]
+    fn onboarding_selector_puts_controls_below_description_without_escape() {
+        let forge = Forge::default();
+        let lines = archetype_lines(&forge, None, false, ArchetypeSelectorContext::Onboarding);
+
+        assert_eq!(lines[0].to_string(), "ATHLETE");
+        assert_eq!(
+            lines[2].to_string(),
+            crate::archetypes::get(forge.archetype).description
+        );
+        assert_eq!(
+            lines[3].to_string(),
+            "←/h Previous   →/l Next   [enter] Choose   [/] Custom"
+        );
+        assert_eq!(
+            lines[4].to_string(),
+            "You can change your archetype at any time."
+        );
+        assert!(!lines.iter().any(|line| line.to_string().contains("[esc]")));
+        assert_eq!(lines[6].to_string(), "Strength   ████████░░  8");
     }
 
     #[test]
@@ -2375,7 +2400,7 @@ mod tests {
         .collect::<Vec<_>>()
         .join("\n");
 
-        assert!(text.contains("Svarog"));
+        assert!(!text.contains("⚒ Svarog"));
         assert!(text.contains("Waiting for the next forge."));
         assert!(text.contains("[l] Latest forges"));
         assert!(text.contains("[n] Next forges"));
@@ -2892,12 +2917,50 @@ mod tests {
     }
 
     #[test]
-    fn demo_title_is_visibly_marked() {
-        let title = title_line(true).to_string();
+    fn demo_marker_is_appended_without_adding_a_line() {
+        let marked = with_demo(Line::from("Settings"), true);
+        let unmarked = with_demo(Line::from("Settings"), false);
 
-        assert!(title.contains("Svarog"));
-        assert!(title.contains("[demo]"));
-        assert!(!title_line(false).to_string().contains("[demo]"));
+        assert_eq!(marked.to_string(), "Settings  [demo]");
+        assert_eq!(unmarked.to_string(), "Settings");
+    }
+
+    #[test]
+    fn primary_screens_start_with_content_and_inline_demo_marker() {
+        let backend = BackendView {
+            label: "Local".into(),
+            unavailable: false,
+            config_file: "/tmp/config.toml".into(),
+        };
+        let activity = ForgeActivitySummary::default();
+        let usage = RecommenderTokenUsageByProvider::default();
+        let recommendation = rec();
+        let ui = TuiState {
+            demo: true,
+            ..TuiState::default()
+        };
+        let screens = vec![
+            idle_lines(&backend, &activity, &usage, None, None, None, None, true),
+            cooldown_lines(&backend, &activity, &usage, None, None, None, None, true),
+            next_forge_lines(&[], true, None, None, None),
+            history_lines_for_date(&[], true, Local::now().date_naive()),
+            forge_lines(&recommendation, &ui),
+            exercise_help_lines(&recommendation, None, false, None, true),
+            settings_lines(&settings_state(), true, 120, 40),
+            archetype_lines(
+                &Forge::default(),
+                None,
+                true,
+                ArchetypeSelectorContext::Onboarding,
+            ),
+        ];
+
+        for lines in screens {
+            let first = lines.first().unwrap().to_string();
+            assert!(!first.trim().is_empty());
+            assert!(first.contains("[demo]"), "{first}");
+            assert!(!first.contains("Svarog"), "{first}");
+        }
     }
 
     #[test]

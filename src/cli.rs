@@ -583,15 +583,7 @@ fn collect_profile(config: &mut Config, paths: &config::Paths, all: bool) -> Res
         Ok(())
     })?;
     onboarding_step(config, paths, config::STEP_ARCHETYPE, all, |config| {
-        loop {
-            if let Some(selection) = tui::select_archetype(&config.forge)? {
-                config.forge = selection;
-                break;
-            }
-            config.profile.injuries =
-                prompt_list("Injuries or hard limitations", &config.profile.injuries)?;
-            config::save(paths, config)?;
-        }
+        config.forge = tui::select_archetype(&config.forge)?;
         Ok(())
     })?;
     onboarding_step(

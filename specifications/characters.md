@@ -87,11 +87,12 @@ Example:
 ```text
 ╭─────────────────────── SVAROG ───────────────────────╮
 │                                                       │
-│                         ⚔                             │
 │                      WRESTLER                         │
 │                                                       │
 │  Powerful pulling, grip, posterior-chain strength,   │
 │  carries, isometrics, explosiveness and conditioning.│
+│  ← previous   → next   Enter choose   / custom       │
+│  You can change your archetype at any time.          │
 │                                                       │
 │  Strength      █████████░  9                         │
 │  Muscle        ████████░░  8                         │
@@ -100,12 +101,6 @@ Example:
 │  Control       ████████░░  8                         │
 │  Stamina       █████████░  9                         │
 │  Longevity     ███████░░░  7                         │
-│                                                       │
-│             ← previous     next →                    │
-│                                                       │
-│                 Enter to choose                       │
-│                                                       │
-│  You can change your archetype at any time.          │
 ╰───────────────────────────────────────────────────────╯
 ```
 
@@ -141,31 +136,9 @@ This acts as the general-purpose default.
 
 ---
 
-# 5. Character symbols
+# 5. Archetype presentation
 
-Each built-in archetype has a small Unicode symbol.
-
-The symbol is decorative and should make archetypes visually distinguishable without requiring images or terminal graphics.
-
-Recommended initial set:
-
-| Archetype      | Symbol |
-| -------------- | ------ |
-| Boxer          | 🥊     |
-| Wrestler       | ⚔      |
-| Martial Artist | ☯      |
-| Bodybuilder    | 🏋     |
-| Runner         | 🏃     |
-| Athlete        | ★      |
-| Gymnast        | ◇      |
-| Yogi           | 🪷     |
-| Mover          | ∿      |
-| Thinker        | 🧠     |
-| Lifer          | ∞      |
-
-Symbols are presentation metadata and must **not** influence recommendation logic.
-
-Prefer symbols with reliable terminal rendering. Where an emoji renders poorly, fall back to the corresponding simple Unicode symbol.
+Archetypes are presented with their name, description and seven stat bars. Do not add decorative icons or symbols; the selector should remain compact and text-first.
 
 ---
 
@@ -276,7 +249,7 @@ The full names should be used where terminal width permits.
 
 # 8. Archetype descriptions
 
-## Boxer 🥊
+## Boxer
 
 **Short description**
 
@@ -299,7 +272,7 @@ The Boxer archetype strongly embodies Svarog's philosophy of accumulating physic
 
 ---
 
-## Wrestler ⚔
+## Wrestler
 
 **Short description**
 
@@ -322,7 +295,7 @@ Bias toward:
 
 ---
 
-## Martial Artist ☯
+## Martial Artist
 
 **Short description**
 
@@ -347,7 +320,7 @@ Avoid unnecessary hypertrophy bias when other choices provide equal benefit.
 
 ---
 
-## Bodybuilder 🏋
+## Bodybuilder
 
 **Short description**
 
@@ -370,7 +343,7 @@ Distributed Svarog sessions should still respect recovery rather than repeatedly
 
 ---
 
-## Runner 🏃
+## Runner
 
 **Short description**
 
@@ -393,7 +366,7 @@ User limitations must override running-specific recommendations.
 
 ---
 
-## Athlete ★
+## Athlete
 
 **Short description**
 
@@ -418,7 +391,7 @@ No single physical quality should dominate without additional evidence from the 
 
 ---
 
-## Gymnast ◇
+## Gymnast
 
 **Short description**
 
@@ -442,7 +415,7 @@ Avoid excessive external-load bias unless required by user goals.
 
 ---
 
-## Yogi 🪷
+## Yogi
 
 **Short description**
 
@@ -466,7 +439,7 @@ Do not interpret Yogi as "no strength work"; strength may still be used when it 
 
 ---
 
-## Mover ∿
+## Mover
 
 **Short description**
 
@@ -490,7 +463,7 @@ This archetype captures Pilates-like movement principles without depending on a 
 
 ---
 
-## Thinker 🧠
+## Thinker
 
 **Short description**
 
@@ -515,7 +488,7 @@ Training should support the working day rather than compete with it.
 
 ---
 
-## Lifer ∞
+## Lifer
 
 **Short description**
 
@@ -989,7 +962,6 @@ Conceptually:
 Archetype {
     id: "boxer",
     name: "Boxer",
-    symbol: "🥊",
     description: "...",
     strength: 6,
     muscle: 5,
@@ -1059,7 +1031,7 @@ The implementation is complete when:
 * [ ] Left/right arrows cycle through archetypes in-place.
 * [ ] Selection wraps from last to first and first to last.
 * [ ] `Athlete` is the default.
-* [ ] Every archetype displays its symbol, title, description and seven stats.
+* [ ] Every archetype displays its title, description and seven stats without decorative symbols.
 * [ ] User can select a built-in archetype with Enter.
 * [ ] User can provide a custom archetype.
 * [ ] Unknown custom archetypes safely fall back to Athlete behavior.

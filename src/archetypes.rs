@@ -67,8 +67,6 @@ pub struct ArchetypeStats {
 pub struct Archetype {
     pub id: ArchetypeId,
     pub name: &'static str,
-    pub symbol: &'static str,
-    pub fallback_symbol: &'static str,
     pub description: &'static str,
     pub stats: ArchetypeStats,
     pub preferred_categories: &'static [&'static str],
@@ -78,14 +76,12 @@ pub struct Archetype {
 }
 
 macro_rules! archetype {
-    ($id:ident, $name:literal, $symbol:literal, $fallback:literal, $description:literal,
+    ($id:ident, $name:literal, $description:literal,
      [$str:literal,$mus:literal,$car:literal,$mob:literal,$ctl:literal,$sta:literal,$lon:literal],
      $categories:expr, $forces:expr, $mechanics:expr, $muscles:expr) => {
         Archetype {
             id: ArchetypeId::$id,
             name: $name,
-            symbol: $symbol,
-            fallback_symbol: $fallback,
             description: $description,
             stats: ArchetypeStats {
                 strength: $str,
@@ -105,17 +101,17 @@ macro_rules! archetype {
 }
 
 pub const BUILT_INS: [Archetype; 11] = [
-    archetype!(Boxer, "Boxer", "🥊", "◆", "Fast, conditioned and durable: calisthenics, footwork, core work and very high distributed training volume.", [6,5,9,6,8,10,7], &["cardio", "plyometrics", "strength"], &["push"], &["compound"], &["abdominals", "shoulders", "quadriceps"]),
-    archetype!(Wrestler, "Wrestler", "⚔", "⚔", "Powerful and hard to fatigue: pulling, grip, posterior chain, carries, isometrics and explosive full-body strength.", [9,8,8,6,8,9,7], &["strongman", "strength", "powerlifting"], &["pull"], &["compound"], &["forearms", "lats", "hamstrings", "lower back", "glutes"]),
-    archetype!(MartialArtist, "Martial Artist", "☯", "☯", "Lean, mobile and precise: speed, coordination, balance, core control and explosive movement.", [7,5,7,10,10,8,8], &["plyometrics", "stretching", "cardio"], &[], &["compound"], &["abdominals", "adductors", "abductors"]),
-    archetype!(Bodybuilder, "Bodybuilder", "🏋", "◆", "Build muscle deliberately through resistance, progressive overload and hypertrophy-focused strength work.", [9,10,4,4,6,6,6], &["strength"], &["push", "pull"], &["isolation"], &["chest", "biceps", "triceps", "shoulders", "quadriceps"]),
-    archetype!(Runner, "Runner", "🏃", "→", "Build a large aerobic engine through movement volume, cardiovascular fitness and durable lower-body endurance.", [4,3,10,5,6,10,8], &["cardio", "plyometrics"], &[], &["compound"], &["calves", "quadriceps", "hamstrings", "glutes"]),
-    archetype!(Athlete, "Athlete", "★", "★", "Be good at everything: balanced strength, muscle, cardio, mobility, coordination and power.", [8,7,8,8,8,8,8], &["strength", "cardio", "stretching", "plyometrics"], &["push", "pull"], &["compound"], &[]),
-    archetype!(Gymnast, "Gymnast", "◇", "◇", "Master your own body through relative strength, core control, balance, mobility and precise movement.", [8,7,7,10,10,8,8], &["strength", "stretching"], &["push", "pull", "static"], &["compound"], &["abdominals", "lats", "shoulders"]),
-    archetype!(Yogi, "Yogi", "🪷", "◇", "Move freely and deliberately through mobility, flexibility, balance, breathing and controlled body awareness.", [3,3,4,10,9,5,9], &["stretching"], &["static"], &[], &["hamstrings", "lower back", "adductors", "abductors"]),
-    archetype!(Mover, "Mover", "∿", "∿", "Strong posture and controlled movement through core work, mobility, balance and low-impact muscular endurance.", [5,5,5,9,9,6,9], &["stretching", "strength"], &["static"], &["isolation"], &["abdominals", "glutes", "lower back"]),
-    archetype!(Thinker, "Thinker", "🧠", "◆", "Use movement to improve focus, energy, mood, stress regulation, sleep and cognitive performance.", [4,3,6,7,7,6,9], &["cardio", "stretching"], &[], &[], &["neck", "shoulders", "lower back"]),
-    archetype!(Lifer, "Lifer", "∞", "∞", "Stay strong, mobile, aerobically fit and physically independent for as many decades as possible.", [7,6,8,8,8,7,10], &["strength", "cardio", "stretching"], &["pull"], &["compound"], &["quadriceps", "hamstrings", "glutes", "forearms"]),
+    archetype!(Boxer, "Boxer", "Fast, conditioned and durable: calisthenics, footwork, core work and very high distributed training volume.", [6,5,9,6,8,10,7], &["cardio", "plyometrics", "strength"], &["push"], &["compound"], &["abdominals", "shoulders", "quadriceps"]),
+    archetype!(Wrestler, "Wrestler", "Powerful and hard to fatigue: pulling, grip, posterior chain, carries, isometrics and explosive full-body strength.", [9,8,8,6,8,9,7], &["strongman", "strength", "powerlifting"], &["pull"], &["compound"], &["forearms", "lats", "hamstrings", "lower back", "glutes"]),
+    archetype!(MartialArtist, "Martial Artist", "Lean, mobile and precise: speed, coordination, balance, core control and explosive movement.", [7,5,7,10,10,8,8], &["plyometrics", "stretching", "cardio"], &[], &["compound"], &["abdominals", "adductors", "abductors"]),
+    archetype!(Bodybuilder, "Bodybuilder", "Build muscle deliberately through resistance, progressive overload and hypertrophy-focused strength work.", [9,10,4,4,6,6,6], &["strength"], &["push", "pull"], &["isolation"], &["chest", "biceps", "triceps", "shoulders", "quadriceps"]),
+    archetype!(Runner, "Runner", "Build a large aerobic engine through movement volume, cardiovascular fitness and durable lower-body endurance.", [4,3,10,5,6,10,8], &["cardio", "plyometrics"], &[], &["compound"], &["calves", "quadriceps", "hamstrings", "glutes"]),
+    archetype!(Athlete, "Athlete", "Be good at everything: balanced strength, muscle, cardio, mobility, coordination and power.", [8,7,8,8,8,8,8], &["strength", "cardio", "stretching", "plyometrics"], &["push", "pull"], &["compound"], &[]),
+    archetype!(Gymnast, "Gymnast", "Master your own body through relative strength, core control, balance, mobility and precise movement.", [8,7,7,10,10,8,8], &["strength", "stretching"], &["push", "pull", "static"], &["compound"], &["abdominals", "lats", "shoulders"]),
+    archetype!(Yogi, "Yogi", "Move freely and deliberately through mobility, flexibility, balance, breathing and controlled body awareness.", [3,3,4,10,9,5,9], &["stretching"], &["static"], &[], &["hamstrings", "lower back", "adductors", "abductors"]),
+    archetype!(Mover, "Mover", "Strong posture and controlled movement through core work, mobility, balance and low-impact muscular endurance.", [5,5,5,9,9,6,9], &["stretching", "strength"], &["static"], &["isolation"], &["abdominals", "glutes", "lower back"]),
+    archetype!(Thinker, "Thinker", "Use movement to improve focus, energy, mood, stress regulation, sleep and cognitive performance.", [4,3,6,7,7,6,9], &["cardio", "stretching"], &[], &[], &["neck", "shoulders", "lower back"]),
+    archetype!(Lifer, "Lifer", "Stay strong, mobile, aerobically fit and physically independent for as many decades as possible.", [7,6,8,8,8,7,10], &["strength", "cardio", "stretching"], &["pull"], &["compound"], &["quadriceps", "hamstrings", "glutes", "forearms"]),
 ];
 
 pub fn get(id: ArchetypeId) -> &'static Archetype {
@@ -137,42 +133,6 @@ pub fn display_name(id: ArchetypeId, custom_name: Option<&str>) -> Cow<'static, 
     } else {
         Cow::Borrowed(get(id).name)
     }
-}
-
-pub fn terminal_symbol(id: ArchetypeId) -> &'static str {
-    let archetype = get(id);
-    if terminal_needs_symbol_fallback(
-        std::env::var("SVAROG_ASCII").ok().as_deref(),
-        std::env::var("TERM").ok().as_deref(),
-        std::env::var("LC_ALL")
-            .ok()
-            .or_else(|| std::env::var("LC_CTYPE").ok())
-            .or_else(|| std::env::var("LANG").ok())
-            .as_deref(),
-    ) {
-        archetype.fallback_symbol
-    } else {
-        archetype.symbol
-    }
-}
-
-fn terminal_needs_symbol_fallback(
-    ascii_override: Option<&str>,
-    term: Option<&str>,
-    locale: Option<&str>,
-) -> bool {
-    let explicitly_ascii = ascii_override.is_some_and(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    });
-    let dumb_terminal = term.is_some_and(|value| value.eq_ignore_ascii_case("dumb"));
-    let non_utf8_locale = locale.is_some_and(|value| {
-        let value = value.to_ascii_lowercase();
-        !value.contains("utf-8") && !value.contains("utf8")
-    });
-    explicitly_ascii || dumb_terminal || non_utf8_locale
 }
 
 pub fn index(id: ArchetypeId) -> usize {
@@ -239,35 +199,5 @@ mod tests {
         assert_eq!(display_name(ArchetypeId::Custom, Some("Goku")), "Goku");
         assert_eq!(display_name(ArchetypeId::Custom, None), "Custom");
         assert_eq!(display_name(ArchetypeId::Boxer, Some("ignored")), "Boxer");
-    }
-
-    #[test]
-    fn terminal_fallback_conditions_are_conservative() {
-        assert!(terminal_needs_symbol_fallback(
-            Some("1"),
-            Some("xterm"),
-            Some("en_US.UTF-8")
-        ));
-        assert!(terminal_needs_symbol_fallback(
-            None,
-            Some("dumb"),
-            Some("en_US.UTF-8")
-        ));
-        assert!(terminal_needs_symbol_fallback(
-            None,
-            Some("xterm"),
-            Some("en_US.ISO-8859-1")
-        ));
-        assert!(terminal_needs_symbol_fallback(
-            None,
-            Some("xterm"),
-            Some("C")
-        ));
-        assert!(!terminal_needs_symbol_fallback(
-            None,
-            Some("xterm"),
-            Some("en_US.UTF-8")
-        ));
-        assert!(!terminal_needs_symbol_fallback(None, Some("xterm"), None));
     }
 }
