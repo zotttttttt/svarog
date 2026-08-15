@@ -1,3 +1,4 @@
+mod archetypes;
 mod cli;
 mod config;
 mod daemon;

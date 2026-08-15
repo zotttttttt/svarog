@@ -16,6 +16,11 @@
 Closing the dashboard stops its local event collector. `svarog stop` also
 closes coding-agent processes inside tmux sessions created by Svarog.
 
+While the dashboard is waiting, press `s` to edit the Forge archetype,
+recommender, notifications, daily safety ceiling, measurements, goals,
+equipment, work setup, limitations, and exercise preferences. Changes remain
+staged until you focus **Apply changes** and press Enter; Esc cancels.
+
 ## Exercise controls
 
 | Command | Purpose |

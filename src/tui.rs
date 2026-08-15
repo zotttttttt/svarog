@@ -1,5 +1,7 @@
 use crate::cli;
-use crate::config::{self, Paths, RecommenderBackend, RuntimeEnv, RuntimeMode};
+use crate::config::{
+    self, Config, Forge, Paths, RecommenderBackend, RuntimeEnv, RuntimeMode, UnitSystem,
+};
 use crate::daemon::{self, ForgeNowResult, QueueRegenerationResult, QueueRegenerationStart};
 use crate::exercise_catalog::{self, ExerciseCatalogEntry};
 use crate::exercise_media::{self, PreparedGallery};
@@ -8,7 +10,7 @@ use crate::models::{
     RecommenderTokenUsageByProvider, SetStatus,
 };
 use crate::storage::{ForgeHistoryEntry, Store};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{Datelike, Duration as ChronoDuration, Local};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::execute;
@@ -19,7 +21,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Alignment;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Terminal;
 use std::io;
 use std::path::Path;
@@ -174,7 +176,22 @@ struct TuiState {
     queue_regeneration_feedback_started_at: Option<Instant>,
     forge_now_feedback: Option<String>,
     demo: bool,
+    settings: Option<SettingsState>,
 }
+
+#[derive(Debug, Clone)]
+struct SettingsState {
+    draft: Config,
+    row: usize,
+    editing: bool,
+    edit_value: String,
+    selecting_archetype: bool,
+    custom_archetype: bool,
+    archetype_original: Option<Forge>,
+    error: Option<String>,
+}
+
+const SETTINGS_ROWS: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum QueueRegenerationFeedback {
@@ -238,7 +255,11 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
         sync_reps(&mut ui, view.recommendation.as_ref());
         poll_exercise_media(&mut ui, view.recommendation.as_ref());
         terminal.draw(|frame| {
-            let lines = screen_lines(&view, &ui, in_tmux);
+            let lines = if let Some(settings) = ui.settings.as_ref() {
+                settings_lines(settings, ui.demo)
+            } else {
+                screen_lines(&view, &ui, in_tmux)
+            };
             let mut paragraph = Paragraph::new(lines)
                 .style(Style::default().bg(colors::BG).fg(colors::TEXT))
                 .alignment(Alignment::Left);
@@ -252,6 +273,31 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
 
         if event::poll(Duration::from_millis(200))? {
             if let Event::Key(key) = event::read()? {
+                if ui.settings.is_some() {
+                    if let Err(error) = handle_settings_key(&mut ui, key.code, env) {
+                        if let Some(settings) = ui.settings.as_mut() {
+                            settings.error = Some(error.to_string());
+                        }
+                    }
+                    continue;
+                }
+                if matches!(view.kind, ViewKind::Idle | ViewKind::Cooldown)
+                    && key.code == KeyCode::Char('s')
+                {
+                    if let Ok(draft) = config::load_or_default(&env.paths) {
+                        ui.settings = Some(SettingsState {
+                            draft,
+                            row: 0,
+                            editing: false,
+                            edit_value: String::new(),
+                            selecting_archetype: false,
+                            custom_archetype: false,
+                            archetype_original: None,
+                            error: None,
+                        });
+                    }
+                    continue;
+                }
                 if quit_requested(key) {
                     break Ok(());
                 }
@@ -347,21 +393,6 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
                     continue;
                 }
                 match (key.code, view.kind, ui.skip_check) {
-                    (code, ViewKind::Idle | ViewKind::Cooldown, false)
-                        if !ui.show_history
-                            && !ui.show_next
-                            && recommender_cycle_direction(code).is_some() =>
-                    {
-                        let direction = recommender_cycle_direction(code).unwrap();
-                        ui.status_message = cycle_recommender_backend(&env.paths, direction)
-                            .err()
-                            .map(|_| {
-                                format!(
-                                    "Could not update recommender. Edit: {}",
-                                    env.paths.config_file.display()
-                                )
-                            });
-                    }
                     (code, ViewKind::Forge, false) if increase_reps_requested(code) => {
                         ui.actual_reps = ui.actual_reps.saturating_add(1).min(999);
                     }
@@ -519,15 +550,6 @@ fn command_available(command: &str) -> bool {
         return false;
     };
     std::env::split_paths(&paths).any(|path| path.join(command).is_file())
-}
-
-fn cycle_recommender_backend(paths: &Paths, direction: CycleDirection) -> Result<()> {
-    let mut config = config::load_or_default(paths)?;
-    config.recommender.backend = match direction {
-        CycleDirection::Forward => config.recommender.backend.next(),
-        CycleDirection::Backward => config.recommender.backend.previous(),
-    };
-    config::save(paths, &config)
 }
 
 fn sync_reps(ui: &mut TuiState, recommendation: Option<&Recommendation>) {
@@ -706,6 +728,547 @@ fn view_lines(view: &ViewModel, ui: &TuiState) -> Vec<Line<'static>> {
             ui.demo,
         ),
     }
+}
+
+fn archetype_lines(forge: &Forge, custom_edit: Option<&str>, demo: bool) -> Vec<Line<'static>> {
+    let archetype = crate::archetypes::get(forge.archetype);
+    let title = if forge.archetype == crate::archetypes::ArchetypeId::Custom {
+        forge.custom_archetype.as_deref().unwrap_or("Custom")
+    } else {
+        archetype.name
+    };
+    let mut lines = vec![
+        title_line(demo),
+        Line::from(""),
+        Line::from(Span::styled(
+            if archetype.symbol.chars().count() > 2 {
+                archetype.fallback_symbol
+            } else {
+                archetype.symbol
+            },
+            accent_bold(),
+        )),
+        Line::from(Span::styled(title.to_uppercase(), text_bold())),
+        Line::from(""),
+        Line::from(Span::styled(archetype.description, text())),
+        Line::from(""),
+    ];
+    for (label, score) in [
+        ("Strength", archetype.stats.strength),
+        ("Muscle", archetype.stats.muscle),
+        ("Cardio", archetype.stats.cardio),
+        ("Mobility", archetype.stats.mobility),
+        ("Control", archetype.stats.control),
+        ("Stamina", archetype.stats.stamina),
+        ("Longevity", archetype.stats.longevity),
+    ] {
+        lines.push(Line::from(vec![
+            Span::styled(format!("{label:<10} "), muted()),
+            Span::styled(
+                format!(
+                    "{}{}  {score}",
+                    "█".repeat(score as usize),
+                    "░".repeat(10 - score as usize)
+                ),
+                accent(),
+            ),
+        ]));
+    }
+    lines.push(Line::from(""));
+    if let Some(value) = custom_edit {
+        lines.push(Line::from(Span::styled("Custom archetype", text_bold())));
+        lines.push(Line::from(Span::styled(format!("> {value}_"), accent())));
+        lines.push(Line::from(Span::styled("[enter] Set  [esc] Back", muted())));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "←/h Previous   →/l Next   [enter] Choose   [/] Custom   [esc] Back",
+            muted(),
+        )));
+        lines.push(Line::from(Span::styled(
+            "You can change your archetype at any time.",
+            muted(),
+        )));
+    }
+    lines
+}
+
+fn settings_lines(settings: &SettingsState, demo: bool) -> Vec<Line<'static>> {
+    if settings.selecting_archetype {
+        return archetype_lines(
+            &settings.draft.forge,
+            settings
+                .custom_archetype
+                .then_some(settings.edit_value.as_str()),
+            demo,
+        );
+    }
+    let profile = &settings.draft.profile;
+    let values = [
+        (
+            "Forge archetype",
+            if settings.draft.forge.archetype == crate::archetypes::ArchetypeId::Custom {
+                settings
+                    .draft
+                    .forge
+                    .custom_archetype
+                    .clone()
+                    .unwrap_or_else(|| "Custom".into())
+            } else {
+                crate::archetypes::get(settings.draft.forge.archetype)
+                    .name
+                    .into()
+            },
+        ),
+        (
+            "Recommender",
+            settings.draft.recommender.backend.label().into(),
+        ),
+        (
+            "Notifications",
+            if settings.draft.preferences.desktop_notifications {
+                "enabled".into()
+            } else {
+                "disabled".into()
+            },
+        ),
+        (
+            "Daily safety ceiling",
+            settings.draft.preferences.max_daily_sets.to_string(),
+        ),
+        ("Units", profile.unit_system.to_string()),
+        (
+            if profile.unit_system == UnitSystem::Metric {
+                "Height (cm)"
+            } else {
+                "Height (in)"
+            },
+            profile
+                .height_cm
+                .map(|v| {
+                    if profile.unit_system == UnitSystem::Metric {
+                        v.to_string()
+                    } else {
+                        format!("{:.1}", v as f32 / 2.54)
+                    }
+                })
+                .unwrap_or_else(|| "not set".into()),
+        ),
+        (
+            if profile.unit_system == UnitSystem::Metric {
+                "Weight (kg)"
+            } else {
+                "Weight (lb)"
+            },
+            profile
+                .weight_kg
+                .map(|v| {
+                    if profile.unit_system == UnitSystem::Metric {
+                        v.to_string()
+                    } else {
+                        format!("{:.1}", v * 2.204_622_6)
+                    }
+                })
+                .unwrap_or_else(|| "not set".into()),
+        ),
+        (
+            "Age",
+            profile
+                .age
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "not set".into()),
+        ),
+        ("Goals", profile.goals.join(", ")),
+        ("Equipment", profile.equipment_text.clone()),
+        ("Work position", profile.work_setup.clone()),
+        (
+            "Arm availability",
+            if profile.one_hand_available {
+                "alternate arms".into()
+            } else {
+                "both hands".into()
+            },
+        ),
+        (
+            "Cautious body parts",
+            profile.cautious_body_parts.join(", "),
+        ),
+        ("Injuries / limitations", profile.injuries.join(", ")),
+        ("Exercise preferences", profile.exercise_preferences.clone()),
+        ("Apply changes", "Enter to save".into()),
+    ];
+    let mut lines = vec![
+        title_line(demo),
+        Line::from(""),
+        Line::from(Span::styled("Settings", text_bold())),
+        Line::from(Span::styled("↑/↓ Focus  ←/→ Change  Enter Edit", muted())),
+        Line::from(""),
+    ];
+    for (index, (label, value)) in values.into_iter().enumerate() {
+        let selected = index == settings.row;
+        lines.push(Line::from(vec![
+            Span::styled(
+                if selected { "› " } else { "  " },
+                if selected { accent_bold() } else { muted() },
+            ),
+            Span::styled(
+                format!("{label:<23}"),
+                if selected { text_bold() } else { muted() },
+            ),
+            Span::styled(value, if selected { accent() } else { text() }),
+        ]));
+    }
+    if settings.editing {
+        lines.extend([
+            Line::from(""),
+            Line::from(Span::styled(
+                format!("> {}_", settings.edit_value),
+                accent(),
+            )),
+            Line::from(Span::styled(
+                "[enter] Set field  [esc] Cancel edit",
+                muted(),
+            )),
+        ]);
+    } else {
+        lines.extend([
+            Line::from(""),
+            Line::from(Span::styled("[esc] Cancel settings", muted())),
+        ]);
+    }
+    if let Some(error) = settings.error.as_deref() {
+        lines.push(Line::from(Span::styled(error.to_string(), accent())));
+    }
+    lines
+}
+
+fn begin_setting_edit(settings: &mut SettingsState) {
+    settings.edit_value = match settings.row {
+        5 => settings
+            .draft
+            .profile
+            .height_cm
+            .map(|v| {
+                if settings.draft.profile.unit_system == UnitSystem::Metric {
+                    v.to_string()
+                } else {
+                    format!("{:.1}", v as f32 / 2.54)
+                }
+            })
+            .unwrap_or_default(),
+        6 => settings
+            .draft
+            .profile
+            .weight_kg
+            .map(|v| {
+                if settings.draft.profile.unit_system == UnitSystem::Metric {
+                    v.to_string()
+                } else {
+                    format!("{:.1}", v * 2.204_622_6)
+                }
+            })
+            .unwrap_or_default(),
+        7 => settings
+            .draft
+            .profile
+            .age
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
+        8 => settings.draft.profile.goals.join(", "),
+        9 => settings.draft.profile.equipment_text.clone(),
+        12 => settings.draft.profile.cautious_body_parts.join(", "),
+        13 => settings.draft.profile.injuries.join(", "),
+        14 => settings.draft.profile.exercise_preferences.clone(),
+        _ => return,
+    };
+    settings.editing = true;
+}
+
+fn comma_list(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn commit_setting_edit(settings: &mut SettingsState) -> Result<()> {
+    let value = settings.edit_value.trim();
+    match settings.row {
+        5 => {
+            settings.draft.profile.height_cm = if value.is_empty() {
+                None
+            } else {
+                let entered: f32 = value.parse().context("height must be a number")?;
+                Some(
+                    if settings.draft.profile.unit_system == UnitSystem::Metric {
+                        entered
+                    } else {
+                        entered * 2.54
+                    }
+                    .round() as u32,
+                )
+            }
+        }
+        6 => {
+            settings.draft.profile.weight_kg = if value.is_empty() {
+                None
+            } else {
+                let entered: f32 = value.parse().context("weight must be a number")?;
+                Some(
+                    if settings.draft.profile.unit_system == UnitSystem::Metric {
+                        entered
+                    } else {
+                        entered / 2.204_622_6
+                    },
+                )
+            }
+        }
+        7 => {
+            settings.draft.profile.age = if value.is_empty() {
+                None
+            } else {
+                Some(value.parse().context("age must be a whole number")?)
+            }
+        }
+        8 => settings.draft.profile.goals = comma_list(value),
+        9 => {
+            settings.draft.profile.equipment_text = if value.is_empty() {
+                "bodyweight only".into()
+            } else {
+                value.into()
+            }
+        }
+        12 => settings.draft.profile.cautious_body_parts = comma_list(value),
+        13 => settings.draft.profile.injuries = comma_list(value),
+        14 => {
+            settings.draft.profile.exercise_preferences = if value.is_empty() {
+                "automatic".into()
+            } else {
+                value.into()
+            }
+        }
+        _ => {}
+    }
+    settings.editing = false;
+    settings.error = None;
+    Ok(())
+}
+
+fn apply_settings(env: &RuntimeEnv, draft: &Config) -> Result<()> {
+    config::save(&env.paths, draft)?;
+    let store = Store::open(&env.paths.database_file)?;
+    store.save_user_profile(draft)?;
+    let equipment = exercise_catalog::locally_resolved_equipment(&draft.profile.equipment_text);
+    store.replace_movement_pool(&exercise_catalog::movements_for_equipment(&equipment))?;
+    daemon::regenerate_queue_after_settings(env);
+    Ok(())
+}
+
+fn handle_settings_key(ui: &mut TuiState, code: KeyCode, env: &RuntimeEnv) -> Result<()> {
+    let Some(settings) = ui.settings.as_mut() else {
+        return Ok(());
+    };
+    if settings.selecting_archetype {
+        settings.error = None;
+        if settings.custom_archetype {
+            match code {
+                KeyCode::Esc => {
+                    settings.custom_archetype = false;
+                    settings.edit_value.clear();
+                }
+                KeyCode::Enter if !settings.edit_value.trim().is_empty() => {
+                    settings.draft.forge.archetype = crate::archetypes::ArchetypeId::Custom;
+                    settings.draft.forge.custom_archetype =
+                        Some(settings.edit_value.trim().chars().take(120).collect());
+                    settings.custom_archetype = false;
+                    settings.selecting_archetype = false;
+                    settings.archetype_original = None;
+                }
+                KeyCode::Backspace => {
+                    settings.edit_value.pop();
+                }
+                KeyCode::Char(ch) if settings.edit_value.chars().count() < 120 => {
+                    settings.edit_value.push(ch)
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+        match code {
+            KeyCode::Left | KeyCode::Char('h') => {
+                settings.draft.forge.archetype =
+                    crate::archetypes::next(settings.draft.forge.archetype, -1);
+                settings.draft.forge.custom_archetype = None;
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                settings.draft.forge.archetype =
+                    crate::archetypes::next(settings.draft.forge.archetype, 1);
+                settings.draft.forge.custom_archetype = None;
+            }
+            KeyCode::Char('/') => {
+                settings.custom_archetype = true;
+                settings.edit_value.clear();
+            }
+            KeyCode::Enter => {
+                settings.selecting_archetype = false;
+                settings.archetype_original = None;
+            }
+            KeyCode::Esc => {
+                if let Some(original) = settings.archetype_original.take() {
+                    settings.draft.forge = original;
+                }
+                settings.selecting_archetype = false;
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+    if settings.editing {
+        match code {
+            KeyCode::Esc => settings.editing = false,
+            KeyCode::Enter => {
+                commit_setting_edit(settings)?;
+            }
+            KeyCode::Backspace => {
+                settings.edit_value.pop();
+            }
+            KeyCode::Char(ch) if settings.edit_value.chars().count() < 500 => {
+                settings.edit_value.push(ch)
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+    match code {
+        KeyCode::Esc => ui.settings = None,
+        KeyCode::Up => settings.row = settings.row.saturating_sub(1),
+        KeyCode::Down => settings.row = (settings.row + 1).min(SETTINGS_ROWS - 1),
+        KeyCode::Left | KeyCode::Right => {
+            let forward = code == KeyCode::Right;
+            match settings.row {
+                1 => {
+                    settings.draft.recommender.backend = if forward {
+                        settings.draft.recommender.backend.next()
+                    } else {
+                        settings.draft.recommender.backend.previous()
+                    }
+                }
+                2 => {
+                    settings.draft.preferences.desktop_notifications =
+                        !settings.draft.preferences.desktop_notifications
+                }
+                3 => {
+                    settings.draft.preferences.max_daily_sets = if forward {
+                        settings
+                            .draft
+                            .preferences
+                            .max_daily_sets
+                            .saturating_add(1)
+                            .min(1000)
+                    } else {
+                        settings
+                            .draft
+                            .preferences
+                            .max_daily_sets
+                            .saturating_sub(1)
+                            .max(1)
+                    }
+                }
+                4 => {
+                    settings.draft.profile.unit_system =
+                        if settings.draft.profile.unit_system == UnitSystem::Metric {
+                            UnitSystem::Imperial
+                        } else {
+                            UnitSystem::Metric
+                        }
+                }
+                10 => {
+                    settings.draft.profile.work_setup =
+                        if settings.draft.profile.work_setup == "sitting" {
+                            "standing".into()
+                        } else {
+                            "sitting".into()
+                        }
+                }
+                11 => {
+                    settings.draft.profile.one_hand_available =
+                        !settings.draft.profile.one_hand_available;
+                    settings.draft.profile.two_hand_available =
+                        !settings.draft.profile.one_hand_available;
+                }
+                _ => {}
+            }
+        }
+        KeyCode::Enter if settings.row == 0 => {
+            settings.archetype_original = Some(settings.draft.forge.clone());
+            settings.selecting_archetype = true;
+        }
+        KeyCode::Enter if settings.row == SETTINGS_ROWS - 1 => {
+            let draft = settings.draft.clone();
+            apply_settings(env, &draft)?;
+            ui.settings = None;
+            ui.status_message = Some("Settings saved. Refreshing future forges…".into());
+        }
+        KeyCode::Enter => begin_setting_edit(settings),
+        _ => {}
+    }
+    Ok(())
+}
+
+pub fn select_archetype(current: &Forge) -> Result<Option<Forge>> {
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+    let mut forge = current.clone();
+    let mut custom: Option<String> = None;
+    let result = loop {
+        terminal.draw(|frame| {
+            let paragraph = Paragraph::new(archetype_lines(&forge, custom.as_deref(), false))
+                .block(Block::default().borders(Borders::ALL).title(" SVAROG "))
+                .style(Style::default().bg(colors::BG).fg(colors::TEXT))
+                .wrap(Wrap { trim: false });
+            frame.render_widget(paragraph, frame.area());
+        })?;
+        if let Event::Key(key) = event::read()? {
+            if let Some(value) = custom.as_mut() {
+                match key.code {
+                    KeyCode::Esc => custom = None,
+                    KeyCode::Backspace => {
+                        value.pop();
+                    }
+                    KeyCode::Char(ch) if value.chars().count() < 120 => value.push(ch),
+                    KeyCode::Enter if !value.trim().is_empty() => {
+                        forge.archetype = crate::archetypes::ArchetypeId::Custom;
+                        forge.custom_archetype = Some(value.trim().to_string());
+                        break Ok(Some(forge));
+                    }
+                    _ => {}
+                }
+            } else {
+                match key.code {
+                    KeyCode::Left | KeyCode::Char('h') => {
+                        forge.archetype = crate::archetypes::next(forge.archetype, -1);
+                        forge.custom_archetype = None;
+                    }
+                    KeyCode::Right | KeyCode::Char('l') => {
+                        forge.archetype = crate::archetypes::next(forge.archetype, 1);
+                        forge.custom_archetype = None;
+                    }
+                    KeyCode::Char('/') => custom = Some(String::new()),
+                    KeyCode::Enter => break Ok(Some(forge)),
+                    KeyCode::Esc => break Ok(None),
+                    _ => {}
+                }
+            }
+        }
+    };
+    let _ = disable_raw_mode();
+    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+    let _ = terminal.show_cursor();
+    result
 }
 
 fn screen_lines(view: &ViewModel, ui: &TuiState, in_tmux: bool) -> Vec<Line<'static>> {
@@ -961,7 +1524,7 @@ fn recommender_line(backend: &BackendView) -> Line<'static> {
     Line::from(vec![
         Span::styled("Recommender: ", muted()),
         Span::styled(format!("[{}]", backend.label), text()),
-        Span::styled("  ← →", muted()),
+        Span::styled("  [s] Settings", muted()),
     ])
 }
 
@@ -1244,24 +1807,6 @@ fn skip_confirmation_action(code: KeyCode) -> Option<SkipConfirmationAction> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CycleDirection {
-    Forward,
-    Backward,
-}
-
-fn recommender_cycle_direction(code: KeyCode) -> Option<CycleDirection> {
-    match code {
-        KeyCode::Left => Some(CycleDirection::Backward),
-        KeyCode::Right
-        | KeyCode::Char('r')
-        | KeyCode::Char('R')
-        | KeyCode::Tab
-        | KeyCode::Char(' ') => Some(CycleDirection::Forward),
-        _ => None,
-    }
-}
-
 fn forge_lines(rec: &Recommendation, ui: &TuiState) -> Vec<Line<'static>> {
     if ui.skip_check {
         return vec![
@@ -1426,6 +1971,51 @@ mod tests {
     use chrono::{TimeZone, Utc};
     use tempfile::tempdir;
 
+    fn settings_state() -> SettingsState {
+        SettingsState {
+            draft: Config::default(),
+            row: 0,
+            editing: false,
+            edit_value: String::new(),
+            selecting_archetype: false,
+            custom_archetype: false,
+            archetype_original: None,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn settings_show_focus_and_archetype_opens_full_selector() {
+        let mut settings = settings_state();
+        let text = settings_lines(&settings, false)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("› Forge archetype"));
+        assert!(text.contains("Apply changes"));
+
+        settings.selecting_archetype = true;
+        let selector = settings_lines(&settings, false)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(selector.contains("ATHLETE"));
+        assert!(selector.contains("Strength"));
+        assert!(selector.contains("You can change your archetype at any time."));
+    }
+
+    #[test]
+    fn settings_text_edits_are_staged_until_apply() {
+        let mut settings = settings_state();
+        settings.row = 8;
+        begin_setting_edit(&mut settings);
+        settings.edit_value = "mobility, strength".into();
+        commit_setting_edit(&mut settings).unwrap();
+        assert_eq!(settings.draft.profile.goals, vec!["mobility", "strength"]);
+    }
+
     fn rec() -> Recommendation {
         Recommendation {
             id: Some(1),
@@ -1486,9 +2076,9 @@ mod tests {
         assert!(text.contains("[l] Latest forges"));
         assert!(text.contains("[n] Next forges"));
         assert!(text.contains(
-            "Waiting for the next forge.\n\n[f] Forge now\n[l] Latest forges [n] Next forges\n\nRecommender: [Codex]  ← →"
+            "Waiting for the next forge.\n\n[f] Forge now\n[l] Latest forges [n] Next forges\n\nRecommender: [Codex]  [s] Settings"
         ));
-        assert!(text.contains("Recommender: [Codex]  ← →"));
+        assert!(text.contains("Recommender: [Codex]  [s] Settings"));
         assert!(!text.contains("[r] Change recommender"));
         assert!(text.contains("Completed:"));
         assert!(text.contains("Svarog Codex tokens (in/out)"));
@@ -2009,7 +2599,7 @@ mod tests {
         assert_eq!(line.spans[0].style, muted());
         assert_eq!(line.spans[1].content.as_ref(), "[Codex]");
         assert_eq!(line.spans[1].style, text());
-        assert_eq!(line.spans[2].content.as_ref(), "  ← →");
+        assert_eq!(line.spans[2].content.as_ref(), "  [s] Settings");
         assert_eq!(line.spans[2].style, muted());
     }
 
@@ -2059,66 +2649,6 @@ mod tests {
             RecommenderBackend::Openai.previous(),
             RecommenderBackend::Local
         );
-    }
-
-    #[test]
-    fn recommender_cycle_key_accepts_common_idle_controls() {
-        assert_eq!(
-            recommender_cycle_direction(KeyCode::Left),
-            Some(CycleDirection::Backward)
-        );
-        assert_eq!(
-            recommender_cycle_direction(KeyCode::Right),
-            Some(CycleDirection::Forward)
-        );
-        assert_eq!(
-            recommender_cycle_direction(KeyCode::Char('r')),
-            Some(CycleDirection::Forward)
-        );
-        assert_eq!(
-            recommender_cycle_direction(KeyCode::Char('R')),
-            Some(CycleDirection::Forward)
-        );
-        assert_eq!(
-            recommender_cycle_direction(KeyCode::Tab),
-            Some(CycleDirection::Forward)
-        );
-        assert_eq!(
-            recommender_cycle_direction(KeyCode::Char(' ')),
-            Some(CycleDirection::Forward)
-        );
-        assert_eq!(recommender_cycle_direction(KeyCode::Char('d')), None);
-    }
-
-    #[test]
-    fn cycling_recommender_backend_persists_to_config() {
-        let root = tempdir().unwrap().keep();
-        let paths = Paths::from_root(root);
-        let config = Config::default();
-        config::save(&paths, &config).unwrap();
-        let store = Store::open(&paths.database_file).unwrap();
-        let mut queued = rec();
-        queued.id = None;
-        store.insert_queued_recommendation(&queued).unwrap();
-
-        cycle_recommender_backend(&paths, CycleDirection::Forward).unwrap();
-
-        let saved = config::load_or_default(&paths).unwrap();
-        assert_eq!(saved.recommender.backend, RecommenderBackend::Openai);
-        assert_eq!(store.queued_recommendation_count().unwrap(), 1);
-    }
-
-    #[test]
-    fn cycling_recommender_backend_backward_persists_to_config() {
-        let root = tempdir().unwrap().keep();
-        let paths = Paths::from_root(root);
-        let config = Config::default();
-        config::save(&paths, &config).unwrap();
-
-        cycle_recommender_backend(&paths, CycleDirection::Backward).unwrap();
-
-        let saved = config::load_or_default(&paths).unwrap();
-        assert_eq!(saved.recommender.backend, RecommenderBackend::Codex);
     }
 
     #[test]

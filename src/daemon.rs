@@ -266,8 +266,7 @@ pub fn process_event(env: &RuntimeEnv, payload: IncomingEvent) -> Result<EventRe
             notice: None,
         });
     }
-    let interval = config.preferences.forge_frequency.max(1);
-    if store.event_count()? % interval != 0 {
+    if !crate::engine::opportunity_allows(&store, &config)? {
         return Ok(EventResponse {
             recommended: false,
             recommendation: None,
@@ -332,6 +331,20 @@ pub fn regenerate_queue_best_effort(env: &RuntimeEnv) {
     std::thread::spawn(move || {
         let _guard = RefillGuard;
         let _ = regenerate_queue_now(&env);
+    });
+}
+
+pub fn regenerate_queue_after_settings(env: &RuntimeEnv) {
+    let env = env.clone();
+    std::thread::spawn(move || {
+        for _ in 0..300 {
+            if begin_queue_job(&REFILL_IN_PROGRESS) {
+                let _guard = RefillGuard;
+                let _ = regenerate_queue_now(&env);
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
     });
 }
 
@@ -629,14 +642,13 @@ mod tests {
     #[test]
     fn process_event_promotes_queued_recommendation() {
         let env = test_env();
-        let mut config = Config {
+        let config = Config {
             recommender: Recommender {
                 backend: RecommenderBackend::Local,
                 ..Recommender::default()
             },
             ..Config::default()
         };
-        config.preferences.forge_frequency = 1;
         crate::config::save(&env.paths, &config).unwrap();
         let store = Store::open(&env.paths.database_file).unwrap();
         let rec = Recommendation {
@@ -655,6 +667,7 @@ mod tests {
         };
         store.insert_queued_recommendation(&rec).unwrap();
 
+        assert!(!process_event(&env, event()).unwrap().recommended);
         let response = process_event(&env, event()).unwrap();
 
         assert!(response.recommended);
@@ -668,17 +681,17 @@ mod tests {
         let env = test_env();
         let store = Store::open(&env.paths.database_file).unwrap();
         store.seed_movements().unwrap();
-        let mut config = Config {
+        let config = Config {
             recommender: Recommender {
                 backend: RecommenderBackend::Local,
                 ..Recommender::default()
             },
             ..Config::default()
         };
-        config.preferences.forge_frequency = 1;
         crate::config::save(&env.paths, &config).unwrap();
         recommender::fill_recommendation_queue(&store, &config, &env.paths).unwrap();
 
+        assert!(!process_event(&env, event()).unwrap().recommended);
         let first = process_event(&env, event()).unwrap();
         let second = process_event(&env, event()).unwrap();
 
@@ -695,7 +708,6 @@ mod tests {
         let env = test_env();
         let mut config = Config::default();
         config.recommender.backend = RecommenderBackend::Local;
-        config.preferences.forge_frequency = 1;
         crate::config::save(&env.paths, &config).unwrap();
 
         let prompt = codex_hook("UserPromptSubmit", Some("turn-1"));
@@ -704,7 +716,7 @@ mod tests {
 
         let store = Store::open(&env.paths.database_file).unwrap();
         assert_eq!(store.event_count().unwrap(), 1);
-        assert!(store.latest_open_recommendation().unwrap().is_some());
+        assert!(store.latest_open_recommendation().unwrap().is_none());
     }
 
     #[test]
@@ -712,9 +724,9 @@ mod tests {
         let env = test_env();
         let mut config = Config::default();
         config.recommender.backend = RecommenderBackend::Local;
-        config.preferences.forge_frequency = 1;
         crate::config::save(&env.paths, &config).unwrap();
 
+        process_codex_hook(&env, codex_hook("UserPromptSubmit", Some("warmup-turn"))).unwrap();
         process_codex_hook(&env, codex_hook("UserPromptSubmit", Some("plan-turn"))).unwrap();
         let store = Store::open(&env.paths.database_file).unwrap();
         let planning_forge = store.latest_open_recommendation().unwrap().unwrap();
@@ -726,6 +738,11 @@ mod tests {
             .unwrap();
         assert_eq!(store.state().unwrap().kind, AppStateKind::Cooldown);
 
+        process_codex_hook(
+            &env,
+            codex_hook("UserPromptSubmit", Some("execution-warmup")),
+        )
+        .unwrap();
         process_codex_hook(&env, codex_hook("UserPromptSubmit", Some("execution-turn"))).unwrap();
 
         let execution_forge = store.latest_open_recommendation().unwrap().unwrap();
@@ -734,7 +751,7 @@ mod tests {
             execution_forge.primary_muscle,
             planning_forge.primary_muscle
         );
-        assert_eq!(store.event_count().unwrap(), 2);
+        assert_eq!(store.event_count().unwrap(), 4);
         assert_eq!(store.state().unwrap().kind, AppStateKind::Recommendation);
     }
 
@@ -743,9 +760,9 @@ mod tests {
         let env = test_env();
         let mut config = Config::default();
         config.recommender.backend = RecommenderBackend::Local;
-        config.preferences.forge_frequency = 1;
         crate::config::save(&env.paths, &config).unwrap();
 
+        process_codex_hook(&env, codex_hook("UserPromptSubmit", Some("turn-0"))).unwrap();
         process_codex_hook(&env, codex_hook("UserPromptSubmit", Some("turn-1"))).unwrap();
         process_codex_hook(&env, codex_hook("Stop", Some("turn-1"))).unwrap();
 
@@ -759,7 +776,6 @@ mod tests {
         let env = test_env();
         let mut config = Config::default();
         config.recommender.backend = RecommenderBackend::Local;
-        config.preferences.forge_frequency = 1;
         crate::config::save(&env.paths, &config).unwrap();
         let state = Arc::new(AppState {
             env: env.clone(),
@@ -810,7 +826,6 @@ mod tests {
         env.daemon_addr = "127.0.0.1:0".parse().unwrap();
         let mut config = Config::default();
         config.recommender.backend = RecommenderBackend::Local;
-        config.preferences.forge_frequency = 1;
         crate::config::save(&env.paths, &config).unwrap();
         let collector = match Collector::start(&env).await {
             Ok(collector) => collector,

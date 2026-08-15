@@ -582,22 +582,16 @@ fn collect_profile(config: &mut Config, paths: &config::Paths, all: bool) -> Res
             prompt_list("Injuries or hard limitations", &config.profile.injuries)?;
         Ok(())
     })?;
-    onboarding_step(config, paths, config::STEP_FORGE_INTENSITY, all, |config| {
-        config.preferences.forge_intensity = prompt_bounded_u32(
-            "Forge intensity (1-5)",
-            config.preferences.forge_intensity,
-            1,
-            5,
-        )?;
-        Ok(())
-    })?;
-    onboarding_step(config, paths, config::STEP_FORGE_FREQUENCY, all, |config| {
-        config.preferences.forge_frequency = prompt_bounded_u32(
-            "Forge interval (how many agent runs before prompting you to move)",
-            config.preferences.forge_frequency,
-            1,
-            12,
-        )?;
+    onboarding_step(config, paths, config::STEP_ARCHETYPE, all, |config| {
+        loop {
+            if let Some(selection) = tui::select_archetype(&config.forge)? {
+                config.forge = selection;
+                break;
+            }
+            config.profile.injuries =
+                prompt_list("Injuries or hard limitations", &config.profile.injuries)?;
+            config::save(paths, config)?;
+        }
         Ok(())
     })?;
     onboarding_step(
@@ -670,13 +664,10 @@ fn print_setup_summary(config: &Config) {
     println!("{}", muted("Equipment:"));
     println!("{}", text(&config.profile.equipment_text));
     println!();
-    println!("{}", muted("Intensity:"));
-    println!("{}", text(config.preferences.forge_intensity));
-    println!();
-    println!("{}", muted("Interval:"));
+    println!("{}", muted("Forge archetype:"));
     println!(
         "{}",
-        text(interval_label(config.preferences.forge_frequency))
+        text(crate::archetypes::get(config.forge.archetype).name)
     );
     println!();
     println!("{}", muted("Notifications:"));
@@ -704,14 +695,6 @@ fn print_setup_summary(config: &Config) {
     );
     println!();
     println!("{}", ember("Happy forging."));
-}
-
-fn interval_label(interval: u32) -> String {
-    if interval <= 1 {
-        "every agent run".to_string()
-    } else {
-        format!("every {interval} agent runs")
-    }
 }
 
 fn print_recommender_notice(config: &Config, env: &RuntimeEnv, notice: &str) {
@@ -1169,19 +1152,6 @@ fn kg_to_lb(weight_kg: f32) -> f32 {
 
 fn lb_to_kg(weight_lb: f32) -> f32 {
     weight_lb * 0.453_592_37
-}
-
-fn prompt_bounded_u32(label: &str, default: u32, min: u32, max: u32) -> Result<u32> {
-    loop {
-        let value = prompt_string(label, &default.to_string())?;
-        let parsed = value
-            .parse::<u32>()
-            .map_err(|err| anyhow::anyhow!("invalid {label}: {err}"))?;
-        if (min..=max).contains(&parsed) {
-            return Ok(parsed);
-        }
-        println!("Use a number from {min} to {max}.");
-    }
 }
 
 fn prompt_bool(label: &str, default: bool) -> Result<bool> {

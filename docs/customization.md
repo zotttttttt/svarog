@@ -6,8 +6,9 @@
 
 Run `svarog setup` to revisit onboarding while preserving workout history and
 the current movement. Setup covers measurements, goals, equipment, exercise
-preferences, work position, available hands, limitations, intensity, interval,
-and notifications.
+preferences, work position, available hands, limitations, notifications, and
+Forge archetype. Most profile fields can also be edited from the waiting
+dashboard by pressing `s`.
 
 Advanced settings live in:
 
@@ -16,20 +17,22 @@ Advanced settings live in:
 ```
 
 Stop Svarog before editing the file so a running process cannot overwrite your
-changes. Useful settings include forge frequency and intensity, daily limits,
+changes. Useful advanced settings include the daily safety ceiling,
 notification behavior, recommender selection, timeouts, fallback behavior, and
 the Codex/OpenAI model configuration.
 
 ## Recommendation prompts
 
-The repository includes two [MiniJinja](https://github.com/mitsuhiko/minijinja)
-templates:
+The repository includes two base
+[MiniJinja](https://github.com/mitsuhiko/minijinja) templates plus archetype
+partials:
 
 - `prompts/exercise_profile.j2` normalizes the user's available equipment.
 - `prompts/recommendation_queue.j2` requests future movement candidates.
+- `prompts/archetypes/*.j2` supplies the selected long-term training bias.
 
-For personal overrides that survive updates, copy either template to the same
-filename under:
+For personal overrides that survive updates, copy a template to the same
+relative path under:
 
 ```text
 ~/.config/svarog/prompts/

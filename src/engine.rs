@@ -20,10 +20,6 @@ pub fn recommend(
     if store.today_set_count()? >= config.preferences.max_daily_sets {
         return Ok(None);
     }
-    if !event_frequency_allows(store, config)? {
-        return Ok(None);
-    }
-
     let movements = store.movements()?;
     let last_muscle = store.last_done_muscle()?;
     let intervention_count = store.intervention_count()?;
@@ -53,9 +49,13 @@ pub fn recommend(
     }
 
     candidates.sort_by_key(|movement| {
+        let score = crate::exercise_catalog::find(&movement.id)
+            .map(|entry| crate::recommender::archetype_score(config, entry))
+            .unwrap_or(0);
         (
             prefer_mobility && !movement.mobility,
             movement.status == MovementStatus::Caution,
+            std::cmp::Reverse(score),
             movement.estimated_seconds,
         )
     });
@@ -64,15 +64,7 @@ pub fn recommend(
         return Ok(None);
     };
 
-    let skip_count = store.recent_skip_count(&movement.id)?;
-    let done_count = store.done_count(&movement.id)?;
-    let mut reps = apply_intensity(movement.base_reps, config.preferences.forge_intensity);
-
-    if skip_count >= 3 {
-        reps = reps.saturating_sub(2).max(1);
-    } else if done_count >= 5 {
-        reps += 1;
-    }
+    let reps = crate::recommender::adaptive_reps(store, &movement.id, movement.base_reps)?;
 
     let weight_kg = choose_weight(&config.profile.equipment_text, &movement.equipment);
 
@@ -148,13 +140,43 @@ fn is_cautious_body_part(config: &Config, movement: &Movement) -> bool {
     })
 }
 
-fn event_frequency_allows(store: &Store, config: &Config) -> Result<bool> {
-    let frequency = config.preferences.forge_frequency.max(1);
-    Ok(store.event_count()? % frequency == 0)
-}
-
-fn apply_intensity(base_reps: u32, intensity: u32) -> u32 {
-    base_reps + intensity.clamp(1, 5) - 1
+pub fn opportunity_allows(store: &Store, config: &Config) -> Result<bool> {
+    if store.today_set_count()? >= config.preferences.max_daily_sets {
+        return Ok(false);
+    }
+    let outcomes = store.recent_outcomes(5)?;
+    let required = if outcomes.is_empty() {
+        2
+    } else {
+        let adverse = outcomes
+            .iter()
+            .take(3)
+            .filter(|item| item.status != "done" || item.actual_reps < item.prescribed_reps)
+            .count();
+        if outcomes.first().is_some_and(|item| item.status == "pain") || adverse >= 2 {
+            5
+        } else if adverse == 1 {
+            3
+        } else {
+            let streak = outcomes
+                .iter()
+                .take_while(|item| {
+                    item.status == "done" && item.actual_reps >= item.prescribed_reps
+                })
+                .count();
+            let threshold = if crate::archetypes::get(config.forge.archetype).stats.stamina >= 8 {
+                3
+            } else {
+                5
+            };
+            if streak >= threshold {
+                1
+            } else {
+                2
+            }
+        }
+    };
+    Ok(store.events_since_last_outcome()? >= required)
 }
 
 #[cfg(test)]
@@ -230,25 +252,53 @@ mod tests {
     }
 
     #[test]
-    fn forge_frequency_blocks_non_matching_agent_runs() {
+    fn opportunity_gate_starts_every_second_agent_run() {
         let store = test_store();
-        let mut config = Config::default();
-        config.preferences.forge_frequency = 2;
+        let config = Config::default();
         store.insert_event(&event(90)).unwrap();
 
-        let next = recommend(&store, &config, &event(90)).unwrap();
-        assert!(next.is_none());
+        assert!(!opportunity_allows(&store, &config).unwrap());
 
         store.insert_event(&event(90)).unwrap();
-        let next = recommend(&store, &config, &event(90)).unwrap();
-        assert!(next.is_some());
+        assert!(opportunity_allows(&store, &config).unwrap());
     }
 
     #[test]
-    fn forge_intensity_adds_small_rep_adjustment() {
+    fn opportunity_gate_backs_off_after_reduced_reps() {
         let store = test_store();
-        let mut config = Config::default();
-        config.preferences.forge_intensity = 3;
+        let config = Config::default();
+        let mut rec = recommend(&store, &config, &event(90)).unwrap().unwrap();
+        rec.reps = 8;
+        rec.id = Some(store.insert_recommendation(&rec).unwrap());
+        store
+            .record_set_with_reps(&rec, SetStatus::Done, 4)
+            .unwrap();
+
+        for _ in 0..2 {
+            store.insert_event(&event(90)).unwrap();
+        }
+        assert!(!opportunity_allows(&store, &config).unwrap());
+        store.insert_event(&event(90)).unwrap();
+        assert!(opportunity_allows(&store, &config).unwrap());
+    }
+
+    #[test]
+    fn high_stamina_archetype_accelerates_after_three_compliant_forges() {
+        let store = test_store();
+        let config = Config::default();
+        for _ in 0..3 {
+            let mut rec = recommend(&store, &config, &event(90)).unwrap().unwrap();
+            rec.id = Some(store.insert_recommendation(&rec).unwrap());
+            store.record_set(&rec, SetStatus::Done).unwrap();
+        }
+        store.insert_event(&event(90)).unwrap();
+        assert!(opportunity_allows(&store, &config).unwrap());
+    }
+
+    #[test]
+    fn new_movement_uses_conservative_catalog_reps() {
+        let store = test_store();
+        let config = Config::default();
 
         let rec = recommend(&store, &config, &event(90)).unwrap().unwrap();
         let base_reps = store
@@ -258,7 +308,7 @@ mod tests {
             .find(|movement| movement.id == rec.movement_id)
             .unwrap()
             .base_reps;
-        assert_eq!(rec.reps, base_reps + 2);
+        assert_eq!(rec.reps, base_reps);
     }
 
     #[test]

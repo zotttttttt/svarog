@@ -57,7 +57,6 @@ struct ExerciseProfileContext<'a> {
 
 #[derive(Debug, Serialize)]
 struct ExerciseProfilePreferences {
-    forge_intensity: u32,
     default_expected_duration_sec: u32,
     max_daily_sets: u32,
 }
@@ -77,12 +76,12 @@ struct ContextProfile {
     two_hand_available: bool,
     cautious_body_parts: Vec<String>,
     injuries: Vec<String>,
+    archetype: String,
+    custom_archetype: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 struct ContextPreferences {
-    forge_intensity: u32,
-    forge_frequency: u32,
     default_expected_duration_sec: u32,
     max_daily_sets: u32,
 }
@@ -93,6 +92,7 @@ struct ContextSet {
     muscles: Vec<String>,
     status: String,
     reps: u32,
+    prescribed_reps: u32,
     weight_kg: Option<f32>,
     side: Option<RecommendationSide>,
     created_at: String,
@@ -330,9 +330,13 @@ fn local_queue(
         })
         .collect::<Result<Vec<_>>>()?;
     movements.sort_by_key(|(movement, recovered)| {
+        let score = exercise_catalog::find(&movement.id)
+            .map(|entry| archetype_score(config, entry))
+            .unwrap_or(0);
         (
             !*recovered,
             movement.status == MovementStatus::Caution,
+            std::cmp::Reverse(score),
             !movement.mobility,
             movement.estimated_seconds,
         )
@@ -356,13 +360,14 @@ fn local_queue(
             continue;
         }
         used_muscles.push(movement.primary_muscle.clone());
+        let reps = adaptive_reps(store, &movement.id, movement.base_reps)?;
         recommendations.push(Recommendation {
             id: None,
             movement_id: movement.id,
             movement_name: movement.name,
             primary_muscle: movement.primary_muscle,
             muscles: movement.muscles,
-            reps: movement.base_reps + config.preferences.forge_intensity.clamp(1, 5) - 1,
+            reps,
             weight_kg: None,
             estimated_seconds: movement.estimated_seconds,
             agent: event.agent,
@@ -375,6 +380,82 @@ fn local_queue(
         }
     }
     Ok(recommendations)
+}
+
+pub(crate) fn archetype_score(config: &Config, entry: &ExerciseCatalogEntry) -> u32 {
+    let archetype = crate::archetypes::get(config.forge.archetype);
+    let category = entry.category.as_str();
+    let mut score = 0;
+    if archetype.preferred_categories.contains(&category) {
+        score += 30;
+    }
+    if entry
+        .force
+        .as_deref()
+        .is_some_and(|value| archetype.preferred_forces.contains(&value))
+    {
+        score += 12;
+    }
+    if entry
+        .mechanic
+        .as_deref()
+        .is_some_and(|value| archetype.preferred_mechanics.contains(&value))
+    {
+        score += 10;
+    }
+    score += entry
+        .primary_muscles
+        .iter()
+        .filter(|muscle| archetype.preferred_muscles.contains(&muscle.as_str()))
+        .count() as u32
+        * 8;
+    if entry.category == "stretching" {
+        score += u32::from(archetype.stats.mobility);
+    }
+    if entry.category == "cardio" {
+        score += u32::from(archetype.stats.cardio);
+    }
+    if entry.category == "strength" {
+        score += u32::from(archetype.stats.strength + archetype.stats.muscle) / 2;
+    }
+    score
+}
+
+pub fn adaptive_reps(store: &Store, movement_id: &str, base: u32) -> Result<u32> {
+    let outcomes = store.recent_movement_outcomes(movement_id, 5)?;
+    let Some(latest) = outcomes.first() else {
+        return Ok(base.clamp(1, 20));
+    };
+    let current = latest.prescribed_reps.clamp(1, 20);
+    if latest.status == "done" && latest.actual_reps < latest.prescribed_reps {
+        return Ok(latest.actual_reps.clamp(1, 20));
+    }
+    let adverse = outcomes
+        .iter()
+        .take(3)
+        .filter(|item| item.status != "done")
+        .count();
+    if adverse >= 2 {
+        return Ok(current.saturating_sub(1).max(1));
+    }
+    if adverse == 1 {
+        return Ok(current);
+    }
+    let increased_twice = outcomes.iter().take(2).count() == 2
+        && outcomes
+            .iter()
+            .take(2)
+            .all(|item| item.status == "done" && item.actual_reps > item.prescribed_reps);
+    let compliant_five = outcomes.iter().take(5).count() == 5
+        && outcomes
+            .iter()
+            .take(5)
+            .all(|item| item.status == "done" && item.actual_reps >= item.prescribed_reps);
+    Ok(if increased_twice || compliant_five {
+        current.saturating_add(1).min(20)
+    } else {
+        current
+    })
 }
 
 fn llm_queue(
@@ -551,7 +632,6 @@ fn exercise_profile_context(config: &Config) -> ExerciseProfileContext<'_> {
     ExerciseProfileContext {
         profile: &config.profile,
         preferences: ExerciseProfilePreferences {
-            forge_intensity: config.preferences.forge_intensity,
             default_expected_duration_sec: config.preferences.default_expected_duration_sec,
             max_daily_sets: config.preferences.max_daily_sets,
         },
@@ -648,10 +728,10 @@ fn build_context(
             two_hand_available: profile.two_hand_available,
             cautious_body_parts: profile.cautious_body_parts.clone(),
             injuries: profile.injuries.clone(),
+            archetype: config.forge.archetype.as_str().to_string(),
+            custom_archetype: config.forge.custom_archetype.clone(),
         },
         preferences: ContextPreferences {
-            forge_intensity: preferences.forge_intensity,
-            forge_frequency: preferences.forge_frequency,
             default_expected_duration_sec: preferences.default_expected_duration_sec,
             max_daily_sets: preferences.max_daily_sets,
         },
@@ -678,6 +758,7 @@ impl From<SetSummary> for ContextSet {
             muscles: value.muscles,
             status: value.status,
             reps: value.reps,
+            prescribed_reps: value.prescribed_reps,
             weight_kg: value.weight_kg,
             side: value.side,
             created_at: value.created_at,
@@ -1303,6 +1384,92 @@ mod tests {
 
     fn test_paths() -> Paths {
         Paths::from_root(tempdir().unwrap().keep().join("svarog"))
+    }
+
+    #[test]
+    fn adaptive_reps_respects_reductions_and_requires_repeated_positive_evidence() {
+        let store = test_store();
+        let movement = store.movements().unwrap().into_iter().next().unwrap();
+        let mut recommendation = Recommendation {
+            id: None,
+            movement_id: movement.id.clone(),
+            movement_name: movement.name,
+            primary_muscle: movement.primary_muscle,
+            muscles: movement.muscles,
+            reps: 10,
+            weight_kg: None,
+            estimated_seconds: movement.estimated_seconds,
+            agent: Agent::Custom,
+            project: None,
+            side: None,
+            created_at: Utc::now(),
+        };
+        recommendation.id = Some(store.insert_recommendation(&recommendation).unwrap());
+        store
+            .record_set_with_reps(&recommendation, SetStatus::Done, 6)
+            .unwrap();
+        assert_eq!(adaptive_reps(&store, &movement.id, 8).unwrap(), 6);
+
+        for actual in [8, 9] {
+            recommendation.id = None;
+            recommendation.reps = actual - 1;
+            recommendation.id = Some(store.insert_recommendation(&recommendation).unwrap());
+            store
+                .record_set_with_reps(&recommendation, SetStatus::Done, actual)
+                .unwrap();
+        }
+        assert_eq!(adaptive_reps(&store, &movement.id, 8).unwrap(), 9);
+    }
+
+    #[test]
+    fn custom_archetype_uses_athlete_for_local_scoring() {
+        let entry = ExerciseCatalogEntry {
+            id: "test".into(),
+            force: Some("push".into()),
+            mechanic: Some("compound".into()),
+            equipment: Some("body only".into()),
+            primary_muscles: vec!["quadriceps".into()],
+            secondary_muscles: vec![],
+            category: "strength".into(),
+            instructions: vec![],
+            images: vec![],
+        };
+        let athlete = Config::default();
+        let mut custom = Config::default();
+        custom.forge.archetype = crate::archetypes::ArchetypeId::Custom;
+        custom.forge.custom_archetype = Some("Goku".into());
+        assert_eq!(
+            archetype_score(&athlete, &entry),
+            archetype_score(&custom, &entry)
+        );
+    }
+
+    #[test]
+    fn local_scoring_reflects_representative_archetype_biases() {
+        let entry = |category: &str| ExerciseCatalogEntry {
+            id: category.into(),
+            force: None,
+            mechanic: None,
+            equipment: Some("body only".into()),
+            primary_muscles: vec![],
+            secondary_muscles: vec![],
+            category: category.into(),
+            instructions: vec![],
+            images: vec![],
+        };
+        let mut runner = Config::default();
+        runner.forge.archetype = crate::archetypes::ArchetypeId::Runner;
+        assert!(
+            archetype_score(&runner, &entry("cardio"))
+                > archetype_score(&runner, &entry("strength"))
+        );
+
+        let mut yogi = Config::default();
+        yogi.forge.archetype = crate::archetypes::ArchetypeId::Yogi;
+        assert!(
+            archetype_score(&yogi, &entry("stretching"))
+                > archetype_score(&yogi, &entry("strength"))
+        );
     }
 
     fn event() -> AgentEvent {

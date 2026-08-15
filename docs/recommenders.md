@@ -8,7 +8,8 @@ recommender changes how candidates are generated, not those safeguards.
 
 ## Choose a recommender
 
-On the waiting screen, use `←` and `→` to cycle through:
+On the waiting screen, press `s`, focus **Recommender** with `↑`/`↓`, and use
+`←`/`→` to cycle through:
 
 | Recommender | Behavior |
 | --- | --- |
@@ -16,10 +17,9 @@ On the waiting screen, use `←` and `→` to cycle through:
 | OpenAI API | Uses the Responses API and records its token usage separately |
 | Codex | Uses your installed Codex CLI without requiring a separate API key |
 
-The choice is saved in `~/.config/svarog/config.toml`. Changing it preserves
-the current and queued movements; the new recommender is used when Svarog next
-refills the queue. Open the upcoming-movements view with `n` and press `r` if
-you want to regenerate immediately.
+The choice is saved when **Apply changes** is selected. Svarog preserves the
+current movement and old safe queue until a newly generated replacement is
+ready.
 
 ## OpenAI API setup
 

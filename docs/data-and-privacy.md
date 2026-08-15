@@ -40,10 +40,11 @@ They do not forward the text of your coding prompts.
 | Codex | A bounded exercise profile or workout context is passed to your installed Codex CLI |
 | OpenAI API | The same bounded context is sent to the OpenAI Responses API |
 
-Recommendation context can include exercise goals, equipment, injuries, recent
-movement outcomes, daily totals, and cooldown state. Exercise instructions and
-reference images stay local. Remote recommenders receive only compact catalog
-metadata, and every response is validated locally.
+Recommendation context can include the Forge archetype, exercise goals,
+equipment, injuries, prescribed-versus-performed outcomes, daily totals, and
+cooldown state. Exercise instructions and reference images stay local. Remote
+recommenders receive only compact catalog metadata, and every response is
+validated locally.
 
 The OpenAI API key is read from the configured environment variable and is not
 stored by Svarog. Codex and OpenAI token totals are tracked separately.

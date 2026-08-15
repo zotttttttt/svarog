@@ -27,6 +27,11 @@ coding agent spends executing a task into tiny workouts. It learns from your
 equipment, preferences, recent activity, fatigue, and pain—then keeps each
 movement short enough to finish while the agent works.
 
+Choose a Forge archetype—the kind of physical capability you want to develop:
+Boxer, Wrestler, Athlete, Gymnast, Yogi, Lifer, or another built-in or custom
+north star. It biases what Svarog selects over time, never what it assumes you
+can do today. Actual completions, changed reps, skips, and pain determine pace.
+
 The loop is simple:
 
 1. You give your coding agent a spec or prompt to execute.
@@ -98,7 +103,7 @@ agent turn that triggered it has ended.
     <img width="420" src="./assets/1-tui-idle.png" alt="Svarog waiting dashboard showing the current recommender, completed exercises, reps, and token usage">
   </a>
 </p>
-<p align="center"><sub>See what is next, track your progress, or switch recommenders with the arrow keys.</sub></p>
+<p align="center"><sub>See what is next, track your progress, or open Settings to update your profile and Forge archetype.</sub></p>
 
 While waiting:
 
@@ -107,7 +112,7 @@ While waiting:
 | `f` | Start the next safe movement now |
 | `l` / `n` | View recent / upcoming movements |
 | `r` | Regenerate from the upcoming-movements view |
-| `←` / `→` | Change the recommender |
+| `s` | Open focus-driven Settings; use ↑/↓ to focus and ←/→ to change a field |
 
 During a movement:
 
