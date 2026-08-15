@@ -17,6 +17,8 @@
   &nbsp;
   <a href="https://github.com/zotttttttt/svarog/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-888888?style=flat-square&amp;labelColor=070808" alt="MIT license"></a>
   &nbsp;
+  <a href="https://github.com/zotttttttt/svarog/releases/latest"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fzotttttttt%2Fsvarog%2Fmain%2Fbadges%2Fbinary-size.json&amp;style=flat-square" alt="Release binary size range"></a>
+  &nbsp;
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-888888?style=flat-square&amp;labelColor=070808" alt="Supported platforms: macOS and Linux">
   &nbsp;
   <img src="https://img.shields.io/badge/desktop%20notifications-macOS-888888?style=flat-square&amp;labelColor=070808" alt="Desktop notifications available on macOS">

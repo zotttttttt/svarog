@@ -45,16 +45,28 @@ jobs:
           actual_version="$($binary --version)"
           test "$actual_version" = "svarog $version"
 
+          binary_size="$(wc -c < "$binary" | tr -d '[:space:]')"
+          case "$binary_size" in
+            ''|*[!0-9]*)
+              echo "Invalid binary size for ${TARGET}: ${binary_size}" >&2
+              exit 1
+              ;;
+          esac
+          test "$binary_size" -gt 0
+
           package="svarog-${version}-${TARGET}"
           mkdir -p "dist/$package"
           cp "$binary" README.md LICENSE THIRD_PARTY_NOTICES.html svarog.png "dist/$package/"
           tar -C dist -czf "dist/$package.tar.gz" "$package"
+          printf '%s\n' "$binary_size" > "dist/${TARGET}.size"
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ matrix.target }}
-          path: dist/*.tar.gz
+          path: |
+            dist/*.tar.gz
+            dist/*.size
           if-no-files-found: error
 
   publish:
@@ -72,10 +84,87 @@ jobs:
         working-directory: dist
         run: sha256sum -- *.tar.gz > SHA256SUMS
 
+      - name: Create binary size badge metadata
+        working-directory: dist
+        run: |
+          expected_targets=(
+            aarch64-apple-darwin
+            x86_64-apple-darwin
+            x86_64-unknown-linux-gnu
+          )
+          sizes=()
+
+          actual_size_file_count="$(find . -maxdepth 1 -type f -name '*.size' | wc -l | tr -d '[:space:]')"
+          test "$actual_size_file_count" -eq "${#expected_targets[@]}"
+
+          for target in "${expected_targets[@]}"; do
+            size_file="${target}.size"
+            test -f "$size_file"
+            size="$(tr -d '[:space:]' < "$size_file")"
+            case "$size" in
+              ''|*[!0-9]*)
+                echo "Invalid binary size for ${target}: ${size}" >&2
+                exit 1
+                ;;
+            esac
+            test "$size" -gt 0
+            sizes+=("$size")
+          done
+
+          min_size="$(printf '%s\n' "${sizes[@]}" | sort -n | head -n 1)"
+          max_size="$(printf '%s\n' "${sizes[@]}" | sort -n | tail -n 1)"
+          min_mb="$(LC_ALL=C awk -v bytes="$min_size" 'BEGIN { printf "%.1f", bytes / 1000000 }')"
+          max_mb="$(LC_ALL=C awk -v bytes="$max_size" 'BEGIN { printf "%.1f", bytes / 1000000 }')"
+
+          if test "$min_mb" = "$max_mb"; then
+            message="${min_mb} MB"
+          else
+            message="${min_mb}–${max_mb} MB"
+          fi
+
+          jq -n \
+            --arg message "$message" \
+            '{
+              schemaVersion: 1,
+              label: "binary",
+              message: $message,
+              color: "888888",
+              labelColor: "070808"
+            }' > binary-size.json
+
       - name: Upload assets to GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: >-
           gh release upload "$RELEASE_TAG" dist/*.tar.gz dist/SHA256SUMS
+          dist/binary-size.json
           --clobber --repo "$GITHUB_REPOSITORY"
+
+      - name: Update latest binary size badge
+        if: ${{ !github.event.release.prerelease }}
+        env:
+          BADGE_BRANCH: main
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          badge_path="badges/binary-size.json"
+          badge_api="repos/${GITHUB_REPOSITORY}/contents/${badge_path}"
+          badge_sha="$(gh api "${badge_api}?ref=${BADGE_BRANCH}" --jq '.sha')"
+          current_content="$(gh api "${badge_api}?ref=${BADGE_BRANCH}" --jq '.content' | tr -d '\n' | base64 --decode)"
+          new_content="$(cat dist/binary-size.json)"
+
+          if test "$current_content" = "$new_content"; then
+            echo "Binary size badge is already current."
+            exit 0
+          fi
+
+          encoded_content="$(base64 < dist/binary-size.json | tr -d '\n')"
+          gh api \
+            --method PUT \
+            "$badge_api" \
+            -f message="chore: update binary size badge for ${RELEASE_TAG}" \
+            -f content="$encoded_content" \
+            -f sha="$badge_sha" \
+            -f branch="$BADGE_BRANCH" \
+            >/dev/null
