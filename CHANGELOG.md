@@ -2,6 +2,20 @@
 
 Notable changes to Svarog are recorded here by the automated release process.
 
+## [0.4.0](https://github.com/zotttttttt/svarog/compare/v0.3.8...v0.4.0) (2026-08-15)
+
+
+### Features
+
+* add forge archetypes and adaptive settings ([e2b989a](https://github.com/zotttttttt/svarog/commit/e2b989a01c73558a5d1b56b7705df59a04185023))
+* improve settings keyboard controls ([470aa5e](https://github.com/zotttttttt/svarog/commit/470aa5ee0ddb6f06dc1e38ddd4cdbdd5179e517f))
+
+
+### Fixes
+
+* close archetype settings gaps ([b72bae3](https://github.com/zotttttttt/svarog/commit/b72bae358453ffa9d7930e7c1ec203bef8c53145))
+* Release: Forge archetypes and secure recommenders ([77c88eb](https://github.com/zotttttttt/svarog/commit/77c88eb36b10ca0c20464c2ed59ca5f58fccf1da))
+
 ## [0.3.8](https://github.com/zotttttttt/svarog/compare/v0.3.7...v0.3.8) (2026-08-11)
 
 
