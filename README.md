@@ -27,10 +27,8 @@ coding agent spends executing a task into tiny workouts. It learns from your
 equipment, preferences, recent activity, fatigue, and pain—then keeps each
 movement short enough to finish while the agent works.
 
-Choose a Forge archetype—the kind of physical capability you want to develop:
-Boxer, Wrestler, Athlete, Gymnast, Yogi, Lifer, or another built-in or custom
-north star. It biases what Svarog selects over time, never what it assumes you
-can do today. Actual completions, changed reps, skips, and pain determine pace.
+Choose a Forge archetype to give recommendations a long-term direction, while
+your actual completions, changed reps, skips, and pain determine today's pace.
 
 The loop is simple:
 
@@ -39,10 +37,27 @@ The loop is simple:
 3. You finish, skip, or report pain while the agent works.
 4. Your history shapes what comes next.
 
-Use the conservative built-in recommender, your installed Codex CLI, or the
-OpenAI API with either an environment variable or a key protected by your
-operating system credential store. Prompt text is never collected or sent in
-recommendation requests.
+Choose how Svarog generates recommendations:
+
+| Recommender | Setup |
+| --- | --- |
+| Local | Conservative built-in rules; offline and enabled by default |
+| Codex | Uses your installed Codex CLI; no separate API key needed |
+| OpenAI (environment) | Reads `OPENAI_API_KEY` from the shell that starts Svarog |
+| OpenAI (saved key) | Stores a key entered in Settings in macOS Keychain or Linux Secret Service |
+
+For the environment option, export the key before starting Svarog:
+
+```bash
+export OPENAI_API_KEY="..."
+svarog
+```
+
+For the saved-key option, open Settings, focus **Saved OpenAI key**, press
+Enter, and enter the key. Then select the matching recommender and apply the
+changes. Neither option writes the key to Svarog's config or workout database.
+Prompt text is never collected or sent in recommendation requests. See
+[Recommenders](docs/recommenders.md) for configuration and fallback details.
 
 ## Get started
 
@@ -101,11 +116,15 @@ movement stays available until you finish, skip, or report pain—even if the
 agent turn that triggered it has ended.
 
 <p align="center">
-  <a href="./assets/1-tui-idle.png">
-    <img width="420" src="./assets/1-tui-idle.png" alt="Svarog waiting dashboard showing the current recommender, completed exercises, reps, and token usage">
+  <a href="./assets/1-idle-recommender-is-working.png">
+    <img width="42%" src="./assets/1-idle-recommender-is-working.png" alt="Svarog waiting dashboard while the OpenAI environment recommender prepares the next movement">
+  </a>
+  &nbsp;
+  <a href="./assets/2-idle.png">
+    <img width="49%" src="./assets/2-idle.png" alt="Svarog idle dashboard showing the selected recommender, completed forges, repetitions, and OpenAI token usage">
   </a>
 </p>
-<p align="center"><sub>See what is next, track your progress, or open Settings to update your profile and Forge archetype.</sub></p>
+<p align="center"><sub>Svarog prepares the next movement while you work, then waits without interrupting your flow.</sub></p>
 
 While waiting:
 
@@ -116,15 +135,26 @@ While waiting:
 | `r` | Regenerate from the upcoming-movements view |
 | `s` | Open focus-driven Settings; use ↑/↓ to focus and ←/→ to change a field |
 
+<p align="center">
+  <a href="./assets/6-next-forges.png">
+    <img width="49%" src="./assets/6-next-forges.png" alt="Svarog upcoming-forges screen showing ten queued movements and regeneration controls">
+  </a>
+  &nbsp;
+  <a href="./assets/7-settings.png">
+    <img width="44%" src="./assets/7-settings.png" alt="Svarog focused Settings screen showing archetype, recommender, profile fields, and apply controls">
+  </a>
+</p>
+<p align="center"><sub>Preview or regenerate upcoming movements, and update your profile, archetype, or recommender in Settings.</sub></p>
+
 During a movement:
 
 <p align="center">
-  <a href="./assets/2-tui-forging.png">
-    <img width="44%" src="./assets/2-tui-forging.png" alt="Svarog movement session showing a kettlebell sumo high pull target and session controls">
+  <a href="./assets/3-forging.png">
+    <img width="44%" src="./assets/3-forging.png" alt="Svarog movement session showing a one-arm kettlebell row target and session controls">
   </a>
   &nbsp;
-  <a href="./assets/3-tui-how-to.png">
-    <img width="44%" src="./assets/3-tui-how-to.png" alt="Svarog terminal instructions for performing a kettlebell sumo high pull">
+  <a href="./assets/4-how-to.png">
+    <img width="44%" src="./assets/4-how-to.png" alt="Svarog terminal instructions for performing a one-arm kettlebell row">
   </a>
 </p>
 <p align="center"><sub>Record the result or open step-by-step instructions without leaving the dashboard.</sub></p>
@@ -139,8 +169,8 @@ During a movement:
 | `p` | Report pain and block the exercise |
 
 <p align="center">
-  <a href="./assets/4-local-html-how-to.png">
-    <img width="760" src="./assets/4-local-html-how-to.png" alt="Local Svarog visual guide with kettlebell sumo high pull instructions and two reference positions">
+  <a href="./assets/5-how-to-images-in-browser.png">
+    <img width="760" src="./assets/5-how-to-images-in-browser.png" alt="Local Svarog visual guide with one-arm kettlebell row instructions and two reference positions">
   </a>
 </p>
 <p align="center"><sub>When available, reference images open on demand in a local visual guide.</sub></p>
@@ -148,6 +178,38 @@ During a movement:
 > Svarog starts conservatively, respects reported pain and fatigue, and excludes
 > exercises that require a partner. Recommendations are not medical advice;
 > stop whenever a movement hurts or feels unsafe.
+
+## Choose your Forge archetype
+
+Your Forge archetype is the kind of physical capability you want Svarog to
+gradually train you toward. It guides exercise selection over time, but never
+assumes what you can handle today. You can change it at any time without losing
+your history.
+
+<p align="center">
+  <a href="./assets/0-choose-your-fighter.png">
+    <img width="680" src="./assets/0-choose-your-fighter.png" alt="Svarog Forge archetype selector showing the Thinker description, navigation controls, and capability stats">
+  </a>
+</p>
+<p align="center"><sub>Choose a long-term direction during setup, or change it later in Settings.</sub></p>
+
+| Archetype | Long-term direction |
+| --- | --- |
+| Boxer | Fast, conditioned and durable: calisthenics, footwork, core work and very high distributed training volume. |
+| Wrestler | Powerful and hard to fatigue: pulling, grip, posterior chain, carries, isometrics and explosive full-body strength. |
+| Martial Artist | Lean, mobile and precise: speed, coordination, balance, core control and explosive movement. |
+| Bodybuilder | Build muscle deliberately through resistance, progressive overload and hypertrophy-focused strength work. |
+| Runner | Build a large aerobic engine through movement volume, cardiovascular fitness and durable lower-body endurance. |
+| Athlete | Be good at everything: balanced strength, muscle, cardio, mobility, coordination and power. |
+| Gymnast | Master your own body through relative strength, core control, balance, mobility and precise movement. |
+| Yogi | Move freely and deliberately through mobility, flexibility, balance, breathing and controlled body awareness. |
+| Mover | Strong posture and controlled movement through core work, mobility, balance and low-impact muscular endurance. |
+| Thinker | Use movement to improve focus, energy, mood, stress regulation, sleep and cognitive performance. |
+| Lifer | Stay strong, mobile, aerobically fit and physically independent for as many decades as possible. |
+
+If none fits, choose **Custom** and name your own physical north star. Custom
+archetypes keep the balanced Athlete behavior while giving the recommender your
+chosen direction.
 
 ## Learn more
 

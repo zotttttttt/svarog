@@ -218,6 +218,30 @@ impl std::fmt::Debug for SettingsState {
 
 const SETTINGS_ROWS: usize = 16;
 
+fn settings_row_order(settings: &SettingsState) -> Vec<usize> {
+    let mut rows = Vec::with_capacity(SETTINGS_ROWS);
+    rows.extend([0, 1]);
+    if settings.draft.recommender.backend == RecommenderBackend::OpenaiKeyring {
+        rows.push(15);
+    }
+    rows.extend(2..15);
+    rows
+}
+
+fn move_settings_focus(settings: &mut SettingsState, forward: bool) {
+    let rows = settings_row_order(settings);
+    let position = rows
+        .iter()
+        .position(|row| *row == settings.row)
+        .unwrap_or(0);
+    let position = if forward {
+        (position + 1).min(rows.len().saturating_sub(1))
+    } else {
+        position.saturating_sub(1)
+    };
+    settings.row = rows[position];
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum QueueRegenerationFeedback {
     Success,
@@ -993,22 +1017,22 @@ fn settings_lines(
     ];
     let footer_height =
         if settings.editing { 3 } else { 2 } + usize::from(settings.error.is_some());
+    let row_order = settings_row_order(settings);
     let visible_rows = usize::from(area_height)
         .saturating_sub(lines.len() + footer_height)
-        .clamp(1, SETTINGS_ROWS);
-    let max_start = SETTINGS_ROWS.saturating_sub(visible_rows);
-    let first_row = settings
-        .row
+        .clamp(1, row_order.len());
+    let focused_position = row_order
+        .iter()
+        .position(|row| *row == settings.row)
+        .unwrap_or(0);
+    let max_start = row_order.len().saturating_sub(visible_rows);
+    let first_row = focused_position
         .saturating_add(1)
         .saturating_sub(visible_rows)
         .min(max_start);
     let value_width = usize::from(area_width).saturating_sub(27).max(1);
-    for (index, (label, value)) in values
-        .into_iter()
-        .enumerate()
-        .skip(first_row)
-        .take(visible_rows)
-    {
+    for index in row_order.into_iter().skip(first_row).take(visible_rows) {
+        let (label, value) = &values[index];
         let selected = index == settings.row;
         lines.push(Line::from(vec![
             Span::styled(
@@ -1020,7 +1044,7 @@ fn settings_lines(
                 if selected { text_bold() } else { muted() },
             ),
             Span::styled(
-                clipped_text(&value, value_width),
+                clipped_text(value, value_width),
                 if selected { accent() } else { text() },
             ),
         ]));
@@ -1516,8 +1540,8 @@ fn handle_settings_key(
     }
     match code {
         KeyCode::Esc => ui.settings = None,
-        KeyCode::Up => settings.row = settings.row.saturating_sub(1),
-        KeyCode::Down => settings.row = (settings.row + 1).min(SETTINGS_ROWS - 1),
+        KeyCode::Up => move_settings_focus(settings, false),
+        KeyCode::Down => move_settings_focus(settings, true),
         KeyCode::Delete if settings.row == 15 => {
             settings.pending_openai_key = Some(PendingSecretChange::Delete);
             settings.error = None;
@@ -1750,6 +1774,7 @@ fn idle_lines(
     ));
     lines.push(Line::from(""));
     lines.push(recommender_line(backend));
+    lines.push(settings_control_line());
     if backend.label == RecommenderBackend::Local.label() {
         lines.push(Line::from(Span::styled(
             "Tip: Use Codex/OpenAI key recommender in Settings.",
@@ -1800,6 +1825,7 @@ fn cooldown_lines(
     ));
     lines.push(Line::from(""));
     lines.push(recommender_line(backend));
+    lines.push(settings_control_line());
     lines.extend(activity_lines(activity));
     lines.extend(recommender_usage_lines(backend, token_usage));
     if backend.unavailable {
@@ -1921,8 +1947,11 @@ fn recommender_line(backend: &BackendView) -> Line<'static> {
     Line::from(vec![
         Span::styled("Recommender: ", muted()),
         Span::styled(format!("[{}]", backend.label), text()),
-        Span::styled("  [s] Settings", muted()),
     ])
+}
+
+fn settings_control_line() -> Line<'static> {
+    Line::from(Span::styled("[s] Settings", muted()))
 }
 
 fn tmux_control_lines() -> Vec<Line<'static>> {
@@ -2409,6 +2438,42 @@ mod tests {
     }
 
     #[test]
+    fn saved_openai_key_row_appears_below_keyring_recommender_only() {
+        let mut settings = settings_state();
+        let local = settings_lines(&settings, false, 120, 40)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        assert!(!local.iter().any(|line| line.contains("Saved OpenAI key")));
+
+        settings.draft.recommender.backend = RecommenderBackend::OpenaiKeyring;
+        let keyring = settings_lines(&settings, false, 120, 40)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        let recommender = keyring
+            .iter()
+            .position(|line| line.contains("Recommender"))
+            .unwrap();
+        let saved_key = keyring
+            .iter()
+            .position(|line| line.contains("Saved OpenAI key"))
+            .unwrap();
+        let notifications = keyring
+            .iter()
+            .position(|line| line.contains("Notifications"))
+            .unwrap();
+        assert_eq!(saved_key, recommender + 1);
+        assert_eq!(notifications, saved_key + 1);
+
+        settings.row = 1;
+        move_settings_focus(&mut settings, true);
+        assert_eq!(settings.row, 15);
+        move_settings_focus(&mut settings, true);
+        assert_eq!(settings.row, 2);
+    }
+
+    #[test]
     fn onboarding_selector_puts_controls_below_description_without_escape() {
         let forge = Forge::default();
         let lines = archetype_lines(&forge, None, false, ArchetypeSelectorContext::Onboarding);
@@ -2541,13 +2606,13 @@ mod tests {
             .join("\n");
         assert!(top.contains("› Forge archetype"));
 
-        settings.row = SETTINGS_ROWS - 1;
+        settings.row = 14;
         let bottom = settings_lines(&settings, false, 60, 10)
             .into_iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(bottom.contains("› Saved OpenAI key"));
+        assert!(bottom.contains("› Exercise preferences"));
         assert!(bottom.contains("[ctrl/cmd+s] Apply changes  [esc] Cancel settings"));
         assert!(!bottom.contains("Forge archetype"));
     }
@@ -2834,9 +2899,9 @@ mod tests {
         assert!(text.contains("[l] Latest forges"));
         assert!(text.contains("[n] Next forges"));
         assert!(text.contains(
-            "Waiting for the next forge.\n\n[f] Forge now\n[l] Latest forges [n] Next forges\n\nRecommender: [Codex]  [s] Settings"
+            "Waiting for the next forge.\n\n[f] Forge now\n[l] Latest forges [n] Next forges\n\nRecommender: [Codex]\n[s] Settings"
         ));
-        assert!(text.contains("Recommender: [Codex]  [s] Settings"));
+        assert!(text.contains("Recommender: [Codex]\n[s] Settings"));
         assert!(!text.contains("[r] Change recommender"));
         assert!(text.contains("Completed:"));
         assert!(text.contains("Svarog Codex tokens (in/out)"));
@@ -2925,7 +2990,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(idle.contains(&format!("Recommender: [Local]  [s] Settings\n{hint}")));
+        assert!(idle.contains(&format!("Recommender: [Local]\n[s] Settings\n{hint}")));
         assert!(!cooldown.contains(hint));
     }
 
@@ -3430,8 +3495,11 @@ mod tests {
         assert_eq!(line.spans[0].style, muted());
         assert_eq!(line.spans[1].content.as_ref(), "[Codex]");
         assert_eq!(line.spans[1].style, text());
-        assert_eq!(line.spans[2].content.as_ref(), "  [s] Settings");
-        assert_eq!(line.spans[2].style, muted());
+        assert_eq!(line.spans.len(), 2);
+
+        let settings = settings_control_line();
+        assert_eq!(settings.to_string(), "[s] Settings");
+        assert_eq!(settings.spans[0].style, muted());
     }
 
     #[test]
