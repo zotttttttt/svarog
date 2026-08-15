@@ -38,6 +38,8 @@ use zeroize::Zeroizing;
 
 type Spark = (usize, usize, char, bool);
 
+const VIEW_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
+
 const SPARK_BURSTS: [&[Spark]; 10] = [
     &[
         (0, 6, '˚', false),
@@ -336,6 +338,10 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
         .ok()
         .filter(|config| config.recommender.backend == RecommenderBackend::OpenaiKeyring)
         .and_then(|_| secrets::has_openai_api_key(&env.paths).ok());
+    let store = Store::open(&env.paths.database_file)?;
+    let mut view = load_view(&store, &env.paths, saved_openai_key_available);
+    let mut last_view_refresh = Instant::now();
+    let mut force_view_refresh = false;
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     let keyboard_enhancement = matches!(supports_keyboard_enhancement(), Ok(true));
@@ -365,8 +371,17 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
             last_spark_toggle = Instant::now();
         }
 
-        poll_queue_regeneration(&mut ui);
-        let view = load_view(&env.paths, ui.saved_openai_key_available);
+        let now = Instant::now();
+        let queue_regeneration_finished = poll_queue_regeneration(&mut ui);
+        if view_refresh_due(
+            last_view_refresh,
+            now,
+            force_view_refresh || queue_regeneration_finished,
+        ) {
+            view = load_view(&store, &env.paths, ui.saved_openai_key_available);
+            last_view_refresh = now;
+            force_view_refresh = false;
+        }
         if view.kind == ViewKind::Forge {
             ui.show_history = false;
             ui.show_next = false;
@@ -397,6 +412,9 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
                         if let Some(settings) = ui.settings.as_mut() {
                             settings.error = Some(error.to_string());
                         }
+                    }
+                    if ui.settings.is_none() {
+                        force_view_refresh = true;
                     }
                     continue;
                 }
@@ -496,7 +514,7 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
                     ui.forge_now_feedback = None;
                     if ui.queue_regeneration.is_none() {
                         match daemon::forge_now(env) {
-                            Ok(ForgeNowResult::Started) => {}
+                            Ok(ForgeNowResult::Started) => force_view_refresh = true,
                             Ok(ForgeNowResult::NoQueued) => {
                                 ui.forge_now_feedback =
                                     Some("No forges queued. Generating a fresh queue…".into());
@@ -534,7 +552,9 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
                         ui.actual_reps = ui.actual_reps.saturating_sub(1).max(1);
                     }
                     (KeyCode::Char('d') | KeyCode::Enter, ViewKind::Forge, false) => {
-                        let _ = cli::tui_action_with_reps(env, SetStatus::Done, ui.actual_reps);
+                        if cli::tui_action_with_reps(env, SetStatus::Done, ui.actual_reps).is_ok() {
+                            force_view_refresh = true;
+                        }
                         ui.skip_check = false;
                     }
                     (KeyCode::Char('s'), ViewKind::Forge, false) => {
@@ -543,14 +563,19 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
                     (code, ViewKind::Forge, true) if skip_confirmation_action(code).is_some() => {
                         match skip_confirmation_action(code).unwrap() {
                             SkipConfirmationAction::Fatigued => {
-                                let _ = cli::tui_action_skip_fatigued(env);
+                                if cli::tui_action_skip_fatigued(env).is_ok() {
+                                    force_view_refresh = true;
+                                }
                             }
                             SkipConfirmationAction::Normal => {
-                                let _ = cli::tui_action(env, SetStatus::Skipped);
+                                if cli::tui_action(env, SetStatus::Skipped).is_ok() {
+                                    force_view_refresh = true;
+                                }
                             }
                             SkipConfirmationAction::Remove => {
                                 match cli::tui_action_remove_exercise(env) {
                                     Ok(()) => {
+                                        force_view_refresh = true;
                                         ui.status_message = Some(
                                             "Exercise removed. Run `svarog exercises restore <id>` to restore it."
                                                 .into(),
@@ -567,7 +592,9 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
                         ui.skip_check = false;
                     }
                     (KeyCode::Char('p'), ViewKind::Forge, _) => {
-                        let _ = cli::tui_action(env, SetStatus::Pain);
+                        if cli::tui_action(env, SetStatus::Pain).is_ok() {
+                            force_view_refresh = true;
+                        }
                         ui.skip_check = false;
                     }
                     _ => {}
@@ -598,19 +625,12 @@ fn apply_queue_regeneration_start(ui: &mut TuiState, start: QueueRegenerationSta
     }
 }
 
-fn load_view(paths: &Paths, saved_openai_key_available: Option<bool>) -> ViewModel {
+fn view_refresh_due(last_refresh: Instant, now: Instant, force: bool) -> bool {
+    force || now.saturating_duration_since(last_refresh) >= VIEW_REFRESH_INTERVAL
+}
+
+fn load_view(store: &Store, paths: &Paths, saved_openai_key_available: Option<bool>) -> ViewModel {
     let backend = recommender_backend_view(paths, saved_openai_key_available);
-    let Ok(store) = Store::open(&paths.database_file) else {
-        return ViewModel {
-            kind: ViewKind::Idle,
-            recommendation: None,
-            backend,
-            activity: ForgeActivitySummary::default(),
-            token_usage: RecommenderTokenUsageByProvider::default(),
-            history: Vec::new(),
-            next_forges: Vec::new(),
-        };
-    };
     let state = store.state().ok();
     let recommendation = store.latest_open_recommendation().ok().flatten();
     let activity = store.completed_forge_summary().unwrap_or_default();
@@ -750,11 +770,11 @@ fn poll_exercise_media(ui: &mut TuiState, recommendation: Option<&Recommendation
     });
 }
 
-fn poll_queue_regeneration(ui: &mut TuiState) {
-    poll_queue_regeneration_at(ui, Instant::now());
+fn poll_queue_regeneration(ui: &mut TuiState) -> bool {
+    poll_queue_regeneration_at(ui, Instant::now())
 }
 
-fn poll_queue_regeneration_at(ui: &mut TuiState, now: Instant) {
+fn poll_queue_regeneration_at(ui: &mut TuiState, now: Instant) -> bool {
     if matches!(
         ui.queue_regeneration_feedback,
         Some(QueueRegenerationFeedback::Success)
@@ -774,7 +794,7 @@ fn poll_queue_regeneration_at(ui: &mut TuiState, now: Instant) {
         Some(Err(TryRecvError::Empty)) | None => None,
     };
     let Some(result) = result else {
-        return;
+        return false;
     };
     ui.queue_regeneration = None;
     ui.queue_regeneration_started_at = None;
@@ -800,6 +820,7 @@ fn poll_queue_regeneration_at(ui: &mut TuiState, now: Instant) {
             }
         }
     }
+    true
 }
 
 fn queue_regeneration_loader(ui: &TuiState) -> Option<usize> {
@@ -2465,7 +2486,8 @@ mod tests {
     use super::*;
     use crate::config::{Config, Recommender, RecommenderBackend};
     use crate::models::{
-        Agent, ForgeActivityTotals, RecommenderTokenUsageSummary, TokenUsageTotals,
+        Agent, ForgeActivityTotals, RecommenderTokenUsage, RecommenderTokenUsageSummary,
+        TokenUsageTotals,
     };
     use crate::recommender::QueueGenerationSource;
     use chrono::{TimeZone, Utc};
@@ -2490,6 +2512,23 @@ mod tests {
             confirming_openai_key_delete: false,
             error: None,
         }
+    }
+
+    #[test]
+    fn view_refreshes_on_interval_or_when_forced() {
+        let last_refresh = Instant::now();
+
+        assert!(!view_refresh_due(
+            last_refresh,
+            last_refresh + Duration::from_millis(499),
+            false
+        ));
+        assert!(view_refresh_due(
+            last_refresh,
+            last_refresh + VIEW_REFRESH_INTERVAL,
+            false
+        ));
+        assert!(view_refresh_due(last_refresh, last_refresh, true));
     }
 
     #[test]
@@ -3555,7 +3594,7 @@ mod tests {
             .unwrap();
 
         let completed_at = Instant::now();
-        poll_queue_regeneration_at(&mut ui, completed_at);
+        assert!(poll_queue_regeneration_at(&mut ui, completed_at));
 
         assert!(ui.queue_regeneration.is_none());
         assert_eq!(
@@ -3571,12 +3610,18 @@ mod tests {
             Some("Settings saved. Future forges refreshed.")
         );
 
-        poll_queue_regeneration_at(&mut ui, completed_at + Duration::from_millis(2_999));
+        assert!(!poll_queue_regeneration_at(
+            &mut ui,
+            completed_at + Duration::from_millis(2_999)
+        ));
         assert_eq!(
             ui.queue_regeneration_feedback,
             Some(QueueRegenerationFeedback::Success)
         );
-        poll_queue_regeneration_at(&mut ui, completed_at + Duration::from_secs(3));
+        assert!(!poll_queue_regeneration_at(
+            &mut ui,
+            completed_at + Duration::from_secs(3)
+        ));
         assert!(ui.queue_regeneration_feedback.is_none());
         assert!(ui.queue_regeneration_feedback_started_at.is_none());
 
@@ -3584,7 +3629,10 @@ mod tests {
         ui.queue_regeneration = Some(failure_receiver);
         ui.settings_regeneration = true;
         failure_sender.send(Err("failed".into())).unwrap();
-        poll_queue_regeneration_at(&mut ui, completed_at + Duration::from_secs(4));
+        assert!(poll_queue_regeneration_at(
+            &mut ui,
+            completed_at + Duration::from_secs(4)
+        ));
         assert_eq!(
             ui.queue_regeneration_feedback,
             Some(QueueRegenerationFeedback::Failure {
@@ -3595,7 +3643,10 @@ mod tests {
             ui.status_message.as_deref(),
             Some("Settings saved. Future forges could not be refreshed; existing queue kept.")
         );
-        poll_queue_regeneration_at(&mut ui, completed_at + Duration::from_secs(10));
+        assert!(!poll_queue_regeneration_at(
+            &mut ui,
+            completed_at + Duration::from_secs(10)
+        ));
         assert!(matches!(
             ui.queue_regeneration_feedback,
             Some(QueueRegenerationFeedback::Failure { .. })
@@ -3764,6 +3815,35 @@ mod tests {
 
         assert_eq!(backend.label, "Local");
         assert!(!backend.unavailable);
+    }
+
+    #[test]
+    fn persistent_view_store_observes_writes_from_another_connection() {
+        let root = tempdir().unwrap();
+        let paths = Paths::from_root(root.path().to_path_buf());
+        config::save(&paths, &Config::default()).unwrap();
+        let reader = Store::open(&paths.database_file).unwrap();
+
+        let initial = load_view(&reader, &paths, None);
+        assert_eq!(initial.token_usage.codex.today.input_tokens, 0);
+
+        let writer = Store::open(&paths.database_file).unwrap();
+        writer
+            .record_recommender_token_usage(
+                RecommenderTokenProvider::Codex,
+                &RecommenderTokenUsage {
+                    input_tokens: 42,
+                    cached_input_tokens: 0,
+                    output_tokens: 7,
+                    reasoning_output_tokens: 0,
+                },
+                Utc::now(),
+            )
+            .unwrap();
+
+        let refreshed = load_view(&reader, &paths, None);
+        assert_eq!(refreshed.token_usage.codex.today.input_tokens, 42);
+        assert_eq!(refreshed.token_usage.codex.today.output_tokens, 7);
     }
 
     #[test]
