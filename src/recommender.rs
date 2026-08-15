@@ -5,6 +5,7 @@ use crate::models::{
     RecommenderTokenProvider, RecommenderTokenUsage,
 };
 use crate::prompt_templates::PromptRenderer;
+use crate::secrets;
 use crate::storage::{SetSummary, Store, MUSCLE_COOLDOWN_MINUTES};
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
@@ -202,56 +203,61 @@ fn generate_recommendation_queue_with_existing(
         project: None,
         created_at: Utc::now(),
     };
-    let (mut recommendations, notice, source, llm_count, local_count) =
-        match config.recommender.backend {
-            RecommenderBackend::Local => {
-                let local = local_queue(store, config, &event, needed, existing)?;
-                let local_count = local.len();
-                (local, None, QueueGenerationSource::Local, 0, local_count)
-            }
-            RecommenderBackend::Codex | RecommenderBackend::Openai => {
-                match llm_queue(store, config, paths, &event, needed, existing) {
-                    Ok(mut llm) => {
-                        llm.truncate(needed as usize);
-                        let llm_count = llm.len();
-                        let local = if config.recommender.local_fallback
-                            && llm_count < needed as usize
-                        {
-                            local_queue(store, config, &event, needed - llm_count as u32, existing)?
-                        } else {
-                            Vec::new()
-                        };
-                        let local_count = local.len();
-                        llm.extend(local);
-                        let source = if local_count > 0 && llm_count > 0 {
-                            QueueGenerationSource::Hybrid
-                        } else if local_count > 0 {
-                            QueueGenerationSource::LocalFallback
-                        } else {
-                            match config.recommender.backend {
-                                RecommenderBackend::Codex => QueueGenerationSource::Codex,
-                                RecommenderBackend::Openai => QueueGenerationSource::OpenAi,
-                                _ => unreachable!(),
+    let (mut recommendations, notice, source, llm_count, local_count) = match config
+        .recommender
+        .backend
+    {
+        RecommenderBackend::Local => {
+            let local = local_queue(store, config, &event, needed, existing)?;
+            let local_count = local.len();
+            (local, None, QueueGenerationSource::Local, 0, local_count)
+        }
+        RecommenderBackend::Codex
+        | RecommenderBackend::OpenaiEnv
+        | RecommenderBackend::OpenaiKeyring => {
+            match llm_queue(store, config, paths, &event, needed, existing) {
+                Ok(mut llm) => {
+                    llm.truncate(needed as usize);
+                    let llm_count = llm.len();
+                    let local = if config.recommender.local_fallback && llm_count < needed as usize
+                    {
+                        local_queue(store, config, &event, needed - llm_count as u32, existing)?
+                    } else {
+                        Vec::new()
+                    };
+                    let local_count = local.len();
+                    llm.extend(local);
+                    let source = if local_count > 0 && llm_count > 0 {
+                        QueueGenerationSource::Hybrid
+                    } else if local_count > 0 {
+                        QueueGenerationSource::LocalFallback
+                    } else {
+                        match config.recommender.backend {
+                            RecommenderBackend::Codex => QueueGenerationSource::Codex,
+                            RecommenderBackend::OpenaiEnv | RecommenderBackend::OpenaiKeyring => {
+                                QueueGenerationSource::OpenAi
                             }
-                        };
-                        let notice = hybrid_notice(config, llm_count, local_count);
-                        (llm, notice, source, llm_count, local_count)
-                    }
-                    Err(err) if config.recommender.local_fallback => {
-                        let fallback = local_queue(store, config, &event, needed, existing)?;
-                        let local_count = fallback.len();
-                        (
-                            fallback,
-                            fallback_notice(config, &err),
-                            QueueGenerationSource::LocalFallback,
-                            0,
-                            local_count,
-                        )
-                    }
-                    Err(err) => return Err(err),
+                            _ => unreachable!(),
+                        }
+                    };
+                    let notice = hybrid_notice(config, llm_count, local_count);
+                    (llm, notice, source, llm_count, local_count)
                 }
+                Err(err) if config.recommender.local_fallback => {
+                    let fallback = local_queue(store, config, &event, needed, existing)?;
+                    let local_count = fallback.len();
+                    (
+                        fallback,
+                        fallback_notice(config, &err),
+                        QueueGenerationSource::LocalFallback,
+                        0,
+                        local_count,
+                    )
+                }
+                Err(err) => return Err(err),
             }
-        };
+        }
+    };
 
     recommendations = schedule_equipment_batch(store.movements()?, recommendations);
     recommendations.truncate(needed as usize);
@@ -270,7 +276,7 @@ fn hybrid_notice(config: &Config, llm_count: usize, local_count: usize) -> Optio
     }
     let backend = match config.recommender.backend {
         RecommenderBackend::Codex => "Codex",
-        RecommenderBackend::Openai => "OpenAI",
+        RecommenderBackend::OpenaiEnv | RecommenderBackend::OpenaiKeyring => "OpenAI",
         _ => "Recommender",
     };
     if llm_count == 0 {
@@ -288,7 +294,7 @@ fn fallback_notice(config: &Config, error: &anyhow::Error) -> Option<String> {
     }
     let backend = match config.recommender.backend {
         RecommenderBackend::Codex => "Codex",
-        RecommenderBackend::Openai => "OpenAI",
+        RecommenderBackend::OpenaiEnv | RecommenderBackend::OpenaiKeyring => "OpenAI",
         _ => "Recommender",
     };
     let details = format!("{error:#}").to_lowercase();
@@ -470,7 +476,9 @@ fn llm_queue(
     let prompt = PromptRenderer::new(&paths.config_dir).recommendation_queue(&context, needed)?;
     let batch = match config.recommender.backend {
         RecommenderBackend::Codex => call_codex_queue(store, config, &prompt, needed),
-        RecommenderBackend::Openai => call_openai_queue(store, config, &prompt, needed),
+        RecommenderBackend::OpenaiEnv | RecommenderBackend::OpenaiKeyring => {
+            call_openai_queue(store, config, paths, &prompt, needed)
+        }
         RecommenderBackend::Local => unreachable!(),
     }?;
     let movements = store.movements()?;
@@ -598,7 +606,9 @@ pub fn initial_exercise_profile(
         .exercise_profile(&exercise_profile_context(config))
         .and_then(|prompt| match config.recommender.backend {
             RecommenderBackend::Codex => call_codex_exercise_profile(store, config, &prompt),
-            RecommenderBackend::Openai => call_openai_exercise_profile(store, config, &prompt),
+            RecommenderBackend::OpenaiEnv | RecommenderBackend::OpenaiKeyring => {
+                call_openai_exercise_profile(store, config, paths, &prompt)
+            }
             RecommenderBackend::Local => unreachable!(),
         })
         .and_then(validate_exercise_profile)
@@ -978,34 +988,48 @@ fn parse_codex_jsonl(output: &str) -> Result<(String, Option<RecommenderTokenUsa
 fn call_openai_queue(
     store: &Store,
     config: &Config,
+    paths: &Paths,
     prompt: &str,
     needed: u32,
 ) -> Result<LlmRecommendationBatch> {
     let body = openai_queue_request_body(config, prompt, needed)?;
-    call_openai_json(store, config, body).context("parsing OpenAI recommendation queue")
+    call_openai_json(store, config, paths, body).context("parsing OpenAI recommendation queue")
 }
 
 fn call_openai_exercise_profile(
     store: &Store,
     config: &Config,
+    paths: &Paths,
     prompt: &str,
 ) -> Result<LlmExerciseProfile> {
     let body = openai_exercise_profile_request_body(config, prompt)?;
-    call_openai_json(store, config, body).context("parsing OpenAI exercise profile")
+    call_openai_json(store, config, paths, body).context("parsing OpenAI exercise profile")
 }
 
-fn call_openai_json<T>(store: &Store, config: &Config, body: serde_json::Value) -> Result<T>
+fn call_openai_json<T>(
+    store: &Store,
+    config: &Config,
+    paths: &Paths,
+    body: serde_json::Value,
+) -> Result<T>
 where
     T: for<'de> Deserialize<'de>,
 {
-    let api_key = std::env::var(&config.recommender.openai.api_key_env)
-        .with_context(|| format!("missing {}", config.recommender.openai.api_key_env))?;
+    let api_key = match config.recommender.backend {
+        RecommenderBackend::OpenaiEnv => std::env::var(&config.recommender.openai.api_key_env)
+            .map(zeroize::Zeroizing::new)
+            .with_context(|| format!("missing {}", config.recommender.openai.api_key_env))?,
+        RecommenderBackend::OpenaiKeyring => secrets::openai_api_key(paths)?
+            .filter(|key| !key.trim().is_empty())
+            .context("no OpenAI API key is saved in Svarog Settings")?,
+        _ => unreachable!(),
+    };
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_millis(config.recommender.timeout_ms))
         .build()?;
     let response: serde_json::Value = client
         .post("https://api.openai.com/v1/responses")
-        .bearer_auth(api_key)
+        .bearer_auth(api_key.as_str())
         .json(&body)
         .send()
         .context("calling OpenAI Responses API")?

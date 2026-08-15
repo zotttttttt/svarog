@@ -9,6 +9,7 @@ use crate::models::{
     AppStateKind, ForgeActivitySummary, Recommendation, RecommenderTokenProvider,
     RecommenderTokenUsageByProvider, SetStatus,
 };
+use crate::secrets::{self, PendingSecretChange};
 use crate::storage::{ForgeHistoryEntry, Store};
 use anyhow::{Context, Result};
 use chrono::{Datelike, Duration as ChronoDuration, Local};
@@ -33,6 +34,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use zeroize::Zeroizing;
 
 type Spark = (usize, usize, char, bool);
 
@@ -181,24 +183,40 @@ struct TuiState {
     settings_regeneration: bool,
     forge_now_feedback: Option<String>,
     demo: bool,
+    saved_openai_key_available: Option<bool>,
     settings: Option<SettingsState>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct SettingsState {
     draft: Config,
     row: usize,
     editing: bool,
-    edit_value: String,
+    edit_value: Zeroizing<String>,
     edit_cursor: usize,
     edit_scroll: usize,
     selecting_archetype: bool,
     custom_archetype: bool,
     archetype_original: Option<Forge>,
+    saved_openai_key_present: bool,
+    saved_openai_key_error: Option<String>,
+    pending_openai_key: Option<PendingSecretChange>,
     error: Option<String>,
 }
 
-const SETTINGS_ROWS: usize = 15;
+impl std::fmt::Debug for SettingsState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SettingsState")
+            .field("row", &self.row)
+            .field("editing", &self.editing)
+            .field("edit_value", &"[REDACTED]")
+            .field("pending_openai_key", &self.pending_openai_key)
+            .finish_non_exhaustive()
+    }
+}
+
+const SETTINGS_ROWS: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum QueueRegenerationFeedback {
@@ -238,6 +256,10 @@ enum ArchetypeSelectorContext {
 }
 
 pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
+    let saved_openai_key_available = config::load_or_default(&env.paths)
+        .ok()
+        .filter(|config| config.recommender.backend == RecommenderBackend::OpenaiKeyring)
+        .and_then(|_| secrets::has_openai_api_key(&env.paths).ok());
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     let keyboard_enhancement = matches!(supports_keyboard_enhancement(), Ok(true));
@@ -252,6 +274,7 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
     let mut ui = TuiState {
         demo: env.mode == RuntimeMode::Dev,
+        saved_openai_key_available,
         ..TuiState::default()
     };
     let mut last_spark_toggle = Instant::now();
@@ -267,7 +290,7 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
         }
 
         poll_queue_regeneration(&mut ui);
-        let view = load_view(&env.paths);
+        let view = load_view(&env.paths, ui.saved_openai_key_available);
         if view.kind == ViewKind::Forge {
             ui.show_history = false;
             ui.show_next = false;
@@ -305,16 +328,26 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
                     && key.code == KeyCode::Char('s')
                 {
                     if let Ok(draft) = config::load_or_default(&env.paths) {
+                        let saved_openai_key = secrets::has_openai_api_key(&env.paths);
+                        let (saved_openai_key_present, saved_openai_key_error) =
+                            match saved_openai_key {
+                                Ok(present) => (present, None),
+                                Err(error) => (false, Some(error.to_string())),
+                            };
+                        ui.saved_openai_key_available = Some(saved_openai_key_present);
                         ui.settings = Some(SettingsState {
                             draft,
                             row: 0,
                             editing: false,
-                            edit_value: String::new(),
+                            edit_value: Zeroizing::new(String::new()),
                             edit_cursor: 0,
                             edit_scroll: 0,
                             selecting_archetype: false,
                             custom_archetype: false,
                             archetype_original: None,
+                            saved_openai_key_present,
+                            saved_openai_key_error,
+                            pending_openai_key: None,
                             error: None,
                         });
                     }
@@ -486,8 +519,8 @@ fn apply_queue_regeneration_start(ui: &mut TuiState, start: QueueRegenerationSta
     }
 }
 
-fn load_view(paths: &Paths) -> ViewModel {
-    let backend = recommender_backend_view(paths);
+fn load_view(paths: &Paths, saved_openai_key_available: Option<bool>) -> ViewModel {
+    let backend = recommender_backend_view(paths, saved_openai_key_available);
     let Ok(store) = Store::open(&paths.database_file) else {
         return ViewModel {
             kind: ViewKind::Idle,
@@ -531,7 +564,10 @@ fn load_view(paths: &Paths) -> ViewModel {
     }
 }
 
-fn recommender_backend_view(paths: &Paths) -> BackendView {
+fn recommender_backend_view(
+    paths: &Paths,
+    saved_openai_key_available: Option<bool>,
+) -> BackendView {
     let config_file = paths.config_file.display().to_string();
     if !paths.config_file.exists() {
         return BackendView {
@@ -549,16 +585,17 @@ fn recommender_backend_view(paths: &Paths) -> BackendView {
     };
     BackendView {
         label: config.recommender.backend.label().to_string(),
-        unavailable: !backend_available(&config),
+        unavailable: !backend_available(&config, saved_openai_key_available),
         config_file,
     }
 }
 
-fn backend_available(config: &config::Config) -> bool {
+fn backend_available(config: &config::Config, saved_openai_key_available: Option<bool>) -> bool {
     match config.recommender.backend {
         RecommenderBackend::Codex => command_available(&config.recommender.codex.command),
-        RecommenderBackend::Openai => std::env::var(&config.recommender.openai.api_key_env)
+        RecommenderBackend::OpenaiEnv => std::env::var(&config.recommender.openai.api_key_env)
             .is_ok_and(|value| !value.trim().is_empty()),
+        RecommenderBackend::OpenaiKeyring => saved_openai_key_available.unwrap_or(false),
         RecommenderBackend::Local => true,
     }
 }
@@ -929,6 +966,22 @@ fn settings_lines(
         ),
         ("Injuries / limitations", profile.injuries.join(", ")),
         ("Exercise preferences", profile.exercise_preferences.clone()),
+        (
+            "Saved OpenAI key",
+            match settings.pending_openai_key.as_ref() {
+                Some(PendingSecretChange::Set(_)) => {
+                    "configured (pending)  [enter] Replace  [del] Remove".into()
+                }
+                Some(PendingSecretChange::Delete) => "remove pending  [enter] Set".into(),
+                None if settings.saved_openai_key_error.is_some() => {
+                    "credential store unavailable  [enter] Retry".into()
+                }
+                None if settings.saved_openai_key_present => {
+                    "configured  [enter] Replace  [del] Remove".into()
+                }
+                None => "not set  [enter] Set".into(),
+            },
+        ),
     ];
     let mut lines = vec![
         with_demo(Line::from(Span::styled("Settings", text_bold())), demo),
@@ -973,13 +1026,18 @@ fn settings_lines(
         ]));
     }
     if settings.editing {
+        let displayed_edit_value = if settings.row == 15 {
+            "•".repeat(settings.edit_value.chars().count())
+        } else {
+            settings.edit_value.to_string()
+        };
         lines.extend([
             Line::from(""),
             Line::from(Span::styled(
                 format!(
                     "> {}",
                     editor_window(
-                        &settings.edit_value,
+                        &displayed_edit_value,
                         settings.edit_cursor,
                         settings.edit_scroll,
                         usize::from(area_width).saturating_sub(3).max(1),
@@ -988,7 +1046,11 @@ fn settings_lines(
                 accent(),
             )),
             Line::from(Span::styled(
-                "[enter] Set field  [esc] Cancel edit",
+                if settings.row == 15 {
+                    "[enter] Stage key  [esc] Cancel edit"
+                } else {
+                    "[enter] Set field  [esc] Cancel edit"
+                },
                 muted(),
             )),
         ]);
@@ -1012,7 +1074,7 @@ fn fitted_modal_lines(lines: Vec<Line<'static>>, height: usize) -> Vec<Line<'sta
 }
 
 fn begin_setting_edit(settings: &mut SettingsState) {
-    settings.edit_value = match settings.row {
+    settings.edit_value = Zeroizing::new(match settings.row {
         5 => settings
             .draft
             .profile
@@ -1048,8 +1110,9 @@ fn begin_setting_edit(settings: &mut SettingsState) {
         12 => settings.draft.profile.cautious_body_parts.join(", "),
         13 => settings.draft.profile.injuries.join(", "),
         14 => settings.draft.profile.exercise_preferences.clone(),
+        15 => String::new(),
         _ => return,
-    };
+    });
     settings.editing = true;
     settings.edit_cursor = settings.edit_value.chars().count();
     settings.edit_scroll = settings.edit_cursor.saturating_sub(20);
@@ -1239,17 +1302,44 @@ fn commit_setting_edit(settings: &mut SettingsState) -> Result<()> {
                 value.into()
             }
         }
+        15 => {
+            if value.is_empty() {
+                settings.error = Some("OpenAI API key cannot be empty".into());
+                return Ok(());
+            }
+            settings.pending_openai_key = Some(PendingSecretChange::Set(zeroize::Zeroizing::new(
+                value.to_string(),
+            )));
+        }
         _ => {}
     }
     settings.editing = false;
+    settings.edit_value = Zeroizing::new(String::new());
     settings.error = None;
     Ok(())
 }
 
-fn apply_settings(env: &RuntimeEnv, draft: &Config) -> Result<Receiver<QueueRegenerationResult>> {
+fn apply_settings(
+    env: &RuntimeEnv,
+    draft: &Config,
+    secret_change: Option<&PendingSecretChange>,
+) -> Result<Receiver<QueueRegenerationResult>> {
     let previous = config::load_or_default(&env.paths)?;
     let config_existed = env.paths.config_file.exists();
-    config::save(&env.paths, draft)?;
+    let previous_key = if secret_change.is_some() {
+        secrets::openai_api_key(&env.paths)?
+    } else {
+        None
+    };
+    if let Some(change) = secret_change {
+        secrets::apply_openai_api_key_change(&env.paths, change)?;
+    }
+    if let Err(error) = config::save(&env.paths, draft) {
+        if secret_change.is_some() {
+            restore_openai_key(&env.paths, previous_key.as_deref().map(String::as_str))?;
+        }
+        return Err(error);
+    }
     let equipment = exercise_catalog::locally_resolved_equipment(&draft.profile.equipment_text);
     let movements = exercise_catalog::movements_for_equipment(&equipment);
     let database_result = Store::open(&env.paths.database_file)
@@ -1261,14 +1351,34 @@ fn apply_settings(env: &RuntimeEnv, draft: &Config) -> Result<Receiver<QueueRege
             std::fs::remove_file(&env.paths.config_file)
                 .with_context(|| format!("removing {}", env.paths.config_file.display()))
         };
-        return match rollback {
-            Ok(()) => Err(error.context("applying settings; previous configuration restored")),
-            Err(rollback_error) => Err(anyhow::anyhow!(
-                "applying settings failed: {error}; restoring the previous configuration also failed: {rollback_error}"
+        let secret_rollback = if secret_change.is_some() {
+            restore_openai_key(&env.paths, previous_key.as_deref().map(String::as_str))
+        } else {
+            Ok(())
+        };
+        return match (rollback, secret_rollback) {
+            (Ok(()), Ok(())) => {
+                Err(error.context("applying settings; previous configuration restored"))
+            }
+            (config_rollback, secret_rollback) => Err(anyhow::anyhow!(
+                "applying settings failed: {error}; config rollback: {}; credential rollback: {}",
+                config_rollback
+                    .err()
+                    .map_or_else(|| "ok".into(), |error| error.to_string()),
+                secret_rollback
+                    .err()
+                    .map_or_else(|| "ok".into(), |error| error.to_string())
             )),
         };
     }
     Ok(daemon::regenerate_queue_after_settings(env))
+}
+
+fn restore_openai_key(paths: &Paths, previous: Option<&str>) -> Result<()> {
+    let change = previous.map_or(PendingSecretChange::Delete, |secret| {
+        PendingSecretChange::Set(Zeroizing::new(secret.to_string()))
+    });
+    secrets::apply_openai_api_key_change(paths, &change)
 }
 
 fn handle_settings_key(
@@ -1355,7 +1465,10 @@ fn handle_settings_key(
             return Ok(());
         }
         match code {
-            KeyCode::Esc => settings.editing = false,
+            KeyCode::Esc => {
+                settings.editing = false;
+                settings.edit_value = Zeroizing::new(String::new());
+            }
             KeyCode::Enter => {
                 commit_setting_edit(settings)?;
             }
@@ -1378,8 +1491,23 @@ fn handle_settings_key(
         return Ok(());
     }
     if settings_apply_requested(code, modifiers) {
+        let saved_key_available = match settings.pending_openai_key.as_ref() {
+            Some(PendingSecretChange::Set(secret)) => !secret.trim().is_empty(),
+            Some(PendingSecretChange::Delete) => false,
+            None => settings.saved_openai_key_present,
+        };
+        if settings.draft.recommender.backend == RecommenderBackend::OpenaiKeyring
+            && !saved_key_available
+        {
+            settings.error = settings.saved_openai_key_error.clone().or_else(|| {
+                Some("Set a saved OpenAI key before choosing OpenAI (saved key)".into())
+            });
+            return Ok(());
+        }
         let draft = settings.draft.clone();
-        let receiver = apply_settings(env, &draft)?;
+        let pending_openai_key = settings.pending_openai_key.clone();
+        let receiver = apply_settings(env, &draft, pending_openai_key.as_ref())?;
+        ui.saved_openai_key_available = Some(saved_key_available);
         ui.settings = None;
         ui.status_message = Some("Settings saved. Refreshing future forges…".into());
         apply_queue_regeneration_start(ui, QueueRegenerationStart::Started(receiver));
@@ -1390,6 +1518,10 @@ fn handle_settings_key(
         KeyCode::Esc => ui.settings = None,
         KeyCode::Up => settings.row = settings.row.saturating_sub(1),
         KeyCode::Down => settings.row = (settings.row + 1).min(SETTINGS_ROWS - 1),
+        KeyCode::Delete if settings.row == 15 => {
+            settings.pending_openai_key = Some(PendingSecretChange::Delete);
+            settings.error = None;
+        }
         KeyCode::Left | KeyCode::Right => {
             let forward = code == KeyCode::Right;
             match settings.row {
@@ -1618,11 +1750,17 @@ fn idle_lines(
     ));
     lines.push(Line::from(""));
     lines.push(recommender_line(backend));
+    if backend.label == RecommenderBackend::Local.label() {
+        lines.push(Line::from(Span::styled(
+            "Tip: Use Codex/OpenAI key recommender in Settings.",
+            muted(),
+        )));
+    }
     lines.extend(activity_lines(activity));
     lines.extend(recommender_usage_lines(backend, token_usage));
     if backend.unavailable {
         lines.push(Line::from(Span::styled(
-            format!("Unavailable. Edit: {}", backend.config_file),
+            unavailable_backend_message(backend),
             muted(),
         )));
     }
@@ -1666,7 +1804,7 @@ fn cooldown_lines(
     lines.extend(recommender_usage_lines(backend, token_usage));
     if backend.unavailable {
         lines.push(Line::from(Span::styled(
-            format!("Unavailable. Edit: {}", backend.config_file),
+            unavailable_backend_message(backend),
             muted(),
         )));
     }
@@ -1703,13 +1841,23 @@ fn activity_lines(activity: &ForgeActivitySummary) -> Vec<Line<'static>> {
     ]
 }
 
+fn unavailable_backend_message(backend: &BackendView) -> String {
+    if backend.label == RecommenderBackend::OpenaiKeyring.label() {
+        "Unavailable. Open Settings to save an OpenAI API key.".into()
+    } else {
+        format!("Unavailable. Edit: {}", backend.config_file)
+    }
+}
+
 fn recommender_usage_lines(
     backend: &BackendView,
     usage: &RecommenderTokenUsageByProvider,
 ) -> Vec<Line<'static>> {
     let (title, usage, show_api_hint) = if backend.label == RecommenderBackend::Codex.label() {
         ("Svarog Codex tokens (in/out)", &usage.codex, true)
-    } else if backend.label == RecommenderBackend::Openai.label() {
+    } else if backend.label == RecommenderBackend::OpenaiEnv.label()
+        || backend.label == RecommenderBackend::OpenaiKeyring.label()
+    {
         ("Svarog OpenAI API tokens (in/out)", &usage.openai, false)
     } else {
         return Vec::new();
@@ -1749,7 +1897,7 @@ fn recommender_usage_lines(
             )),
             Line::from(Span::styled("export OPENAI_API_KEY=\"...\"", muted())),
             Line::from(Span::styled(
-                "Restart Svarog, then select [OpenAI API] with →.",
+                "Restart Svarog, then select [OpenAI (environment)] in Settings.",
                 muted(),
             )),
         ]);
@@ -2220,12 +2368,15 @@ mod tests {
             draft: Config::default(),
             row: 0,
             editing: false,
-            edit_value: String::new(),
+            edit_value: Zeroizing::new(String::new()),
             edit_cursor: 0,
             edit_scroll: 0,
             selecting_archetype: false,
             custom_archetype: false,
             archetype_original: None,
+            saved_openai_key_present: false,
+            saved_openai_key_error: None,
+            pending_openai_key: None,
             error: None,
         }
     }
@@ -2286,9 +2437,78 @@ mod tests {
         let mut settings = settings_state();
         settings.row = 8;
         begin_setting_edit(&mut settings);
-        settings.edit_value = "mobility, strength".into();
+        settings.edit_value = Zeroizing::new("mobility, strength".into());
         commit_setting_edit(&mut settings).unwrap();
         assert_eq!(settings.draft.profile.goals, vec!["mobility", "strength"]);
+    }
+
+    #[test]
+    fn saved_openai_key_editor_masks_and_stages_the_secret() {
+        let mut settings = settings_state();
+        settings.row = 15;
+        begin_setting_edit(&mut settings);
+        settings.edit_value = Zeroizing::new("sk-never-render-this".into());
+        settings.edit_cursor = settings.edit_value.chars().count();
+
+        let rendered = settings_lines(&settings, false, 120, 40)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!rendered.contains("sk-never-render-this"));
+        assert!(rendered.contains('•'));
+
+        commit_setting_edit(&mut settings).unwrap();
+        assert!(matches!(
+            settings.pending_openai_key,
+            Some(PendingSecretChange::Set(_))
+        ));
+        assert!(settings.edit_value.is_empty());
+        assert!(!format!("{settings:?}").contains("sk-never-render-this"));
+        assert!(!toml::to_string(&settings.draft)
+            .unwrap()
+            .contains("sk-never-render-this"));
+    }
+
+    #[test]
+    fn saved_openai_key_can_be_staged_for_removal() {
+        let root = tempdir().unwrap().keep();
+        let env = test_env(root);
+        let mut settings = settings_state();
+        settings.row = 15;
+        settings.saved_openai_key_present = true;
+        let mut ui = TuiState {
+            settings: Some(settings),
+            ..TuiState::default()
+        };
+
+        handle_settings_key(&mut ui, KeyCode::Delete, KeyModifiers::NONE, &env).unwrap();
+
+        assert!(matches!(
+            ui.settings.as_ref().unwrap().pending_openai_key,
+            Some(PendingSecretChange::Delete)
+        ));
+    }
+
+    #[test]
+    fn saved_key_backend_cannot_apply_without_a_key() {
+        let root = tempdir().unwrap().keep();
+        let env = test_env(root);
+        let mut settings = settings_state();
+        settings.draft.recommender.backend = RecommenderBackend::OpenaiKeyring;
+        let mut ui = TuiState {
+            settings: Some(settings),
+            ..TuiState::default()
+        };
+
+        handle_settings_key(&mut ui, KeyCode::Char('s'), KeyModifiers::CONTROL, &env).unwrap();
+
+        let settings = ui.settings.as_ref().unwrap();
+        assert!(settings
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("Set a saved OpenAI key"));
     }
 
     #[test]
@@ -2327,7 +2547,7 @@ mod tests {
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(bottom.contains("› Exercise preferences"));
+        assert!(bottom.contains("› Saved OpenAI key"));
         assert!(bottom.contains("[ctrl/cmd+s] Apply changes  [esc] Cancel settings"));
         assert!(!bottom.contains("Forge archetype"));
     }
@@ -2438,7 +2658,7 @@ mod tests {
             let mut settings = settings_state();
             settings.row = 5;
             settings.draft.profile.unit_system = UnitSystem::Imperial;
-            settings.edit_value = value.into();
+            settings.edit_value = Zeroizing::new(value.into());
             commit_setting_edit(&mut settings).unwrap();
             assert_eq!(
                 settings.draft.profile.height_cm,
@@ -2528,7 +2748,7 @@ mod tests {
         let mut draft = previous.clone();
         draft.profile.goals = vec!["changed".into()];
 
-        assert!(apply_settings(&env, &draft).is_err());
+        assert!(apply_settings(&env, &draft, None).is_err());
         assert_eq!(
             config::load_or_default(&env.paths).unwrap().profile.goals,
             previous.profile.goals
@@ -2543,7 +2763,7 @@ mod tests {
         draft.recommender.backend = RecommenderBackend::Local;
         draft.profile.goals = vec!["mobility".into()];
 
-        let receiver = apply_settings(&env, &draft).unwrap();
+        let receiver = apply_settings(&env, &draft, None).unwrap();
         assert!(receiver
             .recv_timeout(Duration::from_secs(5))
             .unwrap()
@@ -2624,7 +2844,7 @@ mod tests {
         assert!(text.contains("Week 0 forges / 0 reps"));
         assert!(text.contains("Use fewer Codex tokens with an OpenAI API key"));
         assert!(text.contains("export OPENAI_API_KEY=\"...\""));
-        assert!(text.contains("Restart Svarog, then select [OpenAI API] with →."));
+        assert!(text.contains("Restart Svarog, then select [OpenAI (environment)] in Settings."));
         assert!(!text.contains("sets"));
     }
 
@@ -2682,6 +2902,31 @@ mod tests {
                     < text.find("Svarog Codex tokens (in/out)").unwrap()
             );
         }
+    }
+
+    #[test]
+    fn local_backend_hint_appears_only_on_the_idle_screen() {
+        let backend = BackendView {
+            label: RecommenderBackend::Local.label().into(),
+            unavailable: false,
+            config_file: "/tmp/config.toml".into(),
+        };
+        let activity = ForgeActivitySummary::default();
+        let usage = RecommenderTokenUsageByProvider::default();
+        let hint = "Tip: Use Codex/OpenAI key recommender in Settings.";
+        let idle = idle_lines(&backend, &activity, &usage, None, None, None, None, false)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let cooldown = cooldown_lines(&backend, &activity, &usage, None, None, None, None, false)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(idle.contains(&format!("Recommender: [Local]  [s] Settings\n{hint}")));
+        assert!(!cooldown.contains(hint));
     }
 
     #[test]
@@ -3193,7 +3438,7 @@ mod tests {
     fn missing_config_uses_unknown_backend_label() {
         let root = tempdir().unwrap().keep();
         let paths = Paths::from_root(root);
-        let backend = recommender_backend_view(&paths);
+        let backend = recommender_backend_view(&paths, None);
 
         assert_eq!(backend.label, "unknown");
         assert!(backend.unavailable);
@@ -3212,7 +3457,7 @@ mod tests {
         };
         config::save(&paths, &config).unwrap();
 
-        let backend = recommender_backend_view(&paths);
+        let backend = recommender_backend_view(&paths, None);
 
         assert_eq!(backend.label, "Local");
         assert!(!backend.unavailable);
@@ -3220,8 +3465,18 @@ mod tests {
 
     #[test]
     fn backend_cycle_order_matches_tui_shortcut() {
-        assert_eq!(RecommenderBackend::Local.next(), RecommenderBackend::Openai);
-        assert_eq!(RecommenderBackend::Openai.next(), RecommenderBackend::Codex);
+        assert_eq!(
+            RecommenderBackend::Local.next(),
+            RecommenderBackend::OpenaiEnv
+        );
+        assert_eq!(
+            RecommenderBackend::OpenaiEnv.next(),
+            RecommenderBackend::OpenaiKeyring
+        );
+        assert_eq!(
+            RecommenderBackend::OpenaiKeyring.next(),
+            RecommenderBackend::Codex
+        );
         assert_eq!(RecommenderBackend::Codex.next(), RecommenderBackend::Local);
         assert_eq!(
             RecommenderBackend::Local.previous(),
@@ -3229,10 +3484,14 @@ mod tests {
         );
         assert_eq!(
             RecommenderBackend::Codex.previous(),
-            RecommenderBackend::Openai
+            RecommenderBackend::OpenaiKeyring
         );
         assert_eq!(
-            RecommenderBackend::Openai.previous(),
+            RecommenderBackend::OpenaiKeyring.previous(),
+            RecommenderBackend::OpenaiEnv
+        );
+        assert_eq!(
+            RecommenderBackend::OpenaiEnv.previous(),
             RecommenderBackend::Local
         );
     }
@@ -3244,7 +3503,7 @@ mod tests {
         let paths = Paths::from_root(root);
         let mut config = Config {
             recommender: Recommender {
-                backend: RecommenderBackend::Openai,
+                backend: RecommenderBackend::OpenaiEnv,
                 ..Recommender::default()
             },
             ..Config::default()
@@ -3252,16 +3511,16 @@ mod tests {
         config.recommender.openai.api_key_env = "SVAROG_TEST_MISSING_OPENAI_KEY".to_string();
         config::save(&paths, &config).unwrap();
 
-        let backend = recommender_backend_view(&paths);
+        let backend = recommender_backend_view(&paths, None);
 
-        assert_eq!(backend.label, "OpenAI API");
+        assert_eq!(backend.label, "OpenAI (environment)");
         assert!(backend.unavailable);
     }
 
     #[test]
     fn unavailable_backend_lines_include_config_path() {
         let backend = BackendView {
-            label: "OpenAI API".to_string(),
+            label: "OpenAI (environment)".to_string(),
             unavailable: true,
             config_file: "/tmp/svarog/config.toml".to_string(),
         };
@@ -3280,7 +3539,7 @@ mod tests {
         .collect::<Vec<_>>()
         .join("\n");
 
-        assert!(text.contains("Recommender: [OpenAI API]"));
+        assert!(text.contains("Recommender: [OpenAI (environment)]"));
         assert!(text.contains("Unavailable. Edit: /tmp/svarog/config.toml"));
         assert!(text.contains("Svarog OpenAI API tokens"));
         assert!(!text.contains("Svarog Codex tokens"));
@@ -3310,7 +3569,7 @@ mod tests {
         };
 
         let openai = BackendView {
-            label: "OpenAI API".into(),
+            label: "OpenAI (environment)".into(),
             unavailable: false,
             config_file: "/tmp/svarog/config.toml".into(),
         };

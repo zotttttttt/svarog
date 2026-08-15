@@ -3,6 +3,7 @@ use crate::daemon;
 use crate::hooks;
 use crate::models::{Agent, AppStateKind, IncomingEvent, MovementStatus, SetStatus};
 use crate::recommender;
+use crate::secrets;
 use crate::session;
 use crate::stop;
 use crate::storage::Store;
@@ -106,7 +107,13 @@ pub async fn run() -> Result<()> {
             reset,
         }) => {
             let setup_env = RuntimeEnv::load_with_options(dev, dry_run)?;
-            setup(&setup_env, reset)
+            setup(&setup_env, reset)?;
+            if setup_env.dry_run {
+                Ok(())
+            } else {
+                wait_for_tui("Press Enter to open the Svarog TUI: ")?;
+                run_tui(&setup_env).await
+            }
         }
         Some(Command::Init) => init(&env),
         Some(Command::Calibrate) => calibrate(&env),
@@ -235,12 +242,24 @@ fn setup_pending(env: &RuntimeEnv) -> Result<()> {
 }
 
 fn reset_user_data(env: &RuntimeEnv) -> Result<()> {
+    let warning =
+        reset_user_data_with_cleanup(env, || secrets::cleanup_openai_api_key(&env.paths))?;
+    println!("All Svarog user data was reset. Starting onboarding from the beginning.");
+    if let Some(error) = warning {
+        eprintln!("{}", credential_cleanup_warning("Svarog data", &error));
+    }
+    Ok(())
+}
+
+fn reset_user_data_with_cleanup<F>(env: &RuntimeEnv, cleanup: F) -> Result<Option<String>>
+where
+    F: FnOnce() -> Option<String>,
+{
     let config = Config::default();
     config::save(&env.paths, &config)?;
     let store = Store::open(&env.paths.database_file)?;
     store.reset_all_data()?;
-    println!("All Svarog user data was reset. Starting onboarding from the beginning.");
-    Ok(())
+    Ok(cleanup())
 }
 
 fn finish_setup(env: &RuntimeEnv, config: &Config) -> Result<()> {
@@ -359,9 +378,14 @@ async fn run_demo(_remove_data: bool) -> Result<()> {
 
     if reset {
         if root.exists() {
-            remove_demo_data(&root)?;
+            let warning = remove_demo_data_with_cleanup(&root, || {
+                secrets::cleanup_openai_api_key(&env.paths)
+            })?;
             println!("Removed demo data: {}", root.display());
             println!("This cannot be recovered. Production data was not changed.");
+            if let Some(error) = warning {
+                eprintln!("{}", credential_cleanup_warning("Demo data", &error));
+            }
             println!();
         }
         setup(&env, false)?;
@@ -426,6 +450,20 @@ fn remove_demo_data(root: &Path) -> Result<()> {
         );
     }
     fs::remove_dir_all(root).with_context(|| format!("removing {}", root.display()))
+}
+
+fn remove_demo_data_with_cleanup<F>(root: &Path, cleanup: F) -> Result<Option<String>>
+where
+    F: FnOnce() -> Option<String>,
+{
+    remove_demo_data(root)?;
+    Ok(cleanup())
+}
+
+fn credential_cleanup_warning(data_label: &str, error: &str) -> String {
+    format!(
+        "Warning: {data_label} was reset, but the saved OpenAI API key could not be removed from the operating system credential store: {error}. Remove the Svarog OpenAI credential manually from Keychain or Secret Service."
+    )
 }
 
 fn wait_for_tui(prompt: &str) -> Result<()> {
@@ -599,10 +637,6 @@ fn collect_profile(config: &mut Config, paths: &config::Paths, all: bool) -> Res
             Ok(())
         },
     )?;
-    onboarding_step(config, paths, config::STEP_CODEX_COMMAND, all, |config| {
-        config.agents.codex_command = prompt_string("Codex command", &config.agents.codex_command)?;
-        Ok(())
-    })?;
     onboarding_step(
         config,
         paths,
@@ -1507,7 +1541,9 @@ mod tests {
         store.exclude_exercise("Plank").unwrap();
         drop(store);
 
-        reset_user_data(&env).unwrap();
+        let cleanup_warning =
+            reset_user_data_with_cleanup(&env, || Some("credential store is locked".into()))
+                .unwrap();
 
         let reset_config = config::load_or_default(&env.paths).unwrap();
         assert_eq!(reset_config.profile.height_cm, None);
@@ -1519,6 +1555,14 @@ mod tests {
         assert_eq!(store.event_count().unwrap(), 0);
         assert!(store.removed_exercise_ids().unwrap().is_empty());
         assert_eq!(store.state().unwrap().kind, AppStateKind::Idle);
+        assert_eq!(
+            cleanup_warning.as_deref(),
+            Some("credential store is locked")
+        );
+        let warning =
+            credential_cleanup_warning("Svarog data", cleanup_warning.as_deref().unwrap());
+        assert!(warning.starts_with("Warning: Svarog data was reset"));
+        assert!(warning.contains("Remove the Svarog OpenAI credential manually"));
     }
 
     #[test]
@@ -1546,12 +1590,22 @@ mod tests {
         fs::write(demo.join("svarog/config.toml"), "demo").unwrap();
         fs::write(production.join("history.sqlite3"), "keep").unwrap();
 
-        remove_demo_data(&demo).unwrap();
+        let cleanup_warning =
+            remove_demo_data_with_cleanup(&demo, || Some("Secret Service is unavailable".into()))
+                .unwrap();
 
         assert!(!demo.exists());
         assert_eq!(
             fs::read_to_string(production.join("history.sqlite3")).unwrap(),
             "keep"
+        );
+        assert_eq!(
+            cleanup_warning.as_deref(),
+            Some("Secret Service is unavailable")
+        );
+        assert!(
+            credential_cleanup_warning("Demo data", cleanup_warning.as_deref().unwrap())
+                .starts_with("Warning: Demo data was reset")
         );
     }
 
@@ -1560,9 +1614,15 @@ mod tests {
         let project = tempdir().unwrap();
         let invalid = project.path().join("production");
         fs::create_dir_all(&invalid).unwrap();
+        let cleanup_called = std::cell::Cell::new(false);
 
-        assert!(remove_demo_data(&invalid).is_err());
+        assert!(remove_demo_data_with_cleanup(&invalid, || {
+            cleanup_called.set(true);
+            None
+        })
+        .is_err());
         assert!(invalid.exists());
+        assert!(!cleanup_called.get());
     }
 
     #[test]
@@ -1592,7 +1652,11 @@ mod tests {
         );
         assert_eq!(
             "openai".parse::<RecommenderBackend>().unwrap(),
-            RecommenderBackend::Openai
+            RecommenderBackend::OpenaiEnv
+        );
+        assert_eq!(
+            "openai_keyring".parse::<RecommenderBackend>().unwrap(),
+            RecommenderBackend::OpenaiKeyring
         );
         assert_eq!(
             "local".parse::<RecommenderBackend>().unwrap(),

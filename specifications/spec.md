@@ -328,7 +328,6 @@ Collect:
 * injuries or hard limitations
 * Forge archetype
 * daily safety ceiling
-* Codex command
 * exercise preferences as natural-language text
 
 Store in:
@@ -392,7 +391,7 @@ Backends:
 
 ```toml
 [recommender]
-backend = "codex" # codex, openai, local, off
+backend = "codex" # codex, openai_env, openai_keyring, local
 timeout_ms = 60000
 local_fallback = true
 show_llm_failures = true
@@ -412,7 +411,7 @@ Codex recommendation calls use one timeout budget. An early failure of the
 configured model retries once with the user's inherited Codex model; timeout or
 completed-turn failures go directly to the configured local fallback.
 
-The OpenAI backend must use the Responses API with structured JSON output, not legacy text generation. The recommender prompt returns one strict JSON object with either `recommend` or `no_recommendation`. Rust validation remains authoritative for fit, cooldown, repetition, injury conflicts, and max set size.
+The OpenAI backends must use the Responses API with structured JSON output, not legacy text generation. `openai_env` reads `api_key_env`; `openai_keyring` reads a key saved through Svarog Settings and protected by macOS Keychain or Linux Secret Service. Keys must never be serialized to Svarog configuration or workout storage. The legacy `openai` backend value migrates to `openai_env`. The recommender prompt returns one strict JSON object with either `recommend` or `no_recommendation`. Rust validation remains authoritative for fit, cooldown, repetition, injury conflicts, and max set size.
 
 Recommender prompts are MiniJinja files. Bundled defaults live under `prompts/`;
 matching files under `~/.config/svarog/prompts/` override them and are reloaded

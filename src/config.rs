@@ -68,7 +68,7 @@ pub const ORIGINAL_ONBOARDING_STEPS: [&str; 14] = [
 ];
 
 // Add every new question here with a stable ID and increment the version above.
-pub const CURRENT_ONBOARDING_STEPS: [&str; 13] = [
+pub const CURRENT_ONBOARDING_STEPS: [&str; 12] = [
     STEP_HEIGHT,
     STEP_WEIGHT,
     STEP_AGE,
@@ -79,7 +79,6 @@ pub const CURRENT_ONBOARDING_STEPS: [&str; 13] = [
     STEP_CAUTIOUS_BODY_PARTS,
     STEP_INJURIES,
     STEP_ARCHETYPE,
-    STEP_CODEX_COMMAND,
     STEP_EXERCISE_PREFERENCES,
     STEP_DESKTOP_NOTIFICATIONS,
 ];
@@ -221,7 +220,9 @@ pub struct Recommender {
 #[serde(rename_all = "snake_case")]
 pub enum RecommenderBackend {
     Codex,
-    Openai,
+    #[serde(rename = "openai_env", alias = "openai")]
+    OpenaiEnv,
+    OpenaiKeyring,
     #[serde(alias = "off")]
     Local,
 }
@@ -230,15 +231,17 @@ impl RecommenderBackend {
     pub fn label(self) -> &'static str {
         match self {
             Self::Codex => "Codex",
-            Self::Openai => "OpenAI API",
+            Self::OpenaiEnv => "OpenAI (environment)",
+            Self::OpenaiKeyring => "OpenAI (saved key)",
             Self::Local => "Local",
         }
     }
 
     pub fn next(self) -> Self {
         match self {
-            Self::Local => Self::Openai,
-            Self::Openai => Self::Codex,
+            Self::Local => Self::OpenaiEnv,
+            Self::OpenaiEnv => Self::OpenaiKeyring,
+            Self::OpenaiKeyring => Self::Codex,
             Self::Codex => Self::Local,
         }
     }
@@ -246,8 +249,9 @@ impl RecommenderBackend {
     pub fn previous(self) -> Self {
         match self {
             Self::Local => Self::Codex,
-            Self::Codex => Self::Openai,
-            Self::Openai => Self::Local,
+            Self::Codex => Self::OpenaiKeyring,
+            Self::OpenaiKeyring => Self::OpenaiEnv,
+            Self::OpenaiEnv => Self::Local,
         }
     }
 }
@@ -258,9 +262,12 @@ impl FromStr for RecommenderBackend {
     fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
         match value.trim().to_lowercase().as_str() {
             "codex" => Ok(Self::Codex),
-            "openai" | "openai api" | "openai_api" => Ok(Self::Openai),
+            "openai" | "openai env" | "openai_env" | "openai (environment)" => Ok(Self::OpenaiEnv),
+            "openai keyring" | "openai_keyring" | "openai saved" | "openai (saved key)" => {
+                Ok(Self::OpenaiKeyring)
+            }
             "local" => Ok(Self::Local),
-            _ => Err("use one of: codex, openai, local".to_string()),
+            _ => Err("use one of: codex, openai_env, openai_keyring, local".to_string()),
         }
     }
 }
@@ -386,6 +393,13 @@ pub struct Paths {
     pub data_dir: PathBuf,
     pub config_file: PathBuf,
     pub database_file: PathBuf,
+    pub credential_scope: CredentialScope,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialScope {
+    Production,
+    Development,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -413,6 +427,7 @@ impl Paths {
             database_file: data_dir.join("svarog.sqlite3"),
             config_dir,
             data_dir,
+            credential_scope: CredentialScope::Production,
         })
     }
 
@@ -422,6 +437,7 @@ impl Paths {
             database_file: root.join("svarog.sqlite3"),
             config_dir: root.clone(),
             data_dir: root,
+            credential_scope: CredentialScope::Development,
         }
     }
 
@@ -519,7 +535,12 @@ impl RuntimeEnv {
 
 fn resolve_svarog_paths(mode: RuntimeMode) -> Result<Paths> {
     if let Ok(root) = std::env::var("SVAROG_HOME") {
-        return Ok(Paths::from_root(PathBuf::from(root)));
+        let mut paths = Paths::from_root(PathBuf::from(root));
+        paths.credential_scope = match mode {
+            RuntimeMode::Production => CredentialScope::Production,
+            RuntimeMode::Dev => CredentialScope::Development,
+        };
+        return Ok(paths);
     }
     match mode {
         RuntimeMode::Production => Paths::load(),
@@ -750,6 +771,7 @@ mod tests {
             data_dir: root.join("data"),
             config_file: root.join("config").join("config.toml"),
             database_file: root.join("data").join("svarog.sqlite3"),
+            credential_scope: CredentialScope::Development,
         };
         let mut config = Config::default();
         config.agents.codex_command = "codex --sandbox workspace-write".to_string();
@@ -866,6 +888,42 @@ mod tests {
         let migrated = fs::read_to_string(&paths.config_file).unwrap();
         assert!(migrated.contains("backend = \"local\""));
         assert!(!migrated.contains("backend = \"off\""));
+    }
+
+    #[test]
+    fn legacy_openai_backend_migrates_to_explicit_environment_source() {
+        let root = tempdir().unwrap();
+        let paths = Paths::from_root(root.path().join("svarog"));
+        let serialized = toml::to_string_pretty(&Config::default())
+            .unwrap()
+            .replace("backend = \"local\"", "backend = \"openai\"");
+        paths.ensure().unwrap();
+        fs::write(&paths.config_file, serialized).unwrap();
+
+        let config = load_or_default(&paths).unwrap();
+
+        assert_eq!(config.recommender.backend, RecommenderBackend::OpenaiEnv);
+        save(&paths, &config).unwrap();
+        let migrated = fs::read_to_string(&paths.config_file).unwrap();
+        assert!(migrated.contains("backend = \"openai_env\""));
+        assert!(!migrated.contains("backend = \"openai\""));
+    }
+
+    #[test]
+    fn codex_command_is_configurable_but_not_a_current_onboarding_step() {
+        assert!(!CURRENT_ONBOARDING_STEPS.contains(&STEP_CODEX_COMMAND));
+        assert!(ORIGINAL_ONBOARDING_STEPS.contains(&STEP_CODEX_COMMAND));
+
+        let root = tempdir().unwrap();
+        let paths = Paths::from_root(root.path().join("svarog"));
+        let mut config = Config::default();
+        config.agents.codex_command = "custom-codex".into();
+        save(&paths, &config).unwrap();
+
+        assert_eq!(
+            load_or_default(&paths).unwrap().agents.codex_command,
+            "custom-codex"
+        );
     }
 
     #[test]
@@ -1009,6 +1067,7 @@ mod tests {
             data_dir: root.join("data"),
             config_file: root.join("config").join("config.toml"),
             database_file: root.join("data").join("svarog.sqlite3"),
+            credential_scope: CredentialScope::Development,
         };
         let mut config = Config::default();
         config.recommender.codex.args = vec![

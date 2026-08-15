@@ -10,6 +10,7 @@ mod models;
 mod notifications;
 mod prompt_templates;
 mod recommender;
+mod secrets;
 mod self_update;
 mod session;
 mod source_fingerprint;

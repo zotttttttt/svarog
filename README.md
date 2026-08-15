@@ -40,7 +40,9 @@ The loop is simple:
 4. Your history shapes what comes next.
 
 Use the conservative built-in recommender, your installed Codex CLI, or the
-OpenAI API. Prompt text is never collected or sent in recommendation requests.
+OpenAI API with either an environment variable or a key protected by your
+operating system credential store. Prompt text is never collected or sent in
+recommendation requests.
 
 ## Get started
 

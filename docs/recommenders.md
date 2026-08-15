@@ -14,7 +14,8 @@ On the waiting screen, press `s`, focus **Recommender** with `↑`/`↓`, and us
 | Recommender | Behavior |
 | --- | --- |
 | Local | Conservative built-in rules with no LLM or network request; the default |
-| OpenAI API | Uses the Responses API and records its token usage separately |
+| OpenAI (environment) | Uses the Responses API with a key from `OPENAI_API_KEY` |
+| OpenAI (saved key) | Uses the Responses API with a key protected by the operating system credential store |
 | Codex | Uses your installed Codex CLI without requiring a separate API key |
 
 The choice is saved with Ctrl+S or Command+S from Settings. Svarog preserves the
@@ -22,6 +23,8 @@ current movement and old safe queue until a newly generated replacement is
 ready.
 
 ## OpenAI API setup
+
+### Environment variable
 
 Make `OPENAI_API_KEY` available to the shell that starts Svarog:
 
@@ -31,8 +34,19 @@ svarog
 ```
 
 Add the export to your shell profile if you want it available in future
-sessions. Svarog reads the key from the environment and never writes it to the
-config file or database.
+sessions. Choose **OpenAI (environment)** in Settings. Svarog reads the key from
+the environment and never writes it to the config file or database.
+
+### Saved key
+
+In Settings, focus **Saved OpenAI key**, press Enter, and type the key. The
+editor masks the value, and the change is staged until you press Ctrl+S or
+Command+S. Delete stages removal of an existing key.
+
+The key is stored in macOS Keychain or Linux Secret Service, never in
+`config.toml` or the workout database. Choose **OpenAI (saved key)** as the
+recommender to use it. If Linux Secret Service is unavailable, use the
+environment-variable option instead.
 
 The default OpenAI model and reasoning effort can be changed under
 `recommender.openai` in the config file.
