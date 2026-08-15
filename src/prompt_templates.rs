@@ -8,6 +8,60 @@ const EXERCISE_PROFILE_NAME: &str = "exercise_profile.j2";
 const RECOMMENDATION_QUEUE_NAME: &str = "recommendation_queue.j2";
 const DEFAULT_EXERCISE_PROFILE: &str = include_str!("../prompts/exercise_profile.j2");
 const DEFAULT_RECOMMENDATION_QUEUE: &str = include_str!("../prompts/recommendation_queue.j2");
+const ARCHETYPE_TEMPLATES: [(&str, &str); 12] = [
+    (
+        "archetypes/common.j2",
+        include_str!("../prompts/archetypes/common.j2"),
+    ),
+    (
+        "archetypes/boxer.j2",
+        include_str!("../prompts/archetypes/boxer.j2"),
+    ),
+    (
+        "archetypes/wrestler.j2",
+        include_str!("../prompts/archetypes/wrestler.j2"),
+    ),
+    (
+        "archetypes/martial_artist.j2",
+        include_str!("../prompts/archetypes/martial_artist.j2"),
+    ),
+    (
+        "archetypes/bodybuilder.j2",
+        include_str!("../prompts/archetypes/bodybuilder.j2"),
+    ),
+    (
+        "archetypes/runner.j2",
+        include_str!("../prompts/archetypes/runner.j2"),
+    ),
+    (
+        "archetypes/athlete.j2",
+        include_str!("../prompts/archetypes/athlete.j2"),
+    ),
+    (
+        "archetypes/gymnast.j2",
+        include_str!("../prompts/archetypes/gymnast.j2"),
+    ),
+    (
+        "archetypes/yogi.j2",
+        include_str!("../prompts/archetypes/yogi.j2"),
+    ),
+    (
+        "archetypes/mover.j2",
+        include_str!("../prompts/archetypes/mover.j2"),
+    ),
+    (
+        "archetypes/thinker.j2",
+        include_str!("../prompts/archetypes/thinker.j2"),
+    ),
+    (
+        "archetypes/lifer.j2",
+        include_str!("../prompts/archetypes/lifer.j2"),
+    ),
+];
+const CUSTOM_ARCHETYPE_TEMPLATE: (&str, &str) = (
+    "archetypes/custom.j2",
+    include_str!("../prompts/archetypes/custom.j2"),
+);
 
 pub struct PromptRenderer<'a> {
     config_dir: &'a Path,
@@ -53,6 +107,22 @@ impl<'a> PromptRenderer<'a> {
         };
         let mut environment = Environment::new();
         environment.set_undefined_behavior(UndefinedBehavior::Strict);
+        for (partial_name, embedded) in ARCHETYPE_TEMPLATES
+            .into_iter()
+            .chain(std::iter::once(CUSTOM_ARCHETYPE_TEMPLATE))
+        {
+            let override_path = self.config_dir.join("prompts").join(partial_name);
+            let partial_source = if override_path.exists() {
+                fs::read_to_string(&override_path).with_context(|| {
+                    format!("reading prompt override {}", override_path.display())
+                })?
+            } else {
+                embedded.to_string()
+            };
+            environment
+                .add_template_owned(partial_name.to_string(), partial_source)
+                .with_context(|| format!("parsing prompt template {partial_name}"))?;
+        }
         environment
             .add_template_owned(name.to_string(), source)
             .with_context(|| format!("parsing prompt template {name}"))?;
@@ -83,13 +153,39 @@ mod tests {
             .exercise_profile(&json!({"profile": {"age": 33}}))
             .unwrap();
         let queue = renderer
-            .recommendation_queue(&json!({"today_stats": {"reps": 8}}), 5)
+            .recommendation_queue(
+                &json!({"profile": {"archetype": "athlete"}, "today_stats": {"reps": 8}}),
+                5,
+            )
             .unwrap();
 
         assert!(profile.starts_with(DEFAULT_EXERCISE_PROFILE.lines().next().unwrap()));
         assert!(profile.contains("\"age\":33"));
         assert!(!queue.contains("{{ needed }}"));
         assert!(queue.contains("\"reps\":8"));
+    }
+
+    #[test]
+    fn selected_and_custom_archetype_partials_render() {
+        let root = tempdir().unwrap();
+        let renderer = PromptRenderer::new(root.path());
+        let boxer = renderer
+            .recommendation_queue(
+                &json!({"profile": {"archetype": "boxer", "custom_archetype": null}}),
+                1,
+            )
+            .unwrap();
+        assert!(boxer.contains("Forge archetype: Boxer"));
+        assert!(!boxer.contains("Forge archetype: Athlete."));
+
+        let custom = renderer
+            .recommendation_queue(
+                &json!({"profile": {"archetype": "custom", "custom_archetype": "Goku"}}),
+                1,
+            )
+            .unwrap();
+        assert!(custom.contains("Goku"));
+        assert!(custom.contains("If unclear, behave as Athlete."));
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use crate::archetypes::ArchetypeId;
 use anyhow::{bail, Context, Result};
 use directories::BaseDirs;
 use serde::{Deserialize, Serialize};
@@ -12,6 +13,8 @@ use std::str::FromStr;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub profile: Profile,
+    #[serde(default)]
+    pub forge: Forge,
     pub agents: Agents,
     pub preferences: Preferences,
     #[serde(default)]
@@ -28,7 +31,7 @@ pub struct Onboarding {
     pub completed_steps: Vec<String>,
 }
 
-pub const CURRENT_ONBOARDING_VERSION: u32 = 2;
+pub const CURRENT_ONBOARDING_VERSION: u32 = 3;
 pub const STEP_HEIGHT: &str = "profile.height_cm";
 pub const STEP_WEIGHT: &str = "profile.weight_kg";
 pub const STEP_AGE: &str = "profile.age";
@@ -38,12 +41,13 @@ pub const STEP_WORK_SETUP: &str = "profile.work_setup";
 pub const STEP_ARM_AVAILABILITY: &str = "profile.arm_availability";
 pub const STEP_CAUTIOUS_BODY_PARTS: &str = "profile.cautious_body_parts";
 pub const STEP_INJURIES: &str = "profile.injuries";
-pub const STEP_FORGE_INTENSITY: &str = "preferences.forge_intensity";
-pub const STEP_FORGE_FREQUENCY: &str = "preferences.forge_frequency";
+pub const STEP_ARCHETYPE: &str = "forge.archetype";
 pub const STEP_DESKTOP_NOTIFICATIONS: &str = "preferences.desktop_notifications";
 pub const STEP_CODEX_COMMAND: &str = "agents.codex_command";
 pub const STEP_EXERCISE_PREFERENCES: &str = "profile.exercise_preferences";
 const LEGACY_STEP_RECOMMENDER_BACKEND: &str = "recommender.backend";
+const LEGACY_STEP_FORGE_INTENSITY: &str = "preferences.forge_intensity";
+const LEGACY_STEP_FORGE_FREQUENCY: &str = "preferences.forge_frequency";
 
 // Keep this frozen for configs written before onboarding metadata existed.
 pub const ORIGINAL_ONBOARDING_STEPS: [&str; 14] = [
@@ -56,15 +60,15 @@ pub const ORIGINAL_ONBOARDING_STEPS: [&str; 14] = [
     STEP_ARM_AVAILABILITY,
     STEP_CAUTIOUS_BODY_PARTS,
     STEP_INJURIES,
-    STEP_FORGE_INTENSITY,
-    STEP_FORGE_FREQUENCY,
+    LEGACY_STEP_FORGE_INTENSITY,
+    LEGACY_STEP_FORGE_FREQUENCY,
     STEP_CODEX_COMMAND,
     STEP_EXERCISE_PREFERENCES,
     LEGACY_STEP_RECOMMENDER_BACKEND,
 ];
 
 // Add every new question here with a stable ID and increment the version above.
-pub const CURRENT_ONBOARDING_STEPS: [&str; 14] = [
+pub const CURRENT_ONBOARDING_STEPS: [&str; 12] = [
     STEP_HEIGHT,
     STEP_WEIGHT,
     STEP_AGE,
@@ -74,9 +78,7 @@ pub const CURRENT_ONBOARDING_STEPS: [&str; 14] = [
     STEP_ARM_AVAILABILITY,
     STEP_CAUTIOUS_BODY_PARTS,
     STEP_INJURIES,
-    STEP_FORGE_INTENSITY,
-    STEP_FORGE_FREQUENCY,
-    STEP_CODEX_COMMAND,
+    STEP_ARCHETYPE,
     STEP_EXERCISE_PREFERENCES,
     STEP_DESKTOP_NOTIFICATIONS,
 ];
@@ -145,6 +147,23 @@ pub struct Profile {
     pub injuries: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Forge {
+    #[serde(default)]
+    pub archetype: ArchetypeId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_archetype: Option<String>,
+}
+
+impl Default for Forge {
+    fn default() -> Self {
+        Self {
+            archetype: ArchetypeId::Athlete,
+            custom_archetype: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UnitSystem {
@@ -181,8 +200,6 @@ pub struct Agents {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Preferences {
-    pub forge_intensity: u32,
-    pub forge_frequency: u32,
     pub default_expected_duration_sec: u32,
     pub max_daily_sets: u32,
     #[serde(default = "default_true")]
@@ -203,7 +220,9 @@ pub struct Recommender {
 #[serde(rename_all = "snake_case")]
 pub enum RecommenderBackend {
     Codex,
-    Openai,
+    #[serde(rename = "openai_env", alias = "openai")]
+    OpenaiEnv,
+    OpenaiKeyring,
     #[serde(alias = "off")]
     Local,
 }
@@ -212,15 +231,17 @@ impl RecommenderBackend {
     pub fn label(self) -> &'static str {
         match self {
             Self::Codex => "Codex",
-            Self::Openai => "OpenAI API",
+            Self::OpenaiEnv => "OpenAI (environment)",
+            Self::OpenaiKeyring => "OpenAI (saved key)",
             Self::Local => "Local",
         }
     }
 
     pub fn next(self) -> Self {
         match self {
-            Self::Local => Self::Openai,
-            Self::Openai => Self::Codex,
+            Self::Local => Self::OpenaiEnv,
+            Self::OpenaiEnv => Self::OpenaiKeyring,
+            Self::OpenaiKeyring => Self::Codex,
             Self::Codex => Self::Local,
         }
     }
@@ -228,8 +249,9 @@ impl RecommenderBackend {
     pub fn previous(self) -> Self {
         match self {
             Self::Local => Self::Codex,
-            Self::Codex => Self::Openai,
-            Self::Openai => Self::Local,
+            Self::Codex => Self::OpenaiKeyring,
+            Self::OpenaiKeyring => Self::OpenaiEnv,
+            Self::OpenaiEnv => Self::Local,
         }
     }
 }
@@ -240,9 +262,12 @@ impl FromStr for RecommenderBackend {
     fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
         match value.trim().to_lowercase().as_str() {
             "codex" => Ok(Self::Codex),
-            "openai" | "openai api" | "openai_api" => Ok(Self::Openai),
+            "openai" | "openai env" | "openai_env" | "openai (environment)" => Ok(Self::OpenaiEnv),
+            "openai keyring" | "openai_keyring" | "openai saved" | "openai (saved key)" => {
+                Ok(Self::OpenaiKeyring)
+            }
             "local" => Ok(Self::Local),
-            _ => Err("use one of: codex, openai, local".to_string()),
+            _ => Err("use one of: codex, openai_env, openai_keyring, local".to_string()),
         }
     }
 }
@@ -279,14 +304,13 @@ impl Default for Config {
                 cautious_body_parts: Vec::new(),
                 injuries: Vec::new(),
             },
+            forge: Forge::default(),
             agents: Agents {
                 codex_command: "codex".to_string(),
             },
             preferences: Preferences {
-                forge_intensity: 1,
-                forge_frequency: 2,
                 default_expected_duration_sec: 60,
-                max_daily_sets: 12,
+                max_daily_sets: 100,
                 desktop_notifications: true,
             },
             recommender: Recommender::default(),
@@ -369,6 +393,13 @@ pub struct Paths {
     pub data_dir: PathBuf,
     pub config_file: PathBuf,
     pub database_file: PathBuf,
+    pub credential_scope: CredentialScope,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialScope {
+    Production,
+    Development,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -396,6 +427,7 @@ impl Paths {
             database_file: data_dir.join("svarog.sqlite3"),
             config_dir,
             data_dir,
+            credential_scope: CredentialScope::Production,
         })
     }
 
@@ -405,6 +437,7 @@ impl Paths {
             database_file: root.join("svarog.sqlite3"),
             config_dir: root.clone(),
             data_dir: root,
+            credential_scope: CredentialScope::Development,
         }
     }
 
@@ -502,7 +535,12 @@ impl RuntimeEnv {
 
 fn resolve_svarog_paths(mode: RuntimeMode) -> Result<Paths> {
     if let Ok(root) = std::env::var("SVAROG_HOME") {
-        return Ok(Paths::from_root(PathBuf::from(root)));
+        let mut paths = Paths::from_root(PathBuf::from(root));
+        paths.credential_scope = match mode {
+            RuntimeMode::Production => CredentialScope::Production,
+            RuntimeMode::Dev => CredentialScope::Development,
+        };
+        return Ok(paths);
     }
     match mode {
         RuntimeMode::Production => Paths::load(),
@@ -598,6 +636,19 @@ pub fn save(paths: &Paths, config: &Config) -> Result<()> {
 }
 
 fn normalize_loaded_config(config: &mut Config) {
+    if config.onboarding.version < 3 && config.preferences.max_daily_sets == 12 {
+        config.preferences.max_daily_sets = 100;
+    }
+    if config.forge.archetype != ArchetypeId::Custom {
+        config.forge.custom_archetype = None;
+    } else if config
+        .forge
+        .custom_archetype
+        .as_deref()
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        config.forge = Forge::default();
+    }
     let old_codex_args = [
         "exec",
         "--ask-for-approval",
@@ -720,6 +771,7 @@ mod tests {
             data_dir: root.join("data"),
             config_file: root.join("config").join("config.toml"),
             database_file: root.join("data").join("svarog.sqlite3"),
+            credential_scope: CredentialScope::Development,
         };
         let mut config = Config::default();
         config.agents.codex_command = "codex --sandbox workspace-write".to_string();
@@ -759,7 +811,8 @@ mod tests {
     fn default_setup_values_are_conservative() {
         let config = Config::default();
 
-        assert_eq!(config.preferences.forge_frequency, 2);
+        assert_eq!(config.forge.archetype, ArchetypeId::Athlete);
+        assert_eq!(config.preferences.max_daily_sets, 100);
         assert!(config.preferences.desktop_notifications);
         assert_eq!(config.profile.exercise_preferences, "automatic");
         assert_eq!(config.recommender.backend, RecommenderBackend::Local);
@@ -838,6 +891,42 @@ mod tests {
     }
 
     #[test]
+    fn legacy_openai_backend_migrates_to_explicit_environment_source() {
+        let root = tempdir().unwrap();
+        let paths = Paths::from_root(root.path().join("svarog"));
+        let serialized = toml::to_string_pretty(&Config::default())
+            .unwrap()
+            .replace("backend = \"local\"", "backend = \"openai\"");
+        paths.ensure().unwrap();
+        fs::write(&paths.config_file, serialized).unwrap();
+
+        let config = load_or_default(&paths).unwrap();
+
+        assert_eq!(config.recommender.backend, RecommenderBackend::OpenaiEnv);
+        save(&paths, &config).unwrap();
+        let migrated = fs::read_to_string(&paths.config_file).unwrap();
+        assert!(migrated.contains("backend = \"openai_env\""));
+        assert!(!migrated.contains("backend = \"openai\""));
+    }
+
+    #[test]
+    fn codex_command_is_configurable_but_not_a_current_onboarding_step() {
+        assert!(!CURRENT_ONBOARDING_STEPS.contains(&STEP_CODEX_COMMAND));
+        assert!(ORIGINAL_ONBOARDING_STEPS.contains(&STEP_CODEX_COMMAND));
+
+        let root = tempdir().unwrap();
+        let paths = Paths::from_root(root.path().join("svarog"));
+        let mut config = Config::default();
+        config.agents.codex_command = "custom-codex".into();
+        save(&paths, &config).unwrap();
+
+        assert_eq!(
+            load_or_default(&paths).unwrap().agents.codex_command,
+            "custom-codex"
+        );
+    }
+
+    #[test]
     fn load_migrates_only_the_old_default_timeout() {
         let root = tempdir().unwrap();
         let old_paths = Paths::from_root(root.path().join("old"));
@@ -913,7 +1002,7 @@ mod tests {
         assert!(loaded.preferences.desktop_notifications);
         assert_eq!(
             loaded.onboarding.pending_steps(),
-            vec![STEP_DESKTOP_NOTIFICATIONS]
+            vec![STEP_ARCHETYPE, STEP_DESKTOP_NOTIFICATIONS]
         );
         assert!(!loaded.onboarding.is_complete());
     }
@@ -937,6 +1026,40 @@ mod tests {
     }
 
     #[test]
+    fn version_two_default_ceiling_migrates_and_requests_archetype() {
+        let root = tempdir().unwrap();
+        let paths = Paths::from_root(root.path().join("svarog"));
+        let mut config = Config::default();
+        config.preferences.max_daily_sets = 12;
+        config.onboarding.version = 2;
+        for step in CURRENT_ONBOARDING_STEPS {
+            if step != STEP_ARCHETYPE {
+                config.onboarding.mark_completed(step);
+            }
+        }
+        save(&paths, &config).unwrap();
+
+        let loaded = load_or_default(&paths).unwrap();
+
+        assert_eq!(loaded.preferences.max_daily_sets, 100);
+        assert_eq!(loaded.onboarding.pending_steps(), vec![STEP_ARCHETYPE]);
+        assert_eq!(loaded.forge.archetype, ArchetypeId::Athlete);
+    }
+
+    #[test]
+    fn empty_custom_archetype_falls_back_to_athlete() {
+        let root = tempdir().unwrap();
+        let paths = Paths::from_root(root.path().join("svarog"));
+        let mut config = Config::default();
+        config.forge.archetype = ArchetypeId::Custom;
+        config.forge.custom_archetype = Some("  ".into());
+        save(&paths, &config).unwrap();
+
+        let loaded = load_or_default(&paths).unwrap();
+        assert_eq!(loaded.forge, Forge::default());
+    }
+
+    #[test]
     fn load_normalizes_old_codex_exec_args() {
         let root = tempdir().unwrap().keep();
         let paths = Paths {
@@ -944,6 +1067,7 @@ mod tests {
             data_dir: root.join("data"),
             config_file: root.join("config").join("config.toml"),
             database_file: root.join("data").join("svarog.sqlite3"),
+            credential_scope: CredentialScope::Development,
         };
         let mut config = Config::default();
         config.recommender.codex.args = vec![

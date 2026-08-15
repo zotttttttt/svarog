@@ -40,13 +40,19 @@ They do not forward the text of your coding prompts.
 | Codex | A bounded exercise profile or workout context is passed to your installed Codex CLI |
 | OpenAI API | The same bounded context is sent to the OpenAI Responses API |
 
-Recommendation context can include exercise goals, equipment, injuries, recent
-movement outcomes, daily totals, and cooldown state. Exercise instructions and
-reference images stay local. Remote recommenders receive only compact catalog
-metadata, and every response is validated locally.
+Recommendation context can include the Forge archetype, exercise goals,
+equipment, injuries, prescribed-versus-performed outcomes, daily totals, and
+cooldown state. Exercise instructions and reference images stay local. Remote
+recommenders receive only compact catalog metadata, and every response is
+validated locally.
 
-The OpenAI API key is read from the configured environment variable and is not
-stored by Svarog. Codex and OpenAI token totals are tracked separately.
+An OpenAI API key can be read from the configured environment variable or saved
+through Settings. Saved keys are protected by macOS Keychain or Linux Secret
+Service and are never written to Svarog's config file or database. While the
+saved-key recommender is active, Svarog keeps the key in a synchronized,
+zeroized process-memory cache to avoid repeated credential-store prompts. It
+clears that copy when another recommender is applied, the key is removed, or
+Svarog exits. Codex and OpenAI token totals are tracked separately.
 
 ## Notifications
 
@@ -57,8 +63,10 @@ any time under `preferences.desktop_notifications` in the config file.
 ## Remove or isolate data
 
 Run `svarog setup --reset` to erase production profile and activity data after
-typing the exact `destroy all` confirmation. See [Commands](commands.md) for the
-full reset behavior.
+typing the exact `destroy all` confirmation. The reset also attempts to remove
+the production saved OpenAI key. If the operating system credential store is
+unavailable, Svarog warns and continues resetting its local data. See
+[Commands](commands.md) for the full reset behavior.
 
-For testing, `svarog demo` uses only `./.svarog-dev` and does not touch
-production data or hooks.
+For testing, `svarog demo` uses only `./.svarog-dev` and a separate development
+credential; it does not touch production data, credentials, or hooks.

@@ -3,6 +3,7 @@ use crate::daemon;
 use crate::hooks;
 use crate::models::{Agent, AppStateKind, IncomingEvent, MovementStatus, SetStatus};
 use crate::recommender;
+use crate::secrets;
 use crate::session;
 use crate::stop;
 use crate::storage::Store;
@@ -106,7 +107,13 @@ pub async fn run() -> Result<()> {
             reset,
         }) => {
             let setup_env = RuntimeEnv::load_with_options(dev, dry_run)?;
-            setup(&setup_env, reset)
+            setup(&setup_env, reset)?;
+            if setup_env.dry_run {
+                Ok(())
+            } else {
+                wait_for_tui("Press Enter to open the Svarog TUI: ")?;
+                run_tui(&setup_env).await
+            }
         }
         Some(Command::Init) => init(&env),
         Some(Command::Calibrate) => calibrate(&env),
@@ -235,12 +242,24 @@ fn setup_pending(env: &RuntimeEnv) -> Result<()> {
 }
 
 fn reset_user_data(env: &RuntimeEnv) -> Result<()> {
+    let warning =
+        reset_user_data_with_cleanup(env, || secrets::cleanup_openai_api_key(&env.paths))?;
+    println!("All Svarog user data was reset. Starting onboarding from the beginning.");
+    if let Some(error) = warning {
+        eprintln!("{}", credential_cleanup_warning("Svarog data", &error));
+    }
+    Ok(())
+}
+
+fn reset_user_data_with_cleanup<F>(env: &RuntimeEnv, cleanup: F) -> Result<Option<String>>
+where
+    F: FnOnce() -> Option<String>,
+{
     let config = Config::default();
     config::save(&env.paths, &config)?;
     let store = Store::open(&env.paths.database_file)?;
     store.reset_all_data()?;
-    println!("All Svarog user data was reset. Starting onboarding from the beginning.");
-    Ok(())
+    Ok(cleanup())
 }
 
 fn finish_setup(env: &RuntimeEnv, config: &Config) -> Result<()> {
@@ -301,6 +320,7 @@ fn print_setup_intro(env: &RuntimeEnv) {
 }
 
 async fn run_tui(env: &RuntimeEnv) -> Result<()> {
+    let _openai_key_cache_guard = secrets::openai_key_cache_guard(&env.paths);
     daemon::refresh_exercise_pool(env)?;
     let collector = daemon::Collector::start(env).await?;
     let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -359,9 +379,14 @@ async fn run_demo(_remove_data: bool) -> Result<()> {
 
     if reset {
         if root.exists() {
-            remove_demo_data(&root)?;
+            let warning = remove_demo_data_with_cleanup(&root, || {
+                secrets::cleanup_openai_api_key(&env.paths)
+            })?;
             println!("Removed demo data: {}", root.display());
             println!("This cannot be recovered. Production data was not changed.");
+            if let Some(error) = warning {
+                eprintln!("{}", credential_cleanup_warning("Demo data", &error));
+            }
             println!();
         }
         setup(&env, false)?;
@@ -426,6 +451,20 @@ fn remove_demo_data(root: &Path) -> Result<()> {
         );
     }
     fs::remove_dir_all(root).with_context(|| format!("removing {}", root.display()))
+}
+
+fn remove_demo_data_with_cleanup<F>(root: &Path, cleanup: F) -> Result<Option<String>>
+where
+    F: FnOnce() -> Option<String>,
+{
+    remove_demo_data(root)?;
+    Ok(cleanup())
+}
+
+fn credential_cleanup_warning(data_label: &str, error: &str) -> String {
+    format!(
+        "Warning: {data_label} was reset, but the saved OpenAI API key could not be removed from the operating system credential store: {error}. Remove the Svarog OpenAI credential manually from Keychain or Secret Service."
+    )
 }
 
 fn wait_for_tui(prompt: &str) -> Result<()> {
@@ -582,22 +621,8 @@ fn collect_profile(config: &mut Config, paths: &config::Paths, all: bool) -> Res
             prompt_list("Injuries or hard limitations", &config.profile.injuries)?;
         Ok(())
     })?;
-    onboarding_step(config, paths, config::STEP_FORGE_INTENSITY, all, |config| {
-        config.preferences.forge_intensity = prompt_bounded_u32(
-            "Forge intensity (1-5)",
-            config.preferences.forge_intensity,
-            1,
-            5,
-        )?;
-        Ok(())
-    })?;
-    onboarding_step(config, paths, config::STEP_FORGE_FREQUENCY, all, |config| {
-        config.preferences.forge_frequency = prompt_bounded_u32(
-            "Forge interval (how many agent runs before prompting you to move)",
-            config.preferences.forge_frequency,
-            1,
-            12,
-        )?;
+    onboarding_step(config, paths, config::STEP_ARCHETYPE, all, |config| {
+        config.forge = tui::select_archetype(&config.forge)?;
         Ok(())
     })?;
     onboarding_step(
@@ -613,10 +638,6 @@ fn collect_profile(config: &mut Config, paths: &config::Paths, all: bool) -> Res
             Ok(())
         },
     )?;
-    onboarding_step(config, paths, config::STEP_CODEX_COMMAND, all, |config| {
-        config.agents.codex_command = prompt_string("Codex command", &config.agents.codex_command)?;
-        Ok(())
-    })?;
     onboarding_step(
         config,
         paths,
@@ -670,13 +691,13 @@ fn print_setup_summary(config: &Config) {
     println!("{}", muted("Equipment:"));
     println!("{}", text(&config.profile.equipment_text));
     println!();
-    println!("{}", muted("Intensity:"));
-    println!("{}", text(config.preferences.forge_intensity));
-    println!();
-    println!("{}", muted("Interval:"));
+    println!("{}", muted("Forge archetype:"));
     println!(
         "{}",
-        text(interval_label(config.preferences.forge_frequency))
+        text(crate::archetypes::display_name(
+            config.forge.archetype,
+            config.forge.custom_archetype.as_deref(),
+        ))
     );
     println!();
     println!("{}", muted("Notifications:"));
@@ -704,14 +725,6 @@ fn print_setup_summary(config: &Config) {
     );
     println!();
     println!("{}", ember("Happy forging."));
-}
-
-fn interval_label(interval: u32) -> String {
-    if interval <= 1 {
-        "every agent run".to_string()
-    } else {
-        format!("every {interval} agent runs")
-    }
 }
 
 fn print_recommender_notice(config: &Config, env: &RuntimeEnv, notice: &str) {
@@ -1115,12 +1128,12 @@ fn cm_to_feet_inches(height_cm: u32) -> (u32, u32) {
     (total_inches / 12, total_inches % 12)
 }
 
-fn format_imperial_height(height_cm: u32) -> String {
+pub(crate) fn format_imperial_height(height_cm: u32) -> String {
     let (feet, inches) = cm_to_feet_inches(height_cm);
     format!("{feet}'{inches}\"")
 }
 
-fn parse_imperial_height_inches(value: &str) -> Result<u32> {
+pub(crate) fn parse_imperial_height_inches(value: &str) -> Result<u32> {
     let compact = value
         .chars()
         .filter(|character| !character.is_whitespace())
@@ -1169,19 +1182,6 @@ fn kg_to_lb(weight_kg: f32) -> f32 {
 
 fn lb_to_kg(weight_lb: f32) -> f32 {
     weight_lb * 0.453_592_37
-}
-
-fn prompt_bounded_u32(label: &str, default: u32, min: u32, max: u32) -> Result<u32> {
-    loop {
-        let value = prompt_string(label, &default.to_string())?;
-        let parsed = value
-            .parse::<u32>()
-            .map_err(|err| anyhow::anyhow!("invalid {label}: {err}"))?;
-        if (min..=max).contains(&parsed) {
-            return Ok(parsed);
-        }
-        println!("Use a number from {min} to {max}.");
-    }
 }
 
 fn prompt_bool(label: &str, default: bool) -> Result<bool> {
@@ -1542,7 +1542,9 @@ mod tests {
         store.exclude_exercise("Plank").unwrap();
         drop(store);
 
-        reset_user_data(&env).unwrap();
+        let cleanup_warning =
+            reset_user_data_with_cleanup(&env, || Some("credential store is locked".into()))
+                .unwrap();
 
         let reset_config = config::load_or_default(&env.paths).unwrap();
         assert_eq!(reset_config.profile.height_cm, None);
@@ -1554,6 +1556,14 @@ mod tests {
         assert_eq!(store.event_count().unwrap(), 0);
         assert!(store.removed_exercise_ids().unwrap().is_empty());
         assert_eq!(store.state().unwrap().kind, AppStateKind::Idle);
+        assert_eq!(
+            cleanup_warning.as_deref(),
+            Some("credential store is locked")
+        );
+        let warning =
+            credential_cleanup_warning("Svarog data", cleanup_warning.as_deref().unwrap());
+        assert!(warning.starts_with("Warning: Svarog data was reset"));
+        assert!(warning.contains("Remove the Svarog OpenAI credential manually"));
     }
 
     #[test]
@@ -1581,12 +1591,22 @@ mod tests {
         fs::write(demo.join("svarog/config.toml"), "demo").unwrap();
         fs::write(production.join("history.sqlite3"), "keep").unwrap();
 
-        remove_demo_data(&demo).unwrap();
+        let cleanup_warning =
+            remove_demo_data_with_cleanup(&demo, || Some("Secret Service is unavailable".into()))
+                .unwrap();
 
         assert!(!demo.exists());
         assert_eq!(
             fs::read_to_string(production.join("history.sqlite3")).unwrap(),
             "keep"
+        );
+        assert_eq!(
+            cleanup_warning.as_deref(),
+            Some("Secret Service is unavailable")
+        );
+        assert!(
+            credential_cleanup_warning("Demo data", cleanup_warning.as_deref().unwrap())
+                .starts_with("Warning: Demo data was reset")
         );
     }
 
@@ -1595,9 +1615,15 @@ mod tests {
         let project = tempdir().unwrap();
         let invalid = project.path().join("production");
         fs::create_dir_all(&invalid).unwrap();
+        let cleanup_called = std::cell::Cell::new(false);
 
-        assert!(remove_demo_data(&invalid).is_err());
+        assert!(remove_demo_data_with_cleanup(&invalid, || {
+            cleanup_called.set(true);
+            None
+        })
+        .is_err());
         assert!(invalid.exists());
+        assert!(!cleanup_called.get());
     }
 
     #[test]
@@ -1627,7 +1653,11 @@ mod tests {
         );
         assert_eq!(
             "openai".parse::<RecommenderBackend>().unwrap(),
-            RecommenderBackend::Openai
+            RecommenderBackend::OpenaiEnv
+        );
+        assert_eq!(
+            "openai_keyring".parse::<RecommenderBackend>().unwrap(),
+            RecommenderBackend::OpenaiKeyring
         );
         assert_eq!(
             "local".parse::<RecommenderBackend>().unwrap(),

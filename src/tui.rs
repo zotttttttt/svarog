@@ -1,5 +1,7 @@
 use crate::cli;
-use crate::config::{self, Paths, RecommenderBackend, RuntimeEnv, RuntimeMode};
+use crate::config::{
+    self, Config, Forge, Paths, RecommenderBackend, RuntimeEnv, RuntimeMode, UnitSystem,
+};
 use crate::daemon::{self, ForgeNowResult, QueueRegenerationResult, QueueRegenerationStart};
 use crate::exercise_catalog::{self, ExerciseCatalogEntry};
 use crate::exercise_media::{self, PreparedGallery};
@@ -7,19 +9,24 @@ use crate::models::{
     AppStateKind, ForgeActivitySummary, Recommendation, RecommenderTokenProvider,
     RecommenderTokenUsageByProvider, SetStatus,
 };
+use crate::secrets;
 use crate::storage::{ForgeHistoryEntry, Store};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{Datelike, Duration as ChronoDuration, Local};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement, EnterAlternateScreen,
+    LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Alignment;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Terminal;
 use std::io;
 use std::path::Path;
@@ -27,8 +34,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use zeroize::Zeroizing;
 
 type Spark = (usize, usize, char, bool);
+
+const VIEW_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 
 const SPARK_BURSTS: [&[Spark]; 10] = [
     &[
@@ -172,8 +182,118 @@ struct TuiState {
     queue_regeneration_started_at: Option<Instant>,
     queue_regeneration_feedback: Option<QueueRegenerationFeedback>,
     queue_regeneration_feedback_started_at: Option<Instant>,
+    settings_regeneration: bool,
     forge_now_feedback: Option<String>,
     demo: bool,
+    saved_openai_key_available: Option<bool>,
+    settings: Option<SettingsState>,
+}
+
+struct SettingsState {
+    draft: Config,
+    applied_recommender_backend: RecommenderBackend,
+    row: usize,
+    editing: bool,
+    edit_value: Zeroizing<String>,
+    edit_cursor: usize,
+    edit_scroll: usize,
+    selecting_archetype: bool,
+    custom_archetype: bool,
+    archetype_original: Option<Forge>,
+    saved_openai_key_present: bool,
+    saved_openai_key_error: Option<String>,
+    confirming_openai_key_delete: bool,
+    error: Option<String>,
+}
+
+impl std::fmt::Debug for SettingsState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SettingsState")
+            .field("row", &self.row)
+            .field("editing", &self.editing)
+            .field("edit_value", &"[REDACTED]")
+            .field(
+                "confirming_openai_key_delete",
+                &self.confirming_openai_key_delete,
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+const SETTINGS_ROWS: usize = 16;
+
+fn settings_row_order(settings: &SettingsState) -> Vec<usize> {
+    let mut rows = Vec::with_capacity(SETTINGS_ROWS);
+    rows.extend([0, 1]);
+    if settings.draft.recommender.backend == RecommenderBackend::OpenaiKeyring {
+        rows.push(15);
+    }
+    rows.extend(2..15);
+    rows
+}
+
+fn move_settings_focus(settings: &mut SettingsState, forward: bool) {
+    let rows = settings_row_order(settings);
+    let position = rows
+        .iter()
+        .position(|row| *row == settings.row)
+        .unwrap_or(0);
+    let position = if forward {
+        (position + 1).min(rows.len().saturating_sub(1))
+    } else {
+        position.saturating_sub(1)
+    };
+    settings.row = rows[position];
+}
+
+fn refresh_saved_openai_key_state(
+    settings: &mut SettingsState,
+    cached_availability: &mut Option<bool>,
+    paths: &Paths,
+) {
+    refresh_saved_openai_key_state_with(settings, cached_availability, || {
+        secrets::has_openai_api_key(paths)
+    });
+}
+
+fn refresh_saved_openai_key_state_with(
+    settings: &mut SettingsState,
+    cached_availability: &mut Option<bool>,
+    lookup: impl FnOnce() -> Result<bool>,
+) {
+    if settings.draft.recommender.backend != RecommenderBackend::OpenaiKeyring {
+        return;
+    }
+    let result = match *cached_availability {
+        Some(present) => Ok(present),
+        None => lookup(),
+    };
+    match result {
+        Ok(present) => {
+            *cached_availability = Some(present);
+            settings.saved_openai_key_present = present;
+            settings.saved_openai_key_error = None;
+        }
+        Err(error) => {
+            settings.saved_openai_key_present = false;
+            settings.saved_openai_key_error = Some(error.to_string());
+        }
+    }
+}
+
+fn update_saved_openai_key_cache_after_apply(
+    cached_availability: &mut Option<bool>,
+    backend: RecommenderBackend,
+    saved_key_available: bool,
+    clear: impl FnOnce(),
+) {
+    if backend == RecommenderBackend::OpenaiKeyring {
+        *cached_availability = Some(saved_key_available);
+    } else {
+        clear();
+        *cached_availability = None;
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -207,14 +327,36 @@ enum ViewKind {
     Cooldown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArchetypeSelectorContext {
+    Onboarding,
+    Settings,
+}
+
 pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
+    let saved_openai_key_available = config::load_or_default(&env.paths)
+        .ok()
+        .filter(|config| config.recommender.backend == RecommenderBackend::OpenaiKeyring)
+        .and_then(|_| secrets::has_openai_api_key(&env.paths).ok());
+    let store = Store::open(&env.paths.database_file)?;
+    let mut view = load_view(&store, &env.paths, saved_openai_key_available);
+    let mut last_view_refresh = Instant::now();
+    let mut force_view_refresh = false;
     enable_raw_mode()?;
     let mut stdout = io::stdout();
+    let keyboard_enhancement = matches!(supports_keyboard_enhancement(), Ok(true));
+    if keyboard_enhancement {
+        execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )?;
+    }
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     let mut ui = TuiState {
         demo: env.mode == RuntimeMode::Dev,
+        saved_openai_key_available,
         ..TuiState::default()
     };
     let mut last_spark_toggle = Instant::now();
@@ -229,8 +371,17 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
             last_spark_toggle = Instant::now();
         }
 
-        poll_queue_regeneration(&mut ui);
-        let view = load_view(&env.paths);
+        let now = Instant::now();
+        let queue_regeneration_finished = poll_queue_regeneration(&mut ui);
+        if view_refresh_due(
+            last_view_refresh,
+            now,
+            force_view_refresh || queue_regeneration_finished,
+        ) {
+            view = load_view(&store, &env.paths, ui.saved_openai_key_available);
+            last_view_refresh = now;
+            force_view_refresh = false;
+        }
         if view.kind == ViewKind::Forge {
             ui.show_history = false;
             ui.show_next = false;
@@ -238,7 +389,11 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
         sync_reps(&mut ui, view.recommendation.as_ref());
         poll_exercise_media(&mut ui, view.recommendation.as_ref());
         terminal.draw(|frame| {
-            let lines = screen_lines(&view, &ui, in_tmux);
+            let lines = if let Some(settings) = ui.settings.as_ref() {
+                settings_lines(settings, ui.demo, frame.area().width, frame.area().height)
+            } else {
+                screen_lines(&view, &ui, in_tmux)
+            };
             let mut paragraph = Paragraph::new(lines)
                 .style(Style::default().bg(colors::BG).fg(colors::TEXT))
                 .alignment(Alignment::Left);
@@ -252,6 +407,49 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
 
         if event::poll(Duration::from_millis(200))? {
             if let Event::Key(key) = event::read()? {
+                if ui.settings.is_some() {
+                    if let Err(error) = handle_settings_key(&mut ui, key.code, key.modifiers, env) {
+                        if let Some(settings) = ui.settings.as_mut() {
+                            settings.error = Some(error.to_string());
+                        }
+                    }
+                    if ui.settings.is_none() {
+                        force_view_refresh = true;
+                    }
+                    continue;
+                }
+                if matches!(view.kind, ViewKind::Idle | ViewKind::Cooldown)
+                    && key.code == KeyCode::Char('s')
+                {
+                    if let Ok(draft) = config::load_or_default(&env.paths) {
+                        let saved_openai_key_present =
+                            ui.saved_openai_key_available.unwrap_or(false);
+                        let applied_recommender_backend = draft.recommender.backend;
+                        let mut settings = SettingsState {
+                            draft,
+                            applied_recommender_backend,
+                            row: 0,
+                            editing: false,
+                            edit_value: Zeroizing::new(String::new()),
+                            edit_cursor: 0,
+                            edit_scroll: 0,
+                            selecting_archetype: false,
+                            custom_archetype: false,
+                            archetype_original: None,
+                            saved_openai_key_present,
+                            saved_openai_key_error: None,
+                            confirming_openai_key_delete: false,
+                            error: None,
+                        };
+                        refresh_saved_openai_key_state(
+                            &mut settings,
+                            &mut ui.saved_openai_key_available,
+                            &env.paths,
+                        );
+                        ui.settings = Some(settings);
+                    }
+                    continue;
+                }
                 if quit_requested(key) {
                     break Ok(());
                 }
@@ -316,7 +514,7 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
                     ui.forge_now_feedback = None;
                     if ui.queue_regeneration.is_none() {
                         match daemon::forge_now(env) {
-                            Ok(ForgeNowResult::Started) => {}
+                            Ok(ForgeNowResult::Started) => force_view_refresh = true,
                             Ok(ForgeNowResult::NoQueued) => {
                                 ui.forge_now_feedback =
                                     Some("No forges queued. Generating a fresh queue…".into());
@@ -347,21 +545,6 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
                     continue;
                 }
                 match (key.code, view.kind, ui.skip_check) {
-                    (code, ViewKind::Idle | ViewKind::Cooldown, false)
-                        if !ui.show_history
-                            && !ui.show_next
-                            && recommender_cycle_direction(code).is_some() =>
-                    {
-                        let direction = recommender_cycle_direction(code).unwrap();
-                        ui.status_message = cycle_recommender_backend(&env.paths, direction)
-                            .err()
-                            .map(|_| {
-                                format!(
-                                    "Could not update recommender. Edit: {}",
-                                    env.paths.config_file.display()
-                                )
-                            });
-                    }
                     (code, ViewKind::Forge, false) if increase_reps_requested(code) => {
                         ui.actual_reps = ui.actual_reps.saturating_add(1).min(999);
                     }
@@ -369,7 +552,9 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
                         ui.actual_reps = ui.actual_reps.saturating_sub(1).max(1);
                     }
                     (KeyCode::Char('d') | KeyCode::Enter, ViewKind::Forge, false) => {
-                        let _ = cli::tui_action_with_reps(env, SetStatus::Done, ui.actual_reps);
+                        if cli::tui_action_with_reps(env, SetStatus::Done, ui.actual_reps).is_ok() {
+                            force_view_refresh = true;
+                        }
                         ui.skip_check = false;
                     }
                     (KeyCode::Char('s'), ViewKind::Forge, false) => {
@@ -378,14 +563,19 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
                     (code, ViewKind::Forge, true) if skip_confirmation_action(code).is_some() => {
                         match skip_confirmation_action(code).unwrap() {
                             SkipConfirmationAction::Fatigued => {
-                                let _ = cli::tui_action_skip_fatigued(env);
+                                if cli::tui_action_skip_fatigued(env).is_ok() {
+                                    force_view_refresh = true;
+                                }
                             }
                             SkipConfirmationAction::Normal => {
-                                let _ = cli::tui_action(env, SetStatus::Skipped);
+                                if cli::tui_action(env, SetStatus::Skipped).is_ok() {
+                                    force_view_refresh = true;
+                                }
                             }
                             SkipConfirmationAction::Remove => {
                                 match cli::tui_action_remove_exercise(env) {
                                     Ok(()) => {
+                                        force_view_refresh = true;
                                         ui.status_message = Some(
                                             "Exercise removed. Run `svarog exercises restore <id>` to restore it."
                                                 .into(),
@@ -402,7 +592,9 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
                         ui.skip_check = false;
                     }
                     (KeyCode::Char('p'), ViewKind::Forge, _) => {
-                        let _ = cli::tui_action(env, SetStatus::Pain);
+                        if cli::tui_action(env, SetStatus::Pain).is_ok() {
+                            force_view_refresh = true;
+                        }
                         ui.skip_check = false;
                     }
                     _ => {}
@@ -411,6 +603,9 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
         }
     };
 
+    if keyboard_enhancement {
+        let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
+    }
     let _ = disable_raw_mode();
     let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
     let _ = terminal.show_cursor();
@@ -430,19 +625,12 @@ fn apply_queue_regeneration_start(ui: &mut TuiState, start: QueueRegenerationSta
     }
 }
 
-fn load_view(paths: &Paths) -> ViewModel {
-    let backend = recommender_backend_view(paths);
-    let Ok(store) = Store::open(&paths.database_file) else {
-        return ViewModel {
-            kind: ViewKind::Idle,
-            recommendation: None,
-            backend,
-            activity: ForgeActivitySummary::default(),
-            token_usage: RecommenderTokenUsageByProvider::default(),
-            history: Vec::new(),
-            next_forges: Vec::new(),
-        };
-    };
+fn view_refresh_due(last_refresh: Instant, now: Instant, force: bool) -> bool {
+    force || now.saturating_duration_since(last_refresh) >= VIEW_REFRESH_INTERVAL
+}
+
+fn load_view(store: &Store, paths: &Paths, saved_openai_key_available: Option<bool>) -> ViewModel {
+    let backend = recommender_backend_view(paths, saved_openai_key_available);
     let state = store.state().ok();
     let recommendation = store.latest_open_recommendation().ok().flatten();
     let activity = store.completed_forge_summary().unwrap_or_default();
@@ -475,7 +663,10 @@ fn load_view(paths: &Paths) -> ViewModel {
     }
 }
 
-fn recommender_backend_view(paths: &Paths) -> BackendView {
+fn recommender_backend_view(
+    paths: &Paths,
+    saved_openai_key_available: Option<bool>,
+) -> BackendView {
     let config_file = paths.config_file.display().to_string();
     if !paths.config_file.exists() {
         return BackendView {
@@ -493,16 +684,17 @@ fn recommender_backend_view(paths: &Paths) -> BackendView {
     };
     BackendView {
         label: config.recommender.backend.label().to_string(),
-        unavailable: !backend_available(&config),
+        unavailable: !backend_available(&config, saved_openai_key_available),
         config_file,
     }
 }
 
-fn backend_available(config: &config::Config) -> bool {
+fn backend_available(config: &config::Config, saved_openai_key_available: Option<bool>) -> bool {
     match config.recommender.backend {
         RecommenderBackend::Codex => command_available(&config.recommender.codex.command),
-        RecommenderBackend::Openai => std::env::var(&config.recommender.openai.api_key_env)
+        RecommenderBackend::OpenaiEnv => std::env::var(&config.recommender.openai.api_key_env)
             .is_ok_and(|value| !value.trim().is_empty()),
+        RecommenderBackend::OpenaiKeyring => saved_openai_key_available.unwrap_or(false),
         RecommenderBackend::Local => true,
     }
 }
@@ -519,15 +711,6 @@ fn command_available(command: &str) -> bool {
         return false;
     };
     std::env::split_paths(&paths).any(|path| path.join(command).is_file())
-}
-
-fn cycle_recommender_backend(paths: &Paths, direction: CycleDirection) -> Result<()> {
-    let mut config = config::load_or_default(paths)?;
-    config.recommender.backend = match direction {
-        CycleDirection::Forward => config.recommender.backend.next(),
-        CycleDirection::Backward => config.recommender.backend.previous(),
-    };
-    config::save(paths, &config)
 }
 
 fn sync_reps(ui: &mut TuiState, recommendation: Option<&Recommendation>) {
@@ -587,11 +770,11 @@ fn poll_exercise_media(ui: &mut TuiState, recommendation: Option<&Recommendation
     });
 }
 
-fn poll_queue_regeneration(ui: &mut TuiState) {
-    poll_queue_regeneration_at(ui, Instant::now());
+fn poll_queue_regeneration(ui: &mut TuiState) -> bool {
+    poll_queue_regeneration_at(ui, Instant::now())
 }
 
-fn poll_queue_regeneration_at(ui: &mut TuiState, now: Instant) {
+fn poll_queue_regeneration_at(ui: &mut TuiState, now: Instant) -> bool {
     if matches!(
         ui.queue_regeneration_feedback,
         Some(QueueRegenerationFeedback::Success)
@@ -611,22 +794,33 @@ fn poll_queue_regeneration_at(ui: &mut TuiState, now: Instant) {
         Some(Err(TryRecvError::Empty)) | None => None,
     };
     let Some(result) = result else {
-        return;
+        return false;
     };
     ui.queue_regeneration = None;
     ui.queue_regeneration_started_at = None;
+    let settings_regeneration = std::mem::take(&mut ui.settings_regeneration);
     match result {
         Ok(_) => {
             ui.queue_regeneration_feedback = Some(QueueRegenerationFeedback::Success);
             ui.queue_regeneration_feedback_started_at = Some(now);
+            if settings_regeneration {
+                ui.status_message = Some("Settings saved. Future forges refreshed.".into());
+            }
         }
         Err(error) => {
             ui.queue_regeneration_feedback = Some(QueueRegenerationFeedback::Failure {
                 no_safe_forges: error.contains(crate::daemon::NO_SAFE_FORGES_ERROR),
             });
             ui.queue_regeneration_feedback_started_at = None;
+            if settings_regeneration {
+                ui.status_message = Some(
+                    "Settings saved. Future forges could not be refreshed; existing queue kept."
+                        .into(),
+                );
+            }
         }
     }
+    true
 }
 
 fn queue_regeneration_loader(ui: &TuiState) -> Option<usize> {
@@ -708,6 +902,878 @@ fn view_lines(view: &ViewModel, ui: &TuiState) -> Vec<Line<'static>> {
     }
 }
 
+fn archetype_lines(
+    forge: &Forge,
+    custom_edit: Option<&str>,
+    demo: bool,
+    context: ArchetypeSelectorContext,
+) -> Vec<Line<'static>> {
+    let archetype = crate::archetypes::get(forge.archetype);
+    let title = crate::archetypes::display_name(forge.archetype, forge.custom_archetype.as_deref());
+    let mut lines = vec![
+        with_demo(
+            Line::from(Span::styled(title.to_uppercase(), accent_bold())),
+            demo,
+        ),
+        Line::from(Span::styled(archetype.description, text())),
+        Line::from(""),
+    ];
+    if let Some(value) = custom_edit {
+        lines.push(Line::from(Span::styled("Custom archetype", text_bold())));
+        lines.push(Line::from(Span::styled(format!("> {value}_"), accent())));
+        lines.push(Line::from(Span::styled("[enter] Set  [esc] Back", muted())));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "←/h Previous   →/l Next   [enter] Choose   [/] Custom",
+            muted(),
+        )));
+        lines.push(Line::from(Span::styled(
+            "You can change your archetype at any time.",
+            muted(),
+        )));
+        if context == ArchetypeSelectorContext::Settings {
+            lines.push(Line::from(Span::styled("[esc] Back", muted())));
+        }
+    }
+    lines.push(Line::from(""));
+    for (label, score) in [
+        ("Strength", archetype.stats.strength),
+        ("Muscle", archetype.stats.muscle),
+        ("Cardio", archetype.stats.cardio),
+        ("Mobility", archetype.stats.mobility),
+        ("Control", archetype.stats.control),
+        ("Stamina", archetype.stats.stamina),
+        ("Longevity", archetype.stats.longevity),
+    ] {
+        lines.push(Line::from(vec![
+            Span::styled(format!("{label:<10} "), muted()),
+            Span::styled(
+                format!(
+                    "{}{}  {score}",
+                    "█".repeat(score as usize),
+                    "░".repeat(10 - score as usize)
+                ),
+                accent(),
+            ),
+        ]));
+    }
+    lines
+}
+
+fn settings_lines(
+    settings: &SettingsState,
+    demo: bool,
+    area_width: u16,
+    area_height: u16,
+) -> Vec<Line<'static>> {
+    if settings.selecting_archetype {
+        return fitted_modal_lines(
+            archetype_lines(
+                &settings.draft.forge,
+                settings
+                    .custom_archetype
+                    .then_some(settings.edit_value.as_str()),
+                demo,
+                ArchetypeSelectorContext::Settings,
+            ),
+            usize::from(area_height),
+        );
+    }
+    let profile = &settings.draft.profile;
+    let values = [
+        (
+            "Forge archetype",
+            format!(
+                "{}  [enter] Choose",
+                crate::archetypes::display_name(
+                    settings.draft.forge.archetype,
+                    settings.draft.forge.custom_archetype.as_deref(),
+                )
+            ),
+        ),
+        (
+            "Recommender",
+            settings.draft.recommender.backend.label().into(),
+        ),
+        (
+            "Notifications",
+            if settings.draft.preferences.desktop_notifications {
+                "enabled".into()
+            } else {
+                "disabled".into()
+            },
+        ),
+        (
+            "Daily safety ceiling",
+            settings.draft.preferences.max_daily_sets.to_string(),
+        ),
+        ("Units", profile.unit_system.to_string()),
+        (
+            if profile.unit_system == UnitSystem::Metric {
+                "Height (cm)"
+            } else {
+                "Height (ft/in)"
+            },
+            profile
+                .height_cm
+                .map(|v| {
+                    if profile.unit_system == UnitSystem::Metric {
+                        v.to_string()
+                    } else {
+                        cli::format_imperial_height(v)
+                    }
+                })
+                .unwrap_or_else(|| "not set".into()),
+        ),
+        (
+            if profile.unit_system == UnitSystem::Metric {
+                "Weight (kg)"
+            } else {
+                "Weight (lb)"
+            },
+            profile
+                .weight_kg
+                .map(|v| {
+                    if profile.unit_system == UnitSystem::Metric {
+                        v.to_string()
+                    } else {
+                        format!("{:.1}", v * 2.204_622_6)
+                    }
+                })
+                .unwrap_or_else(|| "not set".into()),
+        ),
+        (
+            "Age",
+            profile
+                .age
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "not set".into()),
+        ),
+        ("Goals", profile.goals.join(", ")),
+        ("Equipment", profile.equipment_text.clone()),
+        ("Work position", profile.work_setup.clone()),
+        (
+            "Arm availability",
+            if profile.one_hand_available {
+                "alternate arms".into()
+            } else {
+                "both hands".into()
+            },
+        ),
+        (
+            "Cautious body parts",
+            profile.cautious_body_parts.join(", "),
+        ),
+        ("Injuries / limitations", profile.injuries.join(", ")),
+        ("Exercise preferences", profile.exercise_preferences.clone()),
+        (
+            "Saved OpenAI key",
+            if settings.saved_openai_key_error.is_some() {
+                "credential store unavailable  [enter] Retry".into()
+            } else if settings.saved_openai_key_present {
+                "configured  [enter] Replace  [del] Remove".into()
+            } else {
+                "not set  [enter] Set".into()
+            },
+        ),
+    ];
+    let mut lines = vec![
+        with_demo(Line::from(Span::styled("Settings", text_bold())), demo),
+        Line::from(Span::styled(
+            "↑/↓ Focus  ←/→ Adjust  Enter Open/Edit",
+            muted(),
+        )),
+        Line::from(""),
+    ];
+    let footer_height = if settings.editing || settings.confirming_openai_key_delete {
+        3
+    } else {
+        2
+    } + usize::from(settings.error.is_some());
+    let row_order = settings_row_order(settings);
+    let visible_rows = usize::from(area_height)
+        .saturating_sub(lines.len() + footer_height)
+        .clamp(1, row_order.len());
+    let focused_position = row_order
+        .iter()
+        .position(|row| *row == settings.row)
+        .unwrap_or(0);
+    let max_start = row_order.len().saturating_sub(visible_rows);
+    let first_row = focused_position
+        .saturating_add(1)
+        .saturating_sub(visible_rows)
+        .min(max_start);
+    let value_width = usize::from(area_width).saturating_sub(27).max(1);
+    for index in row_order.into_iter().skip(first_row).take(visible_rows) {
+        let (label, value) = &values[index];
+        let selected = index == settings.row;
+        lines.push(Line::from(vec![
+            Span::styled(
+                if selected { "› " } else { "  " },
+                if selected { accent_bold() } else { muted() },
+            ),
+            Span::styled(
+                format!("{label:<23}"),
+                if selected { text_bold() } else { muted() },
+            ),
+            Span::styled(
+                clipped_text(value, value_width),
+                if selected { accent() } else { text() },
+            ),
+        ]));
+    }
+    if settings.confirming_openai_key_delete {
+        lines.extend([
+            Line::from(""),
+            Line::from(Span::styled("Remove saved OpenAI key?", accent())),
+            Line::from(Span::styled("[enter/y] Remove key  [esc] Cancel", muted())),
+        ]);
+    } else if settings.editing {
+        let displayed_edit_value = if settings.row == 15 {
+            "•".repeat(settings.edit_value.chars().count())
+        } else {
+            settings.edit_value.to_string()
+        };
+        lines.extend([
+            Line::from(""),
+            Line::from(Span::styled(
+                format!(
+                    "> {}",
+                    editor_window(
+                        &displayed_edit_value,
+                        settings.edit_cursor,
+                        settings.edit_scroll,
+                        usize::from(area_width).saturating_sub(3).max(1),
+                    )
+                ),
+                accent(),
+            )),
+            Line::from(Span::styled(
+                if settings.row == 15 {
+                    "[enter] Save key  [esc] Cancel edit"
+                } else {
+                    "[enter] Set field  [esc] Cancel edit"
+                },
+                muted(),
+            )),
+        ]);
+    } else {
+        lines.extend([
+            Line::from(""),
+            Line::from(Span::styled(
+                "[ctrl/cmd+s] Apply changes  [esc] Cancel settings",
+                muted(),
+            )),
+        ]);
+    }
+    if let Some(error) = settings.error.as_deref() {
+        lines.push(Line::from(Span::styled(error.to_string(), accent())));
+    }
+    lines
+}
+
+fn fitted_modal_lines(lines: Vec<Line<'static>>, height: usize) -> Vec<Line<'static>> {
+    lines.into_iter().take(height.max(1)).collect()
+}
+
+fn begin_setting_edit(settings: &mut SettingsState) {
+    settings.edit_value = Zeroizing::new(match settings.row {
+        5 => settings
+            .draft
+            .profile
+            .height_cm
+            .map(|v| {
+                if settings.draft.profile.unit_system == UnitSystem::Metric {
+                    v.to_string()
+                } else {
+                    cli::format_imperial_height(v)
+                }
+            })
+            .unwrap_or_default(),
+        6 => settings
+            .draft
+            .profile
+            .weight_kg
+            .map(|v| {
+                if settings.draft.profile.unit_system == UnitSystem::Metric {
+                    v.to_string()
+                } else {
+                    format!("{:.1}", v * 2.204_622_6)
+                }
+            })
+            .unwrap_or_default(),
+        7 => settings
+            .draft
+            .profile
+            .age
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
+        8 => settings.draft.profile.goals.join(", "),
+        9 => settings.draft.profile.equipment_text.clone(),
+        12 => settings.draft.profile.cautious_body_parts.join(", "),
+        13 => settings.draft.profile.injuries.join(", "),
+        14 => settings.draft.profile.exercise_preferences.clone(),
+        15 => String::new(),
+        _ => return,
+    });
+    settings.editing = true;
+    settings.edit_cursor = settings.edit_value.chars().count();
+    settings.edit_scroll = settings.edit_cursor.saturating_sub(20);
+}
+
+fn clipped_text(value: &str, width: usize) -> String {
+    let count = value.chars().count();
+    if count <= width {
+        return value.to_string();
+    }
+    if width <= 1 {
+        return "…".into();
+    }
+    format!("{}…", value.chars().take(width - 1).collect::<String>())
+}
+
+fn editor_window(value: &str, cursor: usize, requested_scroll: usize, width: usize) -> String {
+    let chars = value.chars().collect::<Vec<_>>();
+    let cursor = cursor.min(chars.len());
+    let mut start = requested_scroll.min(cursor);
+    if cursor >= start.saturating_add(width.saturating_sub(1)) {
+        start = cursor.saturating_add(2).saturating_sub(width);
+    }
+    let mut visible = chars
+        .iter()
+        .skip(start)
+        .take(width.saturating_sub(1))
+        .copied()
+        .collect::<Vec<_>>();
+    visible.insert(cursor.saturating_sub(start).min(visible.len()), '│');
+    visible.into_iter().collect()
+}
+
+fn insert_at_cursor(value: &mut String, cursor: &mut usize, character: char) {
+    let byte = value
+        .char_indices()
+        .nth(*cursor)
+        .map(|(index, _)| index)
+        .unwrap_or(value.len());
+    value.insert(byte, character);
+    *cursor += 1;
+}
+
+fn backspace_at_cursor(value: &mut String, cursor: &mut usize) {
+    if *cursor == 0 {
+        return;
+    }
+    let mut chars = value.chars().collect::<Vec<_>>();
+    chars.remove(*cursor - 1);
+    *value = chars.into_iter().collect();
+    *cursor -= 1;
+}
+
+fn delete_at_cursor(value: &mut String, cursor: usize) {
+    let mut chars = value.chars().collect::<Vec<_>>();
+    if cursor < chars.len() {
+        chars.remove(cursor);
+        *value = chars.into_iter().collect();
+    }
+}
+
+fn adjusted_whole_value(current: Option<u32>, seed: u32, forward: bool) -> u32 {
+    let value = current.unwrap_or(seed);
+    if forward {
+        value.saturating_add(1)
+    } else {
+        value.saturating_sub(1).max(1)
+    }
+}
+
+fn adjust_measurement(settings: &mut SettingsState, forward: bool) {
+    match settings.row {
+        5 => match settings.draft.profile.unit_system {
+            UnitSystem::Metric => {
+                settings.draft.profile.height_cm = Some(adjusted_whole_value(
+                    settings.draft.profile.height_cm,
+                    170,
+                    forward,
+                ));
+            }
+            UnitSystem::Imperial => {
+                let current_inches = settings
+                    .draft
+                    .profile
+                    .height_cm
+                    .map(|height| (f64::from(height) / 2.54).round() as u32);
+                let inches = adjusted_whole_value(current_inches, 67, forward);
+                settings.draft.profile.height_cm =
+                    Some((f64::from(inches) * 2.54).round().min(f64::from(u32::MAX)) as u32);
+            }
+        },
+        6 => {
+            let metric = settings.draft.profile.unit_system == UnitSystem::Metric;
+            let factor = if metric { 1.0 } else { 2.204_622_6 };
+            let seed = if metric { 70.0 } else { 154.0 };
+            let current = settings
+                .draft
+                .profile
+                .weight_kg
+                .filter(|weight| weight.is_finite() && *weight > 0.0)
+                .map(|weight| weight * factor)
+                .unwrap_or(seed);
+            let adjusted = if forward {
+                current + 1.0
+            } else {
+                (current - 1.0).max(1.0)
+            };
+            settings.draft.profile.weight_kg = Some(adjusted / factor);
+        }
+        7 => {
+            settings.draft.profile.age = Some(adjusted_whole_value(
+                settings.draft.profile.age,
+                30,
+                forward,
+            ));
+        }
+        _ => return,
+    }
+    settings.error = None;
+}
+
+fn settings_apply_requested(code: KeyCode, modifiers: KeyModifiers) -> bool {
+    code == KeyCode::Char('s') && modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
+}
+
+fn comma_list(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn commit_setting_edit(settings: &mut SettingsState) -> Result<()> {
+    let value = settings.edit_value.trim();
+    match settings.row {
+        5 => {
+            settings.draft.profile.height_cm = if value.is_empty() {
+                None
+            } else if settings.draft.profile.unit_system == UnitSystem::Metric {
+                Some(
+                    value
+                        .parse::<f32>()
+                        .context("height must be a number")?
+                        .round() as u32,
+                )
+            } else {
+                Some((cli::parse_imperial_height_inches(value)? as f32 * 2.54).round() as u32)
+            }
+        }
+        6 => {
+            settings.draft.profile.weight_kg = if value.is_empty() {
+                None
+            } else {
+                let entered: f32 = value.parse().context("weight must be a number")?;
+                Some(
+                    if settings.draft.profile.unit_system == UnitSystem::Metric {
+                        entered
+                    } else {
+                        entered / 2.204_622_6
+                    },
+                )
+            }
+        }
+        7 => {
+            settings.draft.profile.age = if value.is_empty() {
+                None
+            } else {
+                Some(value.parse().context("age must be a whole number")?)
+            }
+        }
+        8 => settings.draft.profile.goals = comma_list(value),
+        9 => {
+            settings.draft.profile.equipment_text = if value.is_empty() {
+                "bodyweight only".into()
+            } else {
+                value.into()
+            }
+        }
+        12 => settings.draft.profile.cautious_body_parts = comma_list(value),
+        13 => settings.draft.profile.injuries = comma_list(value),
+        14 => {
+            settings.draft.profile.exercise_preferences = if value.is_empty() {
+                "automatic".into()
+            } else {
+                value.into()
+            }
+        }
+        _ => {}
+    }
+    settings.editing = false;
+    settings.edit_value = Zeroizing::new(String::new());
+    settings.error = None;
+    Ok(())
+}
+
+fn save_openai_key_edit(settings: &mut SettingsState, paths: &Paths) -> Result<bool> {
+    save_openai_key_edit_with(settings, |secret| {
+        secrets::save_openai_api_key(paths, secret)
+    })
+}
+
+fn save_openai_key_edit_with(
+    settings: &mut SettingsState,
+    save: impl FnOnce(&str) -> Result<()>,
+) -> Result<bool> {
+    let value = settings.edit_value.trim();
+    if value.is_empty() {
+        settings.error = Some("OpenAI API key cannot be empty".into());
+        return Ok(false);
+    }
+    save(value)?;
+    settings.saved_openai_key_present = true;
+    settings.saved_openai_key_error = None;
+    settings.editing = false;
+    settings.edit_value = Zeroizing::new(String::new());
+    settings.error = None;
+    Ok(true)
+}
+
+fn remove_saved_openai_key(settings: &mut SettingsState, paths: &Paths) -> Result<()> {
+    remove_saved_openai_key_with(settings, || secrets::remove_openai_api_key(paths))
+}
+
+fn remove_saved_openai_key_with(
+    settings: &mut SettingsState,
+    remove: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    remove()?;
+    settings.saved_openai_key_present = false;
+    settings.saved_openai_key_error = None;
+    settings.confirming_openai_key_delete = false;
+    settings.error = None;
+    Ok(())
+}
+
+fn apply_settings(env: &RuntimeEnv, draft: &Config) -> Result<Receiver<QueueRegenerationResult>> {
+    let previous = config::load_or_default(&env.paths)?;
+    let config_existed = env.paths.config_file.exists();
+    config::save(&env.paths, draft)?;
+    let equipment = exercise_catalog::locally_resolved_equipment(&draft.profile.equipment_text);
+    let movements = exercise_catalog::movements_for_equipment(&equipment);
+    let database_result = Store::open(&env.paths.database_file)
+        .and_then(|store| store.apply_user_profile_and_movement_pool(draft, &movements));
+    if let Err(error) = database_result {
+        let rollback = if config_existed {
+            config::save(&env.paths, &previous)
+        } else {
+            std::fs::remove_file(&env.paths.config_file)
+                .with_context(|| format!("removing {}", env.paths.config_file.display()))
+        };
+        return match rollback {
+            Ok(()) => Err(error.context("applying settings; previous configuration restored")),
+            Err(rollback_error) => Err(anyhow::anyhow!(
+                "applying settings failed: {error}; config rollback failed: {rollback_error}"
+            )),
+        };
+    }
+    Ok(daemon::regenerate_queue_after_settings(env))
+}
+
+fn handle_settings_key(
+    ui: &mut TuiState,
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    env: &RuntimeEnv,
+) -> Result<()> {
+    let Some(settings) = ui.settings.as_mut() else {
+        return Ok(());
+    };
+    if settings.selecting_archetype {
+        settings.error = None;
+        if settings.custom_archetype {
+            if settings_apply_requested(code, modifiers) {
+                return Ok(());
+            }
+            match code {
+                KeyCode::Esc => {
+                    settings.custom_archetype = false;
+                    settings.edit_value.clear();
+                    settings.edit_cursor = 0;
+                    settings.edit_scroll = 0;
+                }
+                KeyCode::Enter if !settings.edit_value.trim().is_empty() => {
+                    settings.draft.forge.archetype = crate::archetypes::ArchetypeId::Custom;
+                    settings.draft.forge.custom_archetype =
+                        Some(settings.edit_value.trim().chars().take(120).collect());
+                    settings.custom_archetype = false;
+                    settings.selecting_archetype = false;
+                    settings.archetype_original = None;
+                }
+                KeyCode::Backspace => {
+                    backspace_at_cursor(&mut settings.edit_value, &mut settings.edit_cursor);
+                }
+                KeyCode::Delete => delete_at_cursor(&mut settings.edit_value, settings.edit_cursor),
+                KeyCode::Left => settings.edit_cursor = settings.edit_cursor.saturating_sub(1),
+                KeyCode::Right => {
+                    settings.edit_cursor =
+                        (settings.edit_cursor + 1).min(settings.edit_value.chars().count())
+                }
+                KeyCode::Home => settings.edit_cursor = 0,
+                KeyCode::End => settings.edit_cursor = settings.edit_value.chars().count(),
+                KeyCode::Char(ch) if settings.edit_value.chars().count() < 120 => {
+                    insert_at_cursor(&mut settings.edit_value, &mut settings.edit_cursor, ch)
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+        match code {
+            KeyCode::Left | KeyCode::Char('h') => {
+                settings.draft.forge.archetype =
+                    crate::archetypes::next(settings.draft.forge.archetype, -1);
+                settings.draft.forge.custom_archetype = None;
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                settings.draft.forge.archetype =
+                    crate::archetypes::next(settings.draft.forge.archetype, 1);
+                settings.draft.forge.custom_archetype = None;
+            }
+            KeyCode::Char('/') => {
+                settings.custom_archetype = true;
+                settings.edit_value.clear();
+                settings.edit_cursor = 0;
+                settings.edit_scroll = 0;
+            }
+            KeyCode::Enter => {
+                settings.selecting_archetype = false;
+                settings.archetype_original = None;
+            }
+            KeyCode::Esc => {
+                if let Some(original) = settings.archetype_original.take() {
+                    settings.draft.forge = original;
+                }
+                settings.selecting_archetype = false;
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+    if settings.confirming_openai_key_delete {
+        match code {
+            KeyCode::Esc => settings.confirming_openai_key_delete = false,
+            KeyCode::Enter | KeyCode::Char('y') => {
+                remove_saved_openai_key(settings, &env.paths)?;
+                ui.saved_openai_key_available = Some(false);
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+    if settings.editing {
+        if settings_apply_requested(code, modifiers) {
+            return Ok(());
+        }
+        match code {
+            KeyCode::Esc => {
+                settings.editing = false;
+                settings.edit_value = Zeroizing::new(String::new());
+            }
+            KeyCode::Enter => {
+                if settings.row == 15 {
+                    if save_openai_key_edit(settings, &env.paths)? {
+                        ui.saved_openai_key_available = Some(true);
+                    }
+                } else {
+                    commit_setting_edit(settings)?;
+                }
+            }
+            KeyCode::Backspace => {
+                backspace_at_cursor(&mut settings.edit_value, &mut settings.edit_cursor);
+            }
+            KeyCode::Delete => delete_at_cursor(&mut settings.edit_value, settings.edit_cursor),
+            KeyCode::Left => settings.edit_cursor = settings.edit_cursor.saturating_sub(1),
+            KeyCode::Right => {
+                settings.edit_cursor =
+                    (settings.edit_cursor + 1).min(settings.edit_value.chars().count())
+            }
+            KeyCode::Home => settings.edit_cursor = 0,
+            KeyCode::End => settings.edit_cursor = settings.edit_value.chars().count(),
+            KeyCode::Char(ch) if settings.edit_value.chars().count() < 500 => {
+                insert_at_cursor(&mut settings.edit_value, &mut settings.edit_cursor, ch)
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+    if settings_apply_requested(code, modifiers) {
+        let saved_key_available = settings.saved_openai_key_present;
+        if settings.draft.recommender.backend == RecommenderBackend::OpenaiKeyring
+            && !saved_key_available
+        {
+            settings.error = settings.saved_openai_key_error.clone().or_else(|| {
+                Some("Set a saved OpenAI key before choosing OpenAI (saved key)".into())
+            });
+            return Ok(());
+        }
+        let draft = settings.draft.clone();
+        let receiver = apply_settings(env, &draft)?;
+        update_saved_openai_key_cache_after_apply(
+            &mut ui.saved_openai_key_available,
+            draft.recommender.backend,
+            saved_key_available,
+            || secrets::clear_cached_openai_api_key(&env.paths),
+        );
+        ui.settings = None;
+        ui.status_message = Some("Settings saved. Refreshing future forges…".into());
+        apply_queue_regeneration_start(ui, QueueRegenerationStart::Started(receiver));
+        ui.settings_regeneration = true;
+        return Ok(());
+    }
+    match code {
+        KeyCode::Esc => {
+            if settings.applied_recommender_backend != RecommenderBackend::OpenaiKeyring {
+                secrets::clear_cached_openai_api_key(&env.paths);
+                ui.saved_openai_key_available = None;
+            }
+            ui.settings = None;
+        }
+        KeyCode::Up => move_settings_focus(settings, false),
+        KeyCode::Down => move_settings_focus(settings, true),
+        KeyCode::Delete if settings.row == 15 && settings.saved_openai_key_present => {
+            settings.confirming_openai_key_delete = true;
+            settings.error = None;
+        }
+        KeyCode::Left | KeyCode::Right => {
+            let forward = code == KeyCode::Right;
+            match settings.row {
+                1 => {
+                    settings.draft.recommender.backend = if forward {
+                        settings.draft.recommender.backend.next()
+                    } else {
+                        settings.draft.recommender.backend.previous()
+                    };
+                    refresh_saved_openai_key_state(
+                        settings,
+                        &mut ui.saved_openai_key_available,
+                        &env.paths,
+                    );
+                }
+                2 => {
+                    settings.draft.preferences.desktop_notifications =
+                        !settings.draft.preferences.desktop_notifications
+                }
+                3 => {
+                    settings.draft.preferences.max_daily_sets = if forward {
+                        settings
+                            .draft
+                            .preferences
+                            .max_daily_sets
+                            .saturating_add(1)
+                            .min(1000)
+                    } else {
+                        settings
+                            .draft
+                            .preferences
+                            .max_daily_sets
+                            .saturating_sub(1)
+                            .max(1)
+                    }
+                }
+                4 => {
+                    settings.draft.profile.unit_system =
+                        if settings.draft.profile.unit_system == UnitSystem::Metric {
+                            UnitSystem::Imperial
+                        } else {
+                            UnitSystem::Metric
+                        }
+                }
+                5..=7 => adjust_measurement(settings, forward),
+                10 => {
+                    settings.draft.profile.work_setup =
+                        if settings.draft.profile.work_setup == "sitting" {
+                            "standing".into()
+                        } else {
+                            "sitting".into()
+                        }
+                }
+                11 => {
+                    settings.draft.profile.one_hand_available =
+                        !settings.draft.profile.one_hand_available;
+                    settings.draft.profile.two_hand_available =
+                        !settings.draft.profile.one_hand_available;
+                }
+                _ => {}
+            }
+        }
+        KeyCode::Enter if settings.row == 0 => {
+            settings.archetype_original = Some(settings.draft.forge.clone());
+            settings.selecting_archetype = true;
+        }
+        KeyCode::Enter => begin_setting_edit(settings),
+        _ => {}
+    }
+    Ok(())
+}
+
+pub fn select_archetype(current: &Forge) -> Result<Forge> {
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+    let mut forge = current.clone();
+    let mut custom: Option<String> = None;
+    let result = loop {
+        terminal.draw(|frame| {
+            let paragraph = Paragraph::new(archetype_lines(
+                &forge,
+                custom.as_deref(),
+                false,
+                ArchetypeSelectorContext::Onboarding,
+            ))
+            .block(Block::default().borders(Borders::ALL).title(" SVAROG "))
+            .style(Style::default().bg(colors::BG).fg(colors::TEXT))
+            .wrap(Wrap { trim: false });
+            frame.render_widget(paragraph, frame.area());
+        })?;
+        if let Event::Key(key) = event::read()? {
+            if let Some(value) = custom.as_mut() {
+                match key.code {
+                    KeyCode::Esc => custom = None,
+                    KeyCode::Backspace => {
+                        value.pop();
+                    }
+                    KeyCode::Char(ch) if value.chars().count() < 120 => value.push(ch),
+                    KeyCode::Enter if !value.trim().is_empty() => {
+                        forge.archetype = crate::archetypes::ArchetypeId::Custom;
+                        forge.custom_archetype = Some(value.trim().to_string());
+                        break Ok(forge);
+                    }
+                    _ => {}
+                }
+            } else {
+                match key.code {
+                    KeyCode::Left | KeyCode::Char('h') => {
+                        forge.archetype = crate::archetypes::next(forge.archetype, -1);
+                        forge.custom_archetype = None;
+                    }
+                    KeyCode::Right | KeyCode::Char('l') => {
+                        forge.archetype = crate::archetypes::next(forge.archetype, 1);
+                        forge.custom_archetype = None;
+                    }
+                    KeyCode::Char('/') => custom = Some(String::new()),
+                    KeyCode::Enter => break Ok(forge),
+                    KeyCode::Esc => {}
+                    _ => {}
+                }
+            }
+        }
+    };
+    let _ = disable_raw_mode();
+    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+    let _ = terminal.show_cursor();
+    result
+}
+
 fn screen_lines(view: &ViewModel, ui: &TuiState, in_tmux: bool) -> Vec<Line<'static>> {
     let mut lines = view_lines(view, ui);
     if in_tmux {
@@ -742,9 +1808,10 @@ fn exercise_help_lines(
     demo: bool,
 ) -> Vec<Line<'static>> {
     let mut lines = vec![
-        title_line(demo),
-        Line::from(""),
-        Line::from(Span::styled(rec.display_name(), accent_bold())),
+        with_demo(
+            Line::from(Span::styled(rec.display_name(), accent_bold())),
+            demo,
+        ),
         Line::from(Span::styled("How to", text_bold())),
         Line::from(""),
     ];
@@ -793,9 +1860,10 @@ fn idle_lines(
     demo: bool,
 ) -> Vec<Line<'static>> {
     let mut lines = vec![
-        title_line(demo),
-        Line::from(""),
-        Line::from(Span::styled("Waiting for the next forge.", muted())),
+        with_demo(
+            Line::from(Span::styled("Waiting for the next forge.", muted())),
+            demo,
+        ),
         Line::from(""),
         forge_now_control_line(),
         forge_list_controls_line(),
@@ -807,11 +1875,18 @@ fn idle_lines(
     ));
     lines.push(Line::from(""));
     lines.push(recommender_line(backend));
+    lines.push(settings_control_line());
+    if backend.label == RecommenderBackend::Local.label() {
+        lines.push(Line::from(Span::styled(
+            "Tip: Use Codex/OpenAI key recommender in Settings.",
+            muted(),
+        )));
+    }
     lines.extend(activity_lines(activity));
     lines.extend(recommender_usage_lines(backend, token_usage));
     if backend.unavailable {
         lines.push(Line::from(Span::styled(
-            format!("Unavailable. Edit: {}", backend.config_file),
+            unavailable_backend_message(backend),
             muted(),
         )));
     }
@@ -833,12 +1908,13 @@ fn cooldown_lines(
     demo: bool,
 ) -> Vec<Line<'static>> {
     let mut lines = vec![
-        title_line(demo),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("Forged. ", accent_bold()),
-            Span::styled("Waiting for the next forge.", muted()),
-        ]),
+        with_demo(
+            Line::from(vec![
+                Span::styled("Forged. ", accent_bold()),
+                Span::styled("Waiting for the next forge.", muted()),
+            ]),
+            demo,
+        ),
         Line::from(""),
         forge_now_control_line(),
         forge_list_controls_line(),
@@ -850,11 +1926,12 @@ fn cooldown_lines(
     ));
     lines.push(Line::from(""));
     lines.push(recommender_line(backend));
+    lines.push(settings_control_line());
     lines.extend(activity_lines(activity));
     lines.extend(recommender_usage_lines(backend, token_usage));
     if backend.unavailable {
         lines.push(Line::from(Span::styled(
-            format!("Unavailable. Edit: {}", backend.config_file),
+            unavailable_backend_message(backend),
             muted(),
         )));
     }
@@ -891,13 +1968,23 @@ fn activity_lines(activity: &ForgeActivitySummary) -> Vec<Line<'static>> {
     ]
 }
 
+fn unavailable_backend_message(backend: &BackendView) -> String {
+    if backend.label == RecommenderBackend::OpenaiKeyring.label() {
+        "Unavailable. Open Settings to save an OpenAI API key.".into()
+    } else {
+        format!("Unavailable. Edit: {}", backend.config_file)
+    }
+}
+
 fn recommender_usage_lines(
     backend: &BackendView,
     usage: &RecommenderTokenUsageByProvider,
 ) -> Vec<Line<'static>> {
     let (title, usage, show_api_hint) = if backend.label == RecommenderBackend::Codex.label() {
         ("Svarog Codex tokens (in/out)", &usage.codex, true)
-    } else if backend.label == RecommenderBackend::Openai.label() {
+    } else if backend.label == RecommenderBackend::OpenaiEnv.label()
+        || backend.label == RecommenderBackend::OpenaiKeyring.label()
+    {
         ("Svarog OpenAI API tokens (in/out)", &usage.openai, false)
     } else {
         return Vec::new();
@@ -937,7 +2024,7 @@ fn recommender_usage_lines(
             )),
             Line::from(Span::styled("export OPENAI_API_KEY=\"...\"", muted())),
             Line::from(Span::styled(
-                "Restart Svarog, then select [OpenAI API] with →.",
+                "Restart Svarog, then select [OpenAI (environment)] in Settings.",
                 muted(),
             )),
         ]);
@@ -961,8 +2048,11 @@ fn recommender_line(backend: &BackendView) -> Line<'static> {
     Line::from(vec![
         Span::styled("Recommender: ", muted()),
         Span::styled(format!("[{}]", backend.label), text()),
-        Span::styled("  ← →", muted()),
     ])
+}
+
+fn settings_control_line() -> Line<'static> {
+    Line::from(Span::styled("[s] Settings", muted()))
 }
 
 fn tmux_control_lines() -> Vec<Line<'static>> {
@@ -1091,11 +2181,10 @@ fn next_forge_lines(
     feedback: Option<&QueueRegenerationFeedback>,
     forge_now_feedback: Option<&str>,
 ) -> Vec<Line<'static>> {
-    let mut lines = vec![
-        title_line(demo),
-        Line::from(""),
+    let mut lines = vec![with_demo(
         Line::from(Span::styled("Next forges", text_bold())),
-    ];
+        demo,
+    )];
     if next_forges.is_empty() {
         lines.extend([
             Line::from(""),
@@ -1155,11 +2244,10 @@ fn history_lines_for_date(
     demo: bool,
     today: chrono::NaiveDate,
 ) -> Vec<Line<'static>> {
-    let mut lines = vec![
-        title_line(demo),
-        Line::from(""),
+    let mut lines = vec![with_demo(
         Line::from(Span::styled("Latest forges", text_bold())),
-    ];
+        demo,
+    )];
     if history.is_empty() {
         lines.extend([
             Line::from(""),
@@ -1244,30 +2332,13 @@ fn skip_confirmation_action(code: KeyCode) -> Option<SkipConfirmationAction> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CycleDirection {
-    Forward,
-    Backward,
-}
-
-fn recommender_cycle_direction(code: KeyCode) -> Option<CycleDirection> {
-    match code {
-        KeyCode::Left => Some(CycleDirection::Backward),
-        KeyCode::Right
-        | KeyCode::Char('r')
-        | KeyCode::Char('R')
-        | KeyCode::Tab
-        | KeyCode::Char(' ') => Some(CycleDirection::Forward),
-        _ => None,
-    }
-}
-
 fn forge_lines(rec: &Recommendation, ui: &TuiState) -> Vec<Line<'static>> {
     if ui.skip_check {
         return vec![
-            title_line(ui.demo),
-            Line::from(""),
-            Line::from(Span::styled("Skip this forge?", accent_bold())),
+            with_demo(
+                Line::from(Span::styled("Skip this forge?", accent_bold())),
+                ui.demo,
+            ),
             Line::from(""),
             Line::from(Span::styled("Are you fatigued?", text())),
             Line::from(Span::styled(
@@ -1287,14 +2358,13 @@ fn forge_lines(rec: &Recommendation, ui: &TuiState) -> Vec<Line<'static>> {
         ];
     }
 
-    let mut lines = vec![
-        title_line(ui.demo),
-        Line::from(""),
+    let mut lines = vec![with_demo(
         Line::from(Span::styled(
             rec.display_name().to_uppercase(),
             accent_bold(),
         )),
-    ];
+        ui.demo,
+    )];
     if let Some(weight) = rec.weight_kg {
         lines.push(Line::from(Span::styled(weight_label(weight), text())));
     }
@@ -1375,15 +2445,11 @@ fn animation_lines(frame: usize) -> Vec<Line<'static>> {
         .collect()
 }
 
-fn title_line(demo: bool) -> Line<'static> {
-    let mut spans = vec![
-        Span::styled("⚒ ", accent_bold()),
-        Span::styled("Svarog", text_bold()),
-    ];
+fn with_demo(mut line: Line<'static>, demo: bool) -> Line<'static> {
     if demo {
-        spans.push(Span::styled("  [demo]", muted()));
+        line.spans.push(Span::styled("  [demo]", muted()));
     }
-    Line::from(spans)
+    line
 }
 
 fn text() -> Style {
@@ -1420,11 +2486,632 @@ mod tests {
     use super::*;
     use crate::config::{Config, Recommender, RecommenderBackend};
     use crate::models::{
-        Agent, ForgeActivityTotals, RecommenderTokenUsageSummary, TokenUsageTotals,
+        Agent, ForgeActivityTotals, RecommenderTokenUsage, RecommenderTokenUsageSummary,
+        TokenUsageTotals,
     };
     use crate::recommender::QueueGenerationSource;
     use chrono::{TimeZone, Utc};
+    use std::cell::Cell;
+    use std::time::Duration;
     use tempfile::tempdir;
+
+    fn settings_state() -> SettingsState {
+        SettingsState {
+            draft: Config::default(),
+            applied_recommender_backend: RecommenderBackend::Local,
+            row: 0,
+            editing: false,
+            edit_value: Zeroizing::new(String::new()),
+            edit_cursor: 0,
+            edit_scroll: 0,
+            selecting_archetype: false,
+            custom_archetype: false,
+            archetype_original: None,
+            saved_openai_key_present: false,
+            saved_openai_key_error: None,
+            confirming_openai_key_delete: false,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn view_refreshes_on_interval_or_when_forced() {
+        let last_refresh = Instant::now();
+
+        assert!(!view_refresh_due(
+            last_refresh,
+            last_refresh + Duration::from_millis(499),
+            false
+        ));
+        assert!(view_refresh_due(
+            last_refresh,
+            last_refresh + VIEW_REFRESH_INTERVAL,
+            false
+        ));
+        assert!(view_refresh_due(last_refresh, last_refresh, true));
+    }
+
+    #[test]
+    fn settings_show_focus_and_archetype_opens_full_selector() {
+        let mut settings = settings_state();
+        let text = settings_lines(&settings, false, 120, 40)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("› Forge archetype"));
+        assert!(text.contains("Athlete  [enter] Choose"));
+        assert!(text.contains("Apply changes"));
+        assert!(text.contains("[ctrl/cmd+s] Apply changes  [esc] Cancel settings"));
+        assert!(!text.contains("› Apply changes"));
+
+        settings.selecting_archetype = true;
+        let selector = settings_lines(&settings, false, 120, 40)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(selector.contains("ATHLETE"));
+        assert!(selector.contains("Strength"));
+        assert!(selector.contains("You can change your archetype at any time."));
+        assert!(selector.contains("[esc] Back"));
+        assert!(!selector.contains('★'));
+    }
+
+    #[test]
+    fn saved_openai_key_row_appears_below_keyring_recommender_only() {
+        let mut settings = settings_state();
+        let local = settings_lines(&settings, false, 120, 40)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        assert!(!local.iter().any(|line| line.contains("Saved OpenAI key")));
+
+        settings.draft.recommender.backend = RecommenderBackend::OpenaiKeyring;
+        let keyring = settings_lines(&settings, false, 120, 40)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        let recommender = keyring
+            .iter()
+            .position(|line| line.contains("Recommender"))
+            .unwrap();
+        let saved_key = keyring
+            .iter()
+            .position(|line| line.contains("Saved OpenAI key"))
+            .unwrap();
+        let notifications = keyring
+            .iter()
+            .position(|line| line.contains("Notifications"))
+            .unwrap();
+        assert_eq!(saved_key, recommender + 1);
+        assert_eq!(notifications, saved_key + 1);
+
+        settings.row = 1;
+        move_settings_focus(&mut settings, true);
+        assert_eq!(settings.row, 15);
+        move_settings_focus(&mut settings, true);
+        assert_eq!(settings.row, 2);
+
+        settings.saved_openai_key_present = true;
+        settings.draft.recommender.backend = RecommenderBackend::Codex;
+        assert!(!settings_lines(&settings, false, 120, 40)
+            .iter()
+            .any(|line| line.to_string().contains("Saved OpenAI key")));
+        settings.draft.recommender.backend = RecommenderBackend::OpenaiKeyring;
+        assert!(settings_lines(&settings, false, 120, 40)
+            .iter()
+            .any(|line| line.to_string().contains("configured")));
+    }
+
+    #[test]
+    fn saved_key_lookup_is_lazy_cached_and_retryable() {
+        let mut settings = settings_state();
+        let mut cached = None;
+        let lookups = Cell::new(0);
+
+        refresh_saved_openai_key_state_with(&mut settings, &mut cached, || {
+            lookups.set(lookups.get() + 1);
+            Ok(true)
+        });
+        assert_eq!(lookups.get(), 0);
+        assert_eq!(cached, None);
+
+        settings.draft.recommender.backend = RecommenderBackend::OpenaiKeyring;
+        refresh_saved_openai_key_state_with(&mut settings, &mut cached, || {
+            lookups.set(lookups.get() + 1);
+            Ok(true)
+        });
+        assert_eq!(lookups.get(), 1);
+        assert_eq!(cached, Some(true));
+        assert!(settings.saved_openai_key_present);
+
+        refresh_saved_openai_key_state_with(&mut settings, &mut cached, || {
+            panic!("cached availability should avoid another lookup")
+        });
+
+        cached = None;
+        for expected in 2..=3 {
+            refresh_saved_openai_key_state_with(&mut settings, &mut cached, || {
+                lookups.set(lookups.get() + 1);
+                anyhow::bail!("credential store is locked")
+            });
+            assert_eq!(lookups.get(), expected);
+            assert_eq!(cached, None);
+            assert!(settings.saved_openai_key_error.is_some());
+        }
+    }
+
+    #[test]
+    fn applying_another_backend_clears_cached_key_state() {
+        let mut cached = Some(true);
+        let cleared = Cell::new(false);
+        update_saved_openai_key_cache_after_apply(
+            &mut cached,
+            RecommenderBackend::Codex,
+            true,
+            || cleared.set(true),
+        );
+        assert!(cleared.get());
+        assert_eq!(cached, None);
+
+        let cleared = Cell::new(false);
+        update_saved_openai_key_cache_after_apply(
+            &mut cached,
+            RecommenderBackend::OpenaiKeyring,
+            true,
+            || cleared.set(true),
+        );
+        assert!(!cleared.get());
+        assert_eq!(cached, Some(true));
+    }
+
+    #[test]
+    fn onboarding_selector_puts_controls_below_description_without_escape() {
+        let forge = Forge::default();
+        let lines = archetype_lines(&forge, None, false, ArchetypeSelectorContext::Onboarding);
+
+        assert_eq!(lines[0].to_string(), "ATHLETE");
+        assert_eq!(lines[0].spans[0].style.fg, Some(colors::EMBER));
+        assert_eq!(
+            lines[1].to_string(),
+            crate::archetypes::get(forge.archetype).description
+        );
+        assert!(lines[2].to_string().is_empty());
+        assert_eq!(
+            lines[3].to_string(),
+            "←/h Previous   →/l Next   [enter] Choose   [/] Custom"
+        );
+        assert_eq!(
+            lines[4].to_string(),
+            "You can change your archetype at any time."
+        );
+        assert!(!lines.iter().any(|line| line.to_string().contains("[esc]")));
+        assert_eq!(lines[6].to_string(), "Strength   ████████░░  8");
+    }
+
+    #[test]
+    fn settings_text_edits_are_staged_until_apply() {
+        let mut settings = settings_state();
+        settings.row = 8;
+        begin_setting_edit(&mut settings);
+        settings.edit_value = Zeroizing::new("mobility, strength".into());
+        commit_setting_edit(&mut settings).unwrap();
+        assert_eq!(settings.draft.profile.goals, vec!["mobility", "strength"]);
+    }
+
+    #[test]
+    fn saved_openai_key_editor_masks_and_saves_the_secret_immediately() {
+        let mut settings = settings_state();
+        settings.draft.recommender.backend = RecommenderBackend::OpenaiKeyring;
+        settings.row = 15;
+        begin_setting_edit(&mut settings);
+        settings.edit_value = Zeroizing::new("sk-never-render-this".into());
+        settings.edit_cursor = settings.edit_value.chars().count();
+
+        let rendered = settings_lines(&settings, false, 120, 40)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!rendered.contains("sk-never-render-this"));
+        assert!(rendered.contains('•'));
+        assert!(rendered.contains("[enter] Save key"));
+
+        let mut saved = String::new();
+        assert!(save_openai_key_edit_with(&mut settings, |secret| {
+            saved = secret.to_string();
+            Ok(())
+        })
+        .unwrap());
+        assert_eq!(saved, "sk-never-render-this");
+        assert!(settings.saved_openai_key_present);
+        assert!(settings.edit_value.is_empty());
+        assert!(!format!("{settings:?}").contains("sk-never-render-this"));
+        assert!(!toml::to_string(&settings.draft)
+            .unwrap()
+            .contains("sk-never-render-this"));
+    }
+
+    #[test]
+    fn saved_openai_key_removal_requires_confirmation_and_can_be_cancelled() {
+        let root = tempdir().unwrap().keep();
+        let env = test_env(root);
+        let mut settings = settings_state();
+        settings.draft.recommender.backend = RecommenderBackend::OpenaiKeyring;
+        settings.row = 15;
+        settings.saved_openai_key_present = true;
+        let mut ui = TuiState {
+            settings: Some(settings),
+            saved_openai_key_available: Some(true),
+            ..TuiState::default()
+        };
+
+        handle_settings_key(&mut ui, KeyCode::Delete, KeyModifiers::NONE, &env).unwrap();
+        let settings = ui.settings.as_ref().unwrap();
+        assert!(settings.confirming_openai_key_delete);
+        let rendered = settings_lines(settings, false, 120, 40)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("Remove saved OpenAI key?"));
+        assert!(rendered.contains("[enter/y] Remove key  [esc] Cancel"));
+
+        handle_settings_key(&mut ui, KeyCode::Esc, KeyModifiers::NONE, &env).unwrap();
+        assert!(!ui.settings.as_ref().unwrap().confirming_openai_key_delete);
+        assert!(ui.settings.as_ref().unwrap().saved_openai_key_present);
+    }
+
+    #[test]
+    fn confirmed_saved_openai_key_removal_updates_settings_state() {
+        let mut settings = settings_state();
+        settings.saved_openai_key_present = true;
+        settings.confirming_openai_key_delete = true;
+        let mut removed = false;
+
+        remove_saved_openai_key_with(&mut settings, || {
+            removed = true;
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(removed);
+        assert!(!settings.saved_openai_key_present);
+        assert!(!settings.confirming_openai_key_delete);
+    }
+
+    #[test]
+    fn credential_store_failures_preserve_safe_retry_state() {
+        let mut saving = settings_state();
+        saving.row = 15;
+        begin_setting_edit(&mut saving);
+        saving.edit_value = Zeroizing::new("sk-retry-secret".into());
+        saving.edit_cursor = saving.edit_value.chars().count();
+
+        let save_error =
+            save_openai_key_edit_with(&mut saving, |_| anyhow::bail!("credential store is locked"))
+                .unwrap_err();
+        assert_eq!(save_error.to_string(), "credential store is locked");
+        assert!(saving.editing);
+        assert_eq!(saving.edit_value.as_str(), "sk-retry-secret");
+        assert!(!format!("{saving:?}").contains("sk-retry-secret"));
+
+        let mut removing = settings_state();
+        removing.saved_openai_key_present = true;
+        removing.confirming_openai_key_delete = true;
+        let remove_error = remove_saved_openai_key_with(&mut removing, || {
+            anyhow::bail!("credential store is locked")
+        })
+        .unwrap_err();
+        assert_eq!(remove_error.to_string(), "credential store is locked");
+        assert!(removing.saved_openai_key_present);
+        assert!(removing.confirming_openai_key_delete);
+    }
+
+    #[test]
+    fn saved_key_backend_cannot_apply_without_a_key() {
+        let root = tempdir().unwrap().keep();
+        let env = test_env(root);
+        let mut settings = settings_state();
+        settings.draft.recommender.backend = RecommenderBackend::OpenaiKeyring;
+        let mut ui = TuiState {
+            settings: Some(settings),
+            ..TuiState::default()
+        };
+
+        handle_settings_key(&mut ui, KeyCode::Char('s'), KeyModifiers::CONTROL, &env).unwrap();
+
+        let settings = ui.settings.as_ref().unwrap();
+        assert!(settings
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("Set a saved OpenAI key"));
+    }
+
+    #[test]
+    fn apply_shortcut_is_ignored_while_editing_a_field() {
+        let root = tempdir().unwrap().keep();
+        let env = test_env(root);
+        let mut settings = settings_state();
+        settings.row = 8;
+        begin_setting_edit(&mut settings);
+        let original = settings.edit_value.clone();
+        let mut ui = TuiState {
+            settings: Some(settings),
+            ..TuiState::default()
+        };
+
+        handle_settings_key(&mut ui, KeyCode::Char('s'), KeyModifiers::CONTROL, &env).unwrap();
+
+        let settings = ui.settings.as_ref().unwrap();
+        assert!(settings.editing);
+        assert_eq!(settings.edit_value, original);
+    }
+
+    #[test]
+    fn settings_viewport_keeps_the_focused_row_visible() {
+        let mut settings = settings_state();
+        let top = settings_lines(&settings, false, 60, 10)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(top.contains("› Forge archetype"));
+
+        settings.row = 14;
+        let bottom = settings_lines(&settings, false, 60, 10)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(bottom.contains("› Exercise preferences"));
+        assert!(bottom.contains("[ctrl/cmd+s] Apply changes  [esc] Cancel settings"));
+        assert!(!bottom.contains("Forge archetype"));
+    }
+
+    #[test]
+    fn settings_apply_shortcut_accepts_control_and_super_only() {
+        assert!(settings_apply_requested(
+            KeyCode::Char('s'),
+            KeyModifiers::CONTROL
+        ));
+        assert!(settings_apply_requested(
+            KeyCode::Char('s'),
+            KeyModifiers::SUPER
+        ));
+        assert!(!settings_apply_requested(
+            KeyCode::Char('s'),
+            KeyModifiers::NONE
+        ));
+        assert!(!settings_apply_requested(
+            KeyCode::Char('x'),
+            KeyModifiers::CONTROL
+        ));
+    }
+
+    #[test]
+    fn measurement_arrows_adjust_display_units_and_seed_unset_values() {
+        let mut settings = settings_state();
+
+        settings.row = 5;
+        adjust_measurement(&mut settings, true);
+        assert_eq!(settings.draft.profile.height_cm, Some(171));
+        settings.draft.profile.height_cm = None;
+        adjust_measurement(&mut settings, false);
+        assert_eq!(settings.draft.profile.height_cm, Some(169));
+
+        settings.draft.profile.unit_system = UnitSystem::Imperial;
+        settings.draft.profile.height_cm = None;
+        adjust_measurement(&mut settings, true);
+        assert_eq!(
+            cli::format_imperial_height(settings.draft.profile.height_cm.unwrap()),
+            "5'8\""
+        );
+        settings.draft.profile.height_cm = None;
+        adjust_measurement(&mut settings, false);
+        assert_eq!(
+            cli::format_imperial_height(settings.draft.profile.height_cm.unwrap()),
+            "5'6\""
+        );
+
+        settings.row = 6;
+        settings.draft.profile.unit_system = UnitSystem::Metric;
+        adjust_measurement(&mut settings, true);
+        assert_eq!(settings.draft.profile.weight_kg, Some(71.0));
+        settings.draft.profile.weight_kg = None;
+        adjust_measurement(&mut settings, false);
+        assert_eq!(settings.draft.profile.weight_kg, Some(69.0));
+
+        settings.draft.profile.unit_system = UnitSystem::Imperial;
+        settings.draft.profile.weight_kg = None;
+        adjust_measurement(&mut settings, true);
+        assert!((settings.draft.profile.weight_kg.unwrap() * 2.204_622_6 - 155.0).abs() < 0.01);
+
+        settings.row = 7;
+        adjust_measurement(&mut settings, true);
+        assert_eq!(settings.draft.profile.age, Some(31));
+        settings.draft.profile.age = None;
+        adjust_measurement(&mut settings, false);
+        assert_eq!(settings.draft.profile.age, Some(29));
+    }
+
+    #[test]
+    fn measurement_arrows_saturate_at_one() {
+        let mut settings = settings_state();
+        settings.row = 5;
+        settings.draft.profile.height_cm = Some(1);
+        adjust_measurement(&mut settings, false);
+        assert_eq!(settings.draft.profile.height_cm, Some(1));
+
+        settings.row = 6;
+        settings.draft.profile.weight_kg = Some(1.0);
+        adjust_measurement(&mut settings, false);
+        assert_eq!(settings.draft.profile.weight_kg, Some(1.0));
+
+        settings.row = 7;
+        settings.draft.profile.age = Some(1);
+        adjust_measurement(&mut settings, false);
+        assert_eq!(settings.draft.profile.age, Some(1));
+    }
+
+    #[test]
+    fn editor_supports_cursor_insertion_and_deletion() {
+        let mut value = "ac".to_string();
+        let mut cursor = 1;
+        insert_at_cursor(&mut value, &mut cursor, 'b');
+        assert_eq!(value, "abc");
+        assert_eq!(cursor, 2);
+        backspace_at_cursor(&mut value, &mut cursor);
+        assert_eq!(value, "ac");
+        assert_eq!(cursor, 1);
+        delete_at_cursor(&mut value, cursor);
+        assert_eq!(value, "a");
+        assert_eq!(editor_window("0123456789", 9, 0, 5), "678│9");
+    }
+
+    #[test]
+    fn settings_accept_common_imperial_height_formats() {
+        for (value, expected_cm) in [("5'11", 180), ("6 ft 1 in", 185), ("71 in", 180)] {
+            let mut settings = settings_state();
+            settings.row = 5;
+            settings.draft.profile.unit_system = UnitSystem::Imperial;
+            settings.edit_value = Zeroizing::new(value.into());
+            commit_setting_edit(&mut settings).unwrap();
+            assert_eq!(
+                settings.draft.profile.height_cm,
+                Some(expected_cm),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn settings_keys_change_only_the_focused_field_and_cancel_nested_selector() {
+        let root = tempdir().unwrap().keep();
+        let env = test_env(root);
+        let mut ui = TuiState {
+            settings: Some(settings_state()),
+            ..TuiState::default()
+        };
+        let original_archetype = ui.settings.as_ref().unwrap().draft.forge.archetype;
+        handle_settings_key(&mut ui, KeyCode::Right, KeyModifiers::NONE, &env).unwrap();
+        assert_eq!(
+            ui.settings.as_ref().unwrap().draft.forge.archetype,
+            original_archetype
+        );
+
+        handle_settings_key(&mut ui, KeyCode::Down, KeyModifiers::NONE, &env).unwrap();
+        let original_backend = ui.settings.as_ref().unwrap().draft.recommender.backend;
+        handle_settings_key(&mut ui, KeyCode::Right, KeyModifiers::NONE, &env).unwrap();
+        assert_ne!(
+            ui.settings.as_ref().unwrap().draft.recommender.backend,
+            original_backend
+        );
+
+        handle_settings_key(&mut ui, KeyCode::Up, KeyModifiers::NONE, &env).unwrap();
+        handle_settings_key(&mut ui, KeyCode::Enter, KeyModifiers::NONE, &env).unwrap();
+        handle_settings_key(&mut ui, KeyCode::Right, KeyModifiers::NONE, &env).unwrap();
+        assert_ne!(
+            ui.settings.as_ref().unwrap().draft.forge.archetype,
+            original_archetype
+        );
+        handle_settings_key(&mut ui, KeyCode::Esc, KeyModifiers::NONE, &env).unwrap();
+        assert_eq!(
+            ui.settings.as_ref().unwrap().draft.forge.archetype,
+            original_archetype
+        );
+    }
+
+    #[test]
+    fn escape_discards_the_entire_settings_draft() {
+        let root = tempdir().unwrap().keep();
+        let env = test_env(root);
+        let original = Config::default();
+        config::save(&env.paths, &original).unwrap();
+        let mut settings = settings_state();
+        settings.draft.profile.goals = vec!["not saved".into()];
+        let mut ui = TuiState {
+            settings: Some(settings),
+            saved_openai_key_available: Some(true),
+            ..TuiState::default()
+        };
+
+        handle_settings_key(&mut ui, KeyCode::Esc, KeyModifiers::NONE, &env).unwrap();
+
+        assert!(ui.settings.is_none());
+        assert_eq!(ui.saved_openai_key_available, None);
+        assert_eq!(
+            config::load_or_default(&env.paths).unwrap().profile.goals,
+            original.profile.goals
+        );
+    }
+
+    #[test]
+    fn cancelling_settings_keeps_cache_only_for_the_applied_saved_key_backend() {
+        let root = tempdir().unwrap().keep();
+        let env = test_env(root);
+        let mut settings = settings_state();
+        settings.applied_recommender_backend = RecommenderBackend::OpenaiKeyring;
+        let mut ui = TuiState {
+            settings: Some(settings),
+            saved_openai_key_available: Some(true),
+            ..TuiState::default()
+        };
+
+        handle_settings_key(&mut ui, KeyCode::Esc, KeyModifiers::NONE, &env).unwrap();
+
+        assert!(ui.settings.is_none());
+        assert_eq!(ui.saved_openai_key_available, Some(true));
+    }
+
+    fn test_env(root: std::path::PathBuf) -> RuntimeEnv {
+        RuntimeEnv {
+            mode: RuntimeMode::Dev,
+            paths: Paths::from_root(root.clone()),
+            codex_home: root,
+            daemon_addr: "127.0.0.1:0".parse().unwrap(),
+            dry_run: true,
+        }
+    }
+
+    #[test]
+    fn failed_database_update_restores_previous_config() {
+        let root = tempdir().unwrap().keep();
+        let mut env = test_env(root.clone());
+        let previous = Config::default();
+        config::save(&env.paths, &previous).unwrap();
+        env.paths.database_file = root.join("database-directory");
+        std::fs::create_dir(&env.paths.database_file).unwrap();
+        let mut draft = previous.clone();
+        draft.profile.goals = vec!["changed".into()];
+
+        assert!(apply_settings(&env, &draft).is_err());
+        assert_eq!(
+            config::load_or_default(&env.paths).unwrap().profile.goals,
+            previous.profile.goals
+        );
+    }
+
+    #[test]
+    fn successful_settings_apply_reports_regeneration_result() {
+        let root = tempdir().unwrap().keep();
+        let env = test_env(root);
+        let mut draft = Config::default();
+        draft.recommender.backend = RecommenderBackend::Local;
+        draft.profile.goals = vec!["mobility".into()];
+
+        let receiver = apply_settings(&env, &draft).unwrap();
+        assert!(receiver
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .is_ok());
+        assert_eq!(
+            config::load_or_default(&env.paths).unwrap().profile.goals,
+            vec!["mobility"]
+        );
+    }
 
     fn rec() -> Recommendation {
         Recommendation {
@@ -1481,14 +3168,14 @@ mod tests {
         .collect::<Vec<_>>()
         .join("\n");
 
-        assert!(text.contains("Svarog"));
+        assert!(!text.contains("⚒ Svarog"));
         assert!(text.contains("Waiting for the next forge."));
         assert!(text.contains("[l] Latest forges"));
         assert!(text.contains("[n] Next forges"));
         assert!(text.contains(
-            "Waiting for the next forge.\n\n[f] Forge now\n[l] Latest forges [n] Next forges\n\nRecommender: [Codex]  ← →"
+            "Waiting for the next forge.\n\n[f] Forge now\n[l] Latest forges [n] Next forges\n\nRecommender: [Codex]\n[s] Settings"
         ));
-        assert!(text.contains("Recommender: [Codex]  ← →"));
+        assert!(text.contains("Recommender: [Codex]\n[s] Settings"));
         assert!(!text.contains("[r] Change recommender"));
         assert!(text.contains("Completed:"));
         assert!(text.contains("Svarog Codex tokens (in/out)"));
@@ -1496,7 +3183,7 @@ mod tests {
         assert!(text.contains("Week 0 forges / 0 reps"));
         assert!(text.contains("Use fewer Codex tokens with an OpenAI API key"));
         assert!(text.contains("export OPENAI_API_KEY=\"...\""));
-        assert!(text.contains("Restart Svarog, then select [OpenAI API] with →."));
+        assert!(text.contains("Restart Svarog, then select [OpenAI (environment)] in Settings."));
         assert!(!text.contains("sets"));
     }
 
@@ -1554,6 +3241,31 @@ mod tests {
                     < text.find("Svarog Codex tokens (in/out)").unwrap()
             );
         }
+    }
+
+    #[test]
+    fn local_backend_hint_appears_only_on_the_idle_screen() {
+        let backend = BackendView {
+            label: RecommenderBackend::Local.label().into(),
+            unavailable: false,
+            config_file: "/tmp/config.toml".into(),
+        };
+        let activity = ForgeActivitySummary::default();
+        let usage = RecommenderTokenUsageByProvider::default();
+        let hint = "Tip: Use Codex/OpenAI key recommender in Settings.";
+        let idle = idle_lines(&backend, &activity, &usage, None, None, None, None, false)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let cooldown = cooldown_lines(&backend, &activity, &usage, None, None, None, None, false)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(idle.contains(&format!("Recommender: [Local]\n[s] Settings\n{hint}")));
+        assert!(!cooldown.contains(hint));
     }
 
     #[test]
@@ -1869,6 +3581,7 @@ mod tests {
         let (success_sender, success_receiver) = std::sync::mpsc::channel();
         let mut ui = TuiState {
             queue_regeneration: Some(success_receiver),
+            settings_regeneration: true,
             ..TuiState::default()
         };
         success_sender
@@ -1881,7 +3594,7 @@ mod tests {
             .unwrap();
 
         let completed_at = Instant::now();
-        poll_queue_regeneration_at(&mut ui, completed_at);
+        assert!(poll_queue_regeneration_at(&mut ui, completed_at));
 
         assert!(ui.queue_regeneration.is_none());
         assert_eq!(
@@ -1892,27 +3605,48 @@ mod tests {
             ui.queue_regeneration_feedback_started_at,
             Some(completed_at)
         );
+        assert_eq!(
+            ui.status_message.as_deref(),
+            Some("Settings saved. Future forges refreshed.")
+        );
 
-        poll_queue_regeneration_at(&mut ui, completed_at + Duration::from_millis(2_999));
+        assert!(!poll_queue_regeneration_at(
+            &mut ui,
+            completed_at + Duration::from_millis(2_999)
+        ));
         assert_eq!(
             ui.queue_regeneration_feedback,
             Some(QueueRegenerationFeedback::Success)
         );
-        poll_queue_regeneration_at(&mut ui, completed_at + Duration::from_secs(3));
+        assert!(!poll_queue_regeneration_at(
+            &mut ui,
+            completed_at + Duration::from_secs(3)
+        ));
         assert!(ui.queue_regeneration_feedback.is_none());
         assert!(ui.queue_regeneration_feedback_started_at.is_none());
 
         let (failure_sender, failure_receiver) = std::sync::mpsc::channel();
         ui.queue_regeneration = Some(failure_receiver);
+        ui.settings_regeneration = true;
         failure_sender.send(Err("failed".into())).unwrap();
-        poll_queue_regeneration_at(&mut ui, completed_at + Duration::from_secs(4));
+        assert!(poll_queue_regeneration_at(
+            &mut ui,
+            completed_at + Duration::from_secs(4)
+        ));
         assert_eq!(
             ui.queue_regeneration_feedback,
             Some(QueueRegenerationFeedback::Failure {
                 no_safe_forges: false
             })
         );
-        poll_queue_regeneration_at(&mut ui, completed_at + Duration::from_secs(10));
+        assert_eq!(
+            ui.status_message.as_deref(),
+            Some("Settings saved. Future forges could not be refreshed; existing queue kept.")
+        );
+        assert!(!poll_queue_regeneration_at(
+            &mut ui,
+            completed_at + Duration::from_secs(10)
+        ));
         assert!(matches!(
             ui.queue_regeneration_feedback,
             Some(QueueRegenerationFeedback::Failure { .. })
@@ -1988,12 +3722,50 @@ mod tests {
     }
 
     #[test]
-    fn demo_title_is_visibly_marked() {
-        let title = title_line(true).to_string();
+    fn demo_marker_is_appended_without_adding_a_line() {
+        let marked = with_demo(Line::from("Settings"), true);
+        let unmarked = with_demo(Line::from("Settings"), false);
 
-        assert!(title.contains("Svarog"));
-        assert!(title.contains("[demo]"));
-        assert!(!title_line(false).to_string().contains("[demo]"));
+        assert_eq!(marked.to_string(), "Settings  [demo]");
+        assert_eq!(unmarked.to_string(), "Settings");
+    }
+
+    #[test]
+    fn primary_screens_start_with_content_and_inline_demo_marker() {
+        let backend = BackendView {
+            label: "Local".into(),
+            unavailable: false,
+            config_file: "/tmp/config.toml".into(),
+        };
+        let activity = ForgeActivitySummary::default();
+        let usage = RecommenderTokenUsageByProvider::default();
+        let recommendation = rec();
+        let ui = TuiState {
+            demo: true,
+            ..TuiState::default()
+        };
+        let screens = vec![
+            idle_lines(&backend, &activity, &usage, None, None, None, None, true),
+            cooldown_lines(&backend, &activity, &usage, None, None, None, None, true),
+            next_forge_lines(&[], true, None, None, None),
+            history_lines_for_date(&[], true, Local::now().date_naive()),
+            forge_lines(&recommendation, &ui),
+            exercise_help_lines(&recommendation, None, false, None, true),
+            settings_lines(&settings_state(), true, 120, 40),
+            archetype_lines(
+                &Forge::default(),
+                None,
+                true,
+                ArchetypeSelectorContext::Onboarding,
+            ),
+        ];
+
+        for lines in screens {
+            let first = lines.first().unwrap().to_string();
+            assert!(!first.trim().is_empty());
+            assert!(first.contains("[demo]"), "{first}");
+            assert!(!first.contains("Svarog"), "{first}");
+        }
     }
 
     #[test]
@@ -2009,15 +3781,18 @@ mod tests {
         assert_eq!(line.spans[0].style, muted());
         assert_eq!(line.spans[1].content.as_ref(), "[Codex]");
         assert_eq!(line.spans[1].style, text());
-        assert_eq!(line.spans[2].content.as_ref(), "  ← →");
-        assert_eq!(line.spans[2].style, muted());
+        assert_eq!(line.spans.len(), 2);
+
+        let settings = settings_control_line();
+        assert_eq!(settings.to_string(), "[s] Settings");
+        assert_eq!(settings.spans[0].style, muted());
     }
 
     #[test]
     fn missing_config_uses_unknown_backend_label() {
         let root = tempdir().unwrap().keep();
         let paths = Paths::from_root(root);
-        let backend = recommender_backend_view(&paths);
+        let backend = recommender_backend_view(&paths, None);
 
         assert_eq!(backend.label, "unknown");
         assert!(backend.unavailable);
@@ -2036,16 +3811,55 @@ mod tests {
         };
         config::save(&paths, &config).unwrap();
 
-        let backend = recommender_backend_view(&paths);
+        let backend = recommender_backend_view(&paths, None);
 
         assert_eq!(backend.label, "Local");
         assert!(!backend.unavailable);
     }
 
     #[test]
+    fn persistent_view_store_observes_writes_from_another_connection() {
+        let root = tempdir().unwrap();
+        let paths = Paths::from_root(root.path().to_path_buf());
+        config::save(&paths, &Config::default()).unwrap();
+        let reader = Store::open(&paths.database_file).unwrap();
+
+        let initial = load_view(&reader, &paths, None);
+        assert_eq!(initial.token_usage.codex.today.input_tokens, 0);
+
+        let writer = Store::open(&paths.database_file).unwrap();
+        writer
+            .record_recommender_token_usage(
+                RecommenderTokenProvider::Codex,
+                &RecommenderTokenUsage {
+                    input_tokens: 42,
+                    cached_input_tokens: 0,
+                    output_tokens: 7,
+                    reasoning_output_tokens: 0,
+                },
+                Utc::now(),
+            )
+            .unwrap();
+
+        let refreshed = load_view(&reader, &paths, None);
+        assert_eq!(refreshed.token_usage.codex.today.input_tokens, 42);
+        assert_eq!(refreshed.token_usage.codex.today.output_tokens, 7);
+    }
+
+    #[test]
     fn backend_cycle_order_matches_tui_shortcut() {
-        assert_eq!(RecommenderBackend::Local.next(), RecommenderBackend::Openai);
-        assert_eq!(RecommenderBackend::Openai.next(), RecommenderBackend::Codex);
+        assert_eq!(
+            RecommenderBackend::Local.next(),
+            RecommenderBackend::OpenaiEnv
+        );
+        assert_eq!(
+            RecommenderBackend::OpenaiEnv.next(),
+            RecommenderBackend::OpenaiKeyring
+        );
+        assert_eq!(
+            RecommenderBackend::OpenaiKeyring.next(),
+            RecommenderBackend::Codex
+        );
         assert_eq!(RecommenderBackend::Codex.next(), RecommenderBackend::Local);
         assert_eq!(
             RecommenderBackend::Local.previous(),
@@ -2053,72 +3867,16 @@ mod tests {
         );
         assert_eq!(
             RecommenderBackend::Codex.previous(),
-            RecommenderBackend::Openai
+            RecommenderBackend::OpenaiKeyring
         );
         assert_eq!(
-            RecommenderBackend::Openai.previous(),
+            RecommenderBackend::OpenaiKeyring.previous(),
+            RecommenderBackend::OpenaiEnv
+        );
+        assert_eq!(
+            RecommenderBackend::OpenaiEnv.previous(),
             RecommenderBackend::Local
         );
-    }
-
-    #[test]
-    fn recommender_cycle_key_accepts_common_idle_controls() {
-        assert_eq!(
-            recommender_cycle_direction(KeyCode::Left),
-            Some(CycleDirection::Backward)
-        );
-        assert_eq!(
-            recommender_cycle_direction(KeyCode::Right),
-            Some(CycleDirection::Forward)
-        );
-        assert_eq!(
-            recommender_cycle_direction(KeyCode::Char('r')),
-            Some(CycleDirection::Forward)
-        );
-        assert_eq!(
-            recommender_cycle_direction(KeyCode::Char('R')),
-            Some(CycleDirection::Forward)
-        );
-        assert_eq!(
-            recommender_cycle_direction(KeyCode::Tab),
-            Some(CycleDirection::Forward)
-        );
-        assert_eq!(
-            recommender_cycle_direction(KeyCode::Char(' ')),
-            Some(CycleDirection::Forward)
-        );
-        assert_eq!(recommender_cycle_direction(KeyCode::Char('d')), None);
-    }
-
-    #[test]
-    fn cycling_recommender_backend_persists_to_config() {
-        let root = tempdir().unwrap().keep();
-        let paths = Paths::from_root(root);
-        let config = Config::default();
-        config::save(&paths, &config).unwrap();
-        let store = Store::open(&paths.database_file).unwrap();
-        let mut queued = rec();
-        queued.id = None;
-        store.insert_queued_recommendation(&queued).unwrap();
-
-        cycle_recommender_backend(&paths, CycleDirection::Forward).unwrap();
-
-        let saved = config::load_or_default(&paths).unwrap();
-        assert_eq!(saved.recommender.backend, RecommenderBackend::Openai);
-        assert_eq!(store.queued_recommendation_count().unwrap(), 1);
-    }
-
-    #[test]
-    fn cycling_recommender_backend_backward_persists_to_config() {
-        let root = tempdir().unwrap().keep();
-        let paths = Paths::from_root(root);
-        let config = Config::default();
-        config::save(&paths, &config).unwrap();
-
-        cycle_recommender_backend(&paths, CycleDirection::Backward).unwrap();
-
-        let saved = config::load_or_default(&paths).unwrap();
-        assert_eq!(saved.recommender.backend, RecommenderBackend::Codex);
     }
 
     #[test]
@@ -2128,7 +3886,7 @@ mod tests {
         let paths = Paths::from_root(root);
         let mut config = Config {
             recommender: Recommender {
-                backend: RecommenderBackend::Openai,
+                backend: RecommenderBackend::OpenaiEnv,
                 ..Recommender::default()
             },
             ..Config::default()
@@ -2136,16 +3894,16 @@ mod tests {
         config.recommender.openai.api_key_env = "SVAROG_TEST_MISSING_OPENAI_KEY".to_string();
         config::save(&paths, &config).unwrap();
 
-        let backend = recommender_backend_view(&paths);
+        let backend = recommender_backend_view(&paths, None);
 
-        assert_eq!(backend.label, "OpenAI API");
+        assert_eq!(backend.label, "OpenAI (environment)");
         assert!(backend.unavailable);
     }
 
     #[test]
     fn unavailable_backend_lines_include_config_path() {
         let backend = BackendView {
-            label: "OpenAI API".to_string(),
+            label: "OpenAI (environment)".to_string(),
             unavailable: true,
             config_file: "/tmp/svarog/config.toml".to_string(),
         };
@@ -2164,7 +3922,7 @@ mod tests {
         .collect::<Vec<_>>()
         .join("\n");
 
-        assert!(text.contains("Recommender: [OpenAI API]"));
+        assert!(text.contains("Recommender: [OpenAI (environment)]"));
         assert!(text.contains("Unavailable. Edit: /tmp/svarog/config.toml"));
         assert!(text.contains("Svarog OpenAI API tokens"));
         assert!(!text.contains("Svarog Codex tokens"));
@@ -2194,7 +3952,7 @@ mod tests {
         };
 
         let openai = BackendView {
-            label: "OpenAI API".into(),
+            label: "OpenAI (environment)".into(),
             unavailable: false,
             config_file: "/tmp/svarog/config.toml".into(),
         };

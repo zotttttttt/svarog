@@ -7,7 +7,7 @@ use crate::models::{
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Local, TimeZone, Utc};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::Serialize;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -21,10 +21,20 @@ pub struct SetSummary {
     pub muscles: Vec<String>,
     pub status: String,
     pub reps: u32,
+    pub prescribed_reps: u32,
     pub weight_kg: Option<f32>,
     pub agent: String,
     pub project: Option<String>,
     pub side: Option<RecommendationSide>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutcomeSummary {
+    pub movement_id: String,
+    pub status: String,
+    pub prescribed_reps: u32,
+    pub actual_reps: u32,
     pub created_at: String,
 }
 
@@ -527,6 +537,40 @@ impl Store {
             .conn
             .unchecked_transaction()
             .context("starting exercise-pool replacement")?;
+        Self::replace_movement_pool_in_transaction(&transaction, movements)?;
+        transaction
+            .commit()
+            .context("committing exercise-pool replacement")
+    }
+
+    pub fn apply_user_profile_and_movement_pool(
+        &self,
+        config: &Config,
+        movements: &[Movement],
+    ) -> Result<()> {
+        let transaction = self
+            .conn
+            .unchecked_transaction()
+            .context("starting settings update")?;
+        transaction.execute(
+            r#"
+            INSERT INTO users (id, profile_json, created_at)
+            VALUES (1, ?1, ?2)
+            ON CONFLICT(id) DO UPDATE SET profile_json = excluded.profile_json
+            "#,
+            params![
+                serde_json::to_string(&config.profile)?,
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+        Self::replace_movement_pool_in_transaction(&transaction, movements)?;
+        transaction.commit().context("committing settings update")
+    }
+
+    fn replace_movement_pool_in_transaction(
+        transaction: &Transaction<'_>,
+        movements: &[Movement],
+    ) -> Result<()> {
         transaction.execute("DELETE FROM movements", [])?;
         {
             let mut statement = transaction.prepare(
@@ -596,9 +640,7 @@ impl Store {
             "#,
             [Utc::now().to_rfc3339()],
         )?;
-        transaction
-            .commit()
-            .context("committing exercise-pool replacement")
+        Ok(())
     }
 
     pub fn clear_exercise_exclusions(&self) -> Result<()> {
@@ -1220,26 +1262,6 @@ impl Store {
             .context("counting events")
     }
 
-    pub fn recent_skip_count(&self, movement_id: &str) -> Result<u32> {
-        self.conn
-            .query_row(
-                "SELECT COUNT(*) FROM (SELECT status FROM sets WHERE movement_id = ?1 ORDER BY id DESC LIMIT 3) WHERE status = 'skipped'",
-                [movement_id],
-                |row| row.get::<_, i64>(0).map(|count| count as u32),
-            )
-            .context("counting skips")
-    }
-
-    pub fn done_count(&self, movement_id: &str) -> Result<u32> {
-        self.conn
-            .query_row(
-                "SELECT COUNT(*) FROM sets WHERE movement_id = ?1 AND status = 'done'",
-                [movement_id],
-                |row| row.get::<_, i64>(0).map(|count| count as u32),
-            )
-            .context("counting movement completions")
-    }
-
     pub fn stats_today(&self) -> Result<(u32, u32, u32)> {
         let today = Utc::now().date_naive().to_string();
         self.conn
@@ -1262,6 +1284,85 @@ impl Store {
                 },
             )
             .context("loading today's stats")
+    }
+
+    pub fn recent_outcomes(&self, limit: u32) -> Result<Vec<OutcomeSummary>> {
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT s.movement_id, s.status, COALESCE(r.reps, s.reps), s.reps, s.created_at
+            FROM sets s
+            LEFT JOIN recommendations r ON r.id = s.recommendation_id
+            WHERE s.status IN ('done', 'skipped', 'pain')
+            ORDER BY s.created_at DESC, s.id DESC
+            LIMIT ?1
+            "#,
+        )?;
+        let rows = statement.query_map([i64::from(limit)], |row| {
+            Ok(OutcomeSummary {
+                movement_id: row.get(0)?,
+                status: row.get(1)?,
+                prescribed_reps: row.get::<_, i64>(2)? as u32,
+                actual_reps: row.get::<_, i64>(3)? as u32,
+                created_at: row.get(4)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("loading recent forge outcomes")
+    }
+
+    pub fn recent_movement_outcomes(
+        &self,
+        movement_id: &str,
+        limit: u32,
+    ) -> Result<Vec<OutcomeSummary>> {
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT s.movement_id, s.status, COALESCE(r.reps, s.reps), s.reps, s.created_at
+            FROM sets s
+            LEFT JOIN recommendations r ON r.id = s.recommendation_id
+            WHERE s.movement_id = ?1 AND s.status IN ('done', 'skipped', 'pain')
+            ORDER BY s.created_at DESC, s.id DESC
+            LIMIT ?2
+            "#,
+        )?;
+        let rows = statement.query_map(params![movement_id, i64::from(limit)], |row| {
+            Ok(OutcomeSummary {
+                movement_id: row.get(0)?,
+                status: row.get(1)?,
+                prescribed_reps: row.get::<_, i64>(2)? as u32,
+                actual_reps: row.get::<_, i64>(3)? as u32,
+                created_at: row.get(4)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("loading movement outcomes")
+    }
+
+    pub fn events_since_last_outcome(&self) -> Result<usize> {
+        let last: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT created_at FROM sets WHERE status IN ('done', 'skipped', 'pain') ORDER BY created_at DESC, id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match last {
+            Some(created_at) => self
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM events WHERE created_at > ?1",
+                    [created_at],
+                    |row| row.get::<_, i64>(0).map(|count| count as usize),
+                )
+                .context("counting movement opportunities"),
+            None => self
+                .conn
+                .query_row("SELECT COUNT(*) FROM events", [], |row| {
+                    row.get::<_, i64>(0).map(|count| count as usize)
+                })
+                .context("counting initial movement opportunities"),
+        }
     }
 
     pub fn completed_sets_today_and_yesterday(&self) -> Result<Vec<SetSummary>> {
@@ -1287,10 +1388,12 @@ impl Store {
             .with_timezone(&Utc);
         let mut stmt = self.conn.prepare(
             r#"
-            SELECT movement_id, muscles_json, status, reps, weight_kg, agent, project, side, created_at
-            FROM sets
-            WHERE status = 'done' AND created_at >= ?1 AND created_at < ?2
-            ORDER BY created_at DESC, id DESC
+            SELECT s.movement_id, s.muscles_json, s.status, s.reps,
+                   COALESCE(r.reps, s.reps), s.weight_kg, s.agent, s.project, s.side, s.created_at
+            FROM sets s
+            LEFT JOIN recommendations r ON r.id = s.recommendation_id
+            WHERE s.status IN ('done', 'skipped', 'pain') AND s.created_at >= ?1 AND s.created_at < ?2
+            ORDER BY s.created_at DESC, s.id DESC
             "#,
         )?;
         let rows = stmt.query_map(params![start.to_rfc3339(), end.to_rfc3339()], |row| {
@@ -1300,11 +1403,12 @@ impl Store {
                 muscles: serde_json::from_str(&muscles_json).unwrap_or_default(),
                 status: row.get(2)?,
                 reps: row.get::<_, i64>(3)? as u32,
-                weight_kg: row.get::<_, Option<f64>>(4)?.map(|value| value as f32),
-                agent: row.get(5)?,
-                project: row.get(6)?,
-                side: side_from_str(row.get(7)?),
-                created_at: row.get(8)?,
+                prescribed_reps: row.get::<_, i64>(4)? as u32,
+                weight_kg: row.get::<_, Option<f64>>(5)?.map(|value| value as f32),
+                agent: row.get(6)?,
+                project: row.get(7)?,
+                side: side_from_str(row.get(8)?),
+                created_at: row.get(9)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -1908,6 +2012,27 @@ mod tests {
         assert!(store.movements().unwrap().is_empty());
         assert!(store.latest_open_recommendation().unwrap().is_none());
         assert_eq!(store.state().unwrap().kind, AppStateKind::Idle);
+    }
+
+    #[test]
+    fn settings_profile_and_movement_pool_update_together() {
+        let store = store();
+        let mut config = Config::default();
+        config.profile.goals = vec!["mobility".into()];
+        let movements = crate::exercise_catalog::movements_for_equipment(&["bodyweight".into()]);
+
+        store
+            .apply_user_profile_and_movement_pool(&config, &movements)
+            .unwrap();
+
+        let profile_json: String = store
+            .conn
+            .query_row("SELECT profile_json FROM users WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(profile_json.contains("mobility"));
+        assert_eq!(store.movements().unwrap().len(), movements.len());
     }
 
     #[test]
