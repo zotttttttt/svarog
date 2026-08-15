@@ -144,11 +144,11 @@ jobs:
       - name: Update latest binary size badge
         if: ${{ !github.event.release.prerelease }}
         env:
-          BADGE_BRANCH: main
+          BADGE_BRANCH: badges
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
-          badge_path="badges/binary-size.json"
+          badge_path="binary-size.json"
           badge_api="repos/${GITHUB_REPOSITORY}/contents/${badge_path}"
           badge_sha="$(gh api "${badge_api}?ref=${BADGE_BRANCH}" --jq '.sha')"
           current_content="$(gh api "${badge_api}?ref=${BADGE_BRANCH}" --jq '.content' | tr -d '\n' | base64 --decode)"
