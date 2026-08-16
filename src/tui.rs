@@ -1347,7 +1347,7 @@ fn add_fuel_lines(
             ),
         ]),
         Line::from(""),
-        Line::from(Span::styled("Today’s nutrition", text_bold())),
+        Line::from(Span::styled("Today’s fuel", text_bold())),
         nutrition_summary_line(&state.nutrition),
         Line::from(""),
         Line::from(Span::styled("Recent fuel", text_bold())),
@@ -2982,17 +2982,17 @@ fn nutrition_lines(
 ) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::from(""),
-        Line::from(Span::styled("Today’s nutrition:", muted())),
+        Line::from(Span::styled("Today’s fuel:", muted())),
         nutrition_summary_line(nutrition),
     ];
     if let Some(average) = average {
         let day_label = if average.logged_days == 1 {
-            "logged day"
+            "day"
         } else {
-            "logged days"
+            "days"
         };
         lines.push(Line::from(Span::styled(
-            format!("Daily average ({} {day_label}):", average.logged_days),
+            format!("Daily average fuel ({} {day_label}):", average.logged_days),
             muted(),
         )));
         lines.push(nutrition_summary_line(&average.totals));
@@ -3010,7 +3010,7 @@ fn insert_weight_progress_line(
     };
     if let Some(index) = lines.iter().rposition(|existing| {
         let text = existing.to_string();
-        text == "Today’s nutrition:" || text.starts_with("Daily average (")
+        text == "Today’s fuel:" || text.starts_with("Daily average fuel (")
     }) {
         lines.insert(index + 2, line);
     }
@@ -4431,21 +4431,21 @@ mod tests {
             assert!(text.contains("[n] Next forges"));
             assert!(text.contains("Today 3 forges / 42 reps"));
             assert!(text.contains("Week 12 forges / 180 reps"));
-            assert!(text.contains("Today’s nutrition:"));
+            assert!(text.contains("Today’s fuel:"));
             assert!(text.contains("1840 kcal · P 122.0g · C 190.0g · F 61.0g · S 38.0g"));
-            assert!(text.contains("Daily average (7 logged days):"));
+            assert!(text.contains("Daily average fuel (7 days):"));
             assert!(text.contains("1720 kcal · P 110.0g · C 180.0g · F 58.0g · S 34.0g"));
             assert!(text.contains("Svarog Codex tokens (in/out)"));
             assert!(text.contains("Today  12.4k / 320"));
             assert!(text.contains("Week   58.1k / 1.4k"));
             assert!(text.contains("Use fewer Codex tokens with an OpenAI API key"));
-            assert!(text.find("Completed:").unwrap() < text.find("Today’s nutrition:").unwrap());
+            assert!(text.find("Completed:").unwrap() < text.find("Today’s fuel:").unwrap());
             assert!(
-                text.find("Today’s nutrition:").unwrap()
-                    < text.find("Daily average (7 logged days):").unwrap()
+                text.find("Today’s fuel:").unwrap()
+                    < text.find("Daily average fuel (7 days):").unwrap()
             );
             assert!(
-                text.find("Daily average (7 logged days):").unwrap()
+                text.find("Daily average fuel (7 days):").unwrap()
                     < text.find("Svarog Codex tokens (in/out)").unwrap()
             );
         }
@@ -4475,18 +4475,17 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(text.contains("Daily average (1 logged day):"));
+        assert!(text.contains("Daily average fuel (1 day):"));
         assert!(
-            text.find("Today’s nutrition:").unwrap()
-                < text.find("Daily average (1 logged day):").unwrap()
+            text.find("Today’s fuel:").unwrap() < text.find("Daily average fuel (1 day):").unwrap()
         );
         assert!(
-            text.find("Daily average (1 logged day):").unwrap()
+            text.find("Daily average fuel (1 day):").unwrap()
                 < text.find("Weight: 3.0 kg lost").unwrap()
         );
         assert!(!nutrition_lines(&NutritionTotals::default(), None)
             .iter()
-            .any(|line| line.to_string().starts_with("Daily average (")));
+            .any(|line| line.to_string().starts_with("Daily average fuel (")));
     }
 
     #[test]
@@ -5655,9 +5654,7 @@ mod tests {
         assert!(rendered.contains("coffee with milk"));
         assert!(rendered.contains("[enter] Log that fuel · 16/2000"));
         assert!(rendered.contains("200 ml  [+/-] 200 ml"));
-        assert!(
-            rendered.contains("Today’s nutrition\n120 kcal · P 3.0g · C 14.0g · F 5.0g · S 8.0g")
-        );
+        assert!(rendered.contains("Today’s fuel\n120 kcal · P 3.0g · C 14.0g · F 5.0g · S 8.0g"));
         assert!(rendered.contains("Recent fuel"));
         assert!(!rendered.contains("Today’s fuel"));
         assert!(!rendered.contains("Parse with Luna"));
