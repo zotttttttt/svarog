@@ -15,8 +15,8 @@ use crate::storage::{ForgeHistoryEntry, Store};
 use anyhow::{Context, Result};
 use chrono::{Datelike, Duration as ChronoDuration, Local};
 use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -35,6 +35,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use unicode_width::UnicodeWidthChar;
 use zeroize::Zeroizing;
 
 type Spark = (usize, usize, char, bool);
@@ -390,7 +391,7 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
             PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
         )?;
     }
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     let mut ui = TuiState {
@@ -401,7 +402,7 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
     let mut last_spark_toggle = Instant::now();
     let in_tmux = std::env::var_os("TMUX").is_some();
 
-    let result: Result<()> = loop {
+    let result: Result<()> = (|| loop {
         if shutdown.load(Ordering::Acquire) {
             cancel_add_fuel(&mut ui);
             break Ok(());
@@ -451,9 +452,28 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
         })?;
 
         if event::poll(Duration::from_millis(200))? {
-            if let Event::Key(key) = event::read()? {
+            let input_event = event::read()?;
+            if let Event::Paste(value) = &input_event {
+                let area = terminal.size()?;
                 if ui.add_fuel.is_some() {
-                    let close = handle_add_fuel_key(&mut ui, key.code, key.modifiers, env, &store);
+                    handle_add_fuel_paste(&mut ui, value, area.width, area.height);
+                } else {
+                    handle_settings_paste(&mut ui, value);
+                }
+                continue;
+            }
+            if let Event::Key(key) = input_event {
+                if ui.add_fuel.is_some() {
+                    let area = terminal.size()?;
+                    let close = handle_add_fuel_key(
+                        &mut ui,
+                        key.code,
+                        key.modifiers,
+                        env,
+                        &store,
+                        area.width,
+                        area.height,
+                    );
                     if close {
                         ui.add_fuel = None;
                     }
@@ -662,7 +682,7 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
                 }
             }
         }
-    };
+    })();
 
     cancel_add_fuel(&mut ui);
 
@@ -670,7 +690,11 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
         let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
     }
     let _ = disable_raw_mode();
-    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+    let _ = execute!(
+        terminal.backend_mut(),
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    );
     let _ = terminal.show_cursor();
     result
 }
@@ -975,20 +999,27 @@ fn start_fuel_parse(state: &mut AddFuelState, env: &RuntimeEnv) {
     state.feedback = None;
 }
 
-fn focus_scroll_hint(state: &AddFuelState) -> usize {
+fn focus_scroll_hint(state: &AddFuelState, area_width: u16) -> usize {
     match state.focus {
         AddFuelFocus::Meal => 0,
-        AddFuelFocus::Water => 4,
-        AddFuelFocus::Recent => 11,
+        AddFuelFocus::Water => {
+            3 + editor_visual_line_count(&state.input, editor_content_width(area_width))
+        }
+        AddFuelFocus::Recent => {
+            10 + editor_visual_line_count(&state.input, editor_content_width(area_width))
+                + state.selected_recent
+        }
     }
 }
 
 fn handle_add_fuel_key(
     ui: &mut TuiState,
     code: KeyCode,
-    _modifiers: KeyModifiers,
+    modifiers: KeyModifiers,
     env: &RuntimeEnv,
     store: &Store,
+    area_width: u16,
+    area_height: u16,
 ) -> bool {
     let Some(state) = ui.add_fuel.as_mut() else {
         return false;
@@ -1017,12 +1048,8 @@ fn handle_add_fuel_key(
             KeyCode::Home => state.scroll = 0,
             KeyCode::End => state.scroll = usize::MAX,
             KeyCode::Enter => {
-                let result = store.save_fuel_batch(
-                    state.input.trim(),
-                    &outcome.events,
-                    outcome.provider,
-                    outcome.model,
-                );
+                let result =
+                    store.save_fuel_batch(&outcome.events, outcome.provider, outcome.model);
                 match result {
                     Ok(ids) => {
                         let meal_count = ids.len();
@@ -1081,7 +1108,7 @@ fn handle_add_fuel_key(
                 AddFuelFocus::Water => AddFuelFocus::Recent,
                 AddFuelFocus::Recent => AddFuelFocus::Meal,
             };
-            state.scroll = focus_scroll_hint(state);
+            state.scroll = focus_scroll_hint(state, area_width);
         }
         KeyCode::BackTab => {
             state.focus = match state.focus {
@@ -1090,42 +1117,71 @@ fn handle_add_fuel_key(
                 AddFuelFocus::Water => AddFuelFocus::Meal,
                 AddFuelFocus::Recent => AddFuelFocus::Water,
             };
-            state.scroll = focus_scroll_hint(state);
+            state.scroll = focus_scroll_hint(state, area_width);
         }
         KeyCode::Up if state.focus == AddFuelFocus::Water => {
             state.focus = AddFuelFocus::Meal;
-            state.scroll = 0;
-        }
-        KeyCode::Down if state.focus == AddFuelFocus::Meal => {
-            state.focus = AddFuelFocus::Water;
-            state.scroll = 4;
+            keep_meal_cursor_visible(state, area_width, area_height);
         }
         KeyCode::Down if state.focus == AddFuelFocus::Water && !state.recent.is_empty() => {
             state.focus = AddFuelFocus::Recent;
-            state.scroll = focus_scroll_hint(state);
+            state.scroll = focus_scroll_hint(state, area_width);
         }
-        KeyCode::Enter if state.focus == AddFuelFocus::Meal => start_fuel_parse(state, env),
+        KeyCode::Enter
+            if state.focus == AddFuelFocus::Meal
+                && modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
+        {
+            start_fuel_parse(state, env)
+        }
+        KeyCode::Enter if state.focus == AddFuelFocus::Meal => {
+            insert_fuel_text(state, "\n");
+            keep_meal_cursor_visible(state, area_width, area_height);
+        }
         KeyCode::Backspace if state.focus == AddFuelFocus::Meal => {
-            backspace_at_cursor(&mut state.input, &mut state.cursor)
+            backspace_at_cursor(&mut state.input, &mut state.cursor);
+            keep_meal_cursor_visible(state, area_width, area_height);
         }
         KeyCode::Delete if state.focus == AddFuelFocus::Meal => {
-            delete_at_cursor(&mut state.input, state.cursor)
+            delete_at_cursor(&mut state.input, state.cursor);
+            keep_meal_cursor_visible(state, area_width, area_height);
         }
         KeyCode::Left if state.focus == AddFuelFocus::Meal => {
-            state.cursor = state.cursor.saturating_sub(1)
+            state.cursor = state.cursor.saturating_sub(1);
+            keep_meal_cursor_visible(state, area_width, area_height);
         }
         KeyCode::Right if state.focus == AddFuelFocus::Meal => {
-            state.cursor = (state.cursor + 1).min(state.input.chars().count())
+            state.cursor = (state.cursor + 1).min(state.input.chars().count());
+            keep_meal_cursor_visible(state, area_width, area_height);
         }
-        KeyCode::Home if state.focus == AddFuelFocus::Meal => state.cursor = 0,
+        KeyCode::Up if state.focus == AddFuelFocus::Meal => {
+            state.cursor = move_cursor_vertical(
+                &state.input,
+                state.cursor,
+                editor_content_width(area_width),
+                false,
+            );
+            keep_meal_cursor_visible(state, area_width, area_height);
+        }
+        KeyCode::Down if state.focus == AddFuelFocus::Meal => {
+            state.cursor = move_cursor_vertical(
+                &state.input,
+                state.cursor,
+                editor_content_width(area_width),
+                true,
+            );
+            keep_meal_cursor_visible(state, area_width, area_height);
+        }
+        KeyCode::Home if state.focus == AddFuelFocus::Meal => {
+            state.cursor = current_line_start(&state.input, state.cursor);
+            keep_meal_cursor_visible(state, area_width, area_height);
+        }
         KeyCode::End if state.focus == AddFuelFocus::Meal => {
-            state.cursor = state.input.chars().count()
+            state.cursor = current_line_end(&state.input, state.cursor);
+            keep_meal_cursor_visible(state, area_width, area_height);
         }
-        KeyCode::Char(ch)
-            if state.focus == AddFuelFocus::Meal
-                && state.input.chars().count() < fuel::MAX_FUEL_INPUT_CHARS =>
-        {
-            insert_at_cursor(&mut state.input, &mut state.cursor, ch)
+        KeyCode::Char(ch) if state.focus == AddFuelFocus::Meal => {
+            insert_fuel_text(state, &ch.to_string());
+            keep_meal_cursor_visible(state, area_width, area_height);
         }
         KeyCode::Char('+') | KeyCode::Char('=') if state.focus == AddFuelFocus::Water => {
             adjust_water_from_tui(state, store, 1.0)
@@ -1134,11 +1190,13 @@ fn handle_add_fuel_key(
             adjust_water_from_tui(state, store, -1.0)
         }
         KeyCode::Up if state.focus == AddFuelFocus::Recent => {
-            state.selected_recent = state.selected_recent.saturating_sub(1)
+            state.selected_recent = state.selected_recent.saturating_sub(1);
+            state.scroll = focus_scroll_hint(state, area_width);
         }
         KeyCode::Down if state.focus == AddFuelFocus::Recent => {
             state.selected_recent =
-                (state.selected_recent + 1).min(state.recent.len().saturating_sub(1))
+                (state.selected_recent + 1).min(state.recent.len().saturating_sub(1));
+            state.scroll = focus_scroll_hint(state, area_width);
         }
         KeyCode::Char('d') if state.focus == AddFuelFocus::Recent && !state.recent.is_empty() => {
             state.confirming_delete = true
@@ -1146,6 +1204,65 @@ fn handle_add_fuel_key(
         _ => {}
     }
     false
+}
+
+fn handle_add_fuel_paste(ui: &mut TuiState, value: &str, area_width: u16, area_height: u16) {
+    let Some(state) = ui.add_fuel.as_mut() else {
+        return;
+    };
+    if state.focus != AddFuelFocus::Meal
+        || state.parsing.is_some()
+        || state.parsed.is_some()
+        || state.confirming_delete
+    {
+        return;
+    }
+    let normalized = value
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .replace('\t', "    ")
+        .chars()
+        .filter(|character| *character == '\n' || !character.is_control())
+        .collect::<String>();
+    insert_fuel_text(state, &normalized);
+    keep_meal_cursor_visible(state, area_width, area_height);
+}
+
+fn handle_settings_paste(ui: &mut TuiState, value: &str) {
+    let Some(settings) = ui.settings.as_mut() else {
+        return;
+    };
+    let limit: usize = if settings.selecting_archetype && settings.custom_archetype {
+        120
+    } else if settings.editing {
+        500
+    } else {
+        return;
+    };
+    let remaining = limit.saturating_sub(settings.edit_value.chars().count());
+    let accepted = value
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(remaining)
+        .collect::<String>();
+    insert_text_at_cursor(
+        &mut settings.edit_value,
+        &mut settings.edit_cursor,
+        &accepted,
+    );
+}
+
+fn insert_fuel_text(state: &mut AddFuelState, value: &str) {
+    let remaining = fuel::MAX_FUEL_INPUT_CHARS.saturating_sub(state.input.chars().count());
+    let accepted = value.chars().take(remaining).collect::<String>();
+    let truncated = accepted.chars().count() < value.chars().count();
+    insert_text_at_cursor(&mut state.input, &mut state.cursor, &accepted);
+    state.feedback = truncated.then(|| {
+        format!(
+            "Meal description is limited to {} characters.",
+            fuel::MAX_FUEL_INPUT_CHARS
+        )
+    });
 }
 
 fn adjust_water_from_tui(state: &mut AddFuelState, store: &Store, direction: f64) {
@@ -1183,42 +1300,22 @@ fn add_fuel_lines(
         with_demo(Line::from(Span::styled("Add fuel", accent_bold())), demo),
         Line::from(""),
         Line::from(Span::styled("Meals or drinks", text_bold())),
-        Line::from(vec![
-            Span::styled(
-                if state.focus == AddFuelFocus::Meal {
-                    "› "
-                } else {
-                    "  "
-                },
-                accent_bold(),
-            ),
-            Span::styled(
-                if state.input.is_empty() {
-                    if state.focus == AddFuelFocus::Meal {
-                        "│ Describe one meal or a whole day…".to_string()
-                    } else {
-                        "Describe one meal or a whole day…".to_string()
-                    }
-                } else {
-                    editor_window(
-                        &state.input,
-                        state.cursor,
-                        0,
-                        width.saturating_sub(3).max(1),
-                    )
-                },
-                if state.focus == AddFuelFocus::Meal {
-                    accent()
-                } else {
-                    text()
-                },
-            ),
-        ]),
+    ];
+    lines.extend(meal_editor_lines(state, area_width));
+    lines.extend([
         Line::from(Span::styled(
             if state.backend == RecommenderBackend::Local {
-                "Nutrition parsing unavailable with Local recommender"
+                format!(
+                    "Nutrition parsing unavailable with Local recommender · {}/{}",
+                    state.input.chars().count(),
+                    fuel::MAX_FUEL_INPUT_CHARS
+                )
             } else {
-                "[enter] Log that fuel"
+                format!(
+                    "[ctrl/cmd+enter] Log that fuel · {}/{}",
+                    state.input.chars().count(),
+                    fuel::MAX_FUEL_INPUT_CHARS
+                )
             },
             muted(),
         )),
@@ -1247,7 +1344,7 @@ fn add_fuel_lines(
         nutrition_summary_line(&state.nutrition),
         Line::from(""),
         Line::from(Span::styled("Recent fuel", text_bold())),
-    ];
+    ]);
     if state.recent.is_empty() {
         lines.push(Line::from(Span::styled(
             "  No meals or drinks logged yet.",
@@ -1955,6 +2052,161 @@ fn editor_window(value: &str, cursor: usize, requested_scroll: usize, width: usi
     visible.into_iter().collect()
 }
 
+fn editor_content_width(area_width: u16) -> usize {
+    usize::from(area_width).saturating_sub(3).max(1)
+}
+
+#[derive(Clone, Copy)]
+struct EditorPosition {
+    row: usize,
+    character_column: usize,
+    display_column: usize,
+}
+
+fn editor_layout(value: &str, width: usize) -> (Vec<String>, Vec<EditorPosition>) {
+    let width = width.max(1);
+    let mut rows = vec![String::new()];
+    let mut positions = vec![EditorPosition {
+        row: 0,
+        character_column: 0,
+        display_column: 0,
+    }];
+    let mut row = 0;
+    let mut character_column: usize = 0;
+    let mut display_column: usize = 0;
+    let mut soft_wrapped = false;
+    for character in value.chars() {
+        if character == '\n' {
+            if soft_wrapped {
+                soft_wrapped = false;
+            } else {
+                row += 1;
+                character_column = 0;
+                display_column = 0;
+                rows.push(String::new());
+            }
+        } else {
+            soft_wrapped = false;
+            let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+            if display_column > 0 && display_column.saturating_add(character_width) > width {
+                row += 1;
+                character_column = 0;
+                display_column = 0;
+                rows.push(String::new());
+            }
+            rows[row].push(character);
+            character_column += 1;
+            display_column += character_width;
+            if display_column == width {
+                row += 1;
+                character_column = 0;
+                display_column = 0;
+                rows.push(String::new());
+                soft_wrapped = true;
+            }
+        }
+        positions.push(EditorPosition {
+            row,
+            character_column,
+            display_column,
+        });
+    }
+    (rows, positions)
+}
+
+fn editor_visual_line_count(value: &str, width: usize) -> usize {
+    editor_layout(value, width).0.len().max(1)
+}
+
+fn meal_editor_lines(state: &AddFuelState, area_width: u16) -> Vec<Line<'static>> {
+    let focused = state.focus == AddFuelFocus::Meal;
+    if state.input.is_empty() {
+        return vec![Line::from(vec![
+            Span::styled(if focused { "› " } else { "  " }, accent_bold()),
+            Span::styled(
+                if focused {
+                    "│ Describe one meal or a whole day…"
+                } else {
+                    "Describe one meal or a whole day…"
+                },
+                if focused { accent() } else { text() },
+            ),
+        ])];
+    }
+    let (mut rows, positions) = editor_layout(&state.input, editor_content_width(area_width));
+    if focused {
+        let position = positions[state.cursor.min(positions.len().saturating_sub(1))];
+        let byte = rows[position.row]
+            .char_indices()
+            .nth(position.character_column)
+            .map(|(index, _)| index)
+            .unwrap_or(rows[position.row].len());
+        rows[position.row].insert(byte, '│');
+    }
+    rows.into_iter()
+        .enumerate()
+        .map(|(index, row)| {
+            Line::from(vec![
+                Span::styled(
+                    if focused && index == 0 { "› " } else { "  " },
+                    accent_bold(),
+                ),
+                Span::styled(row, if focused { accent() } else { text() }),
+            ])
+        })
+        .collect()
+}
+
+fn move_cursor_vertical(value: &str, cursor: usize, width: usize, down: bool) -> usize {
+    let (_, positions) = editor_layout(value, width);
+    let cursor = cursor.min(positions.len().saturating_sub(1));
+    let position = positions[cursor];
+    let target_row = if down {
+        position.row.saturating_add(1)
+    } else if position.row == 0 {
+        return cursor;
+    } else {
+        position.row - 1
+    };
+    positions
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| candidate.row == target_row)
+        .min_by_key(|(_, candidate)| candidate.display_column.abs_diff(position.display_column))
+        .map(|(index, _)| index)
+        .unwrap_or(cursor)
+}
+
+fn current_line_start(value: &str, cursor: usize) -> usize {
+    value
+        .chars()
+        .take(cursor)
+        .collect::<Vec<_>>()
+        .iter()
+        .rposition(|character| *character == '\n')
+        .map_or(0, |index| index + 1)
+}
+
+fn current_line_end(value: &str, cursor: usize) -> usize {
+    let chars = value.chars().collect::<Vec<_>>();
+    chars
+        .iter()
+        .enumerate()
+        .skip(cursor.min(chars.len()))
+        .find(|(_, character)| **character == '\n')
+        .map_or(chars.len(), |(index, _)| index)
+}
+
+fn keep_meal_cursor_visible(state: &mut AddFuelState, area_width: u16, area_height: u16) {
+    let (_, positions) = editor_layout(&state.input, editor_content_width(area_width));
+    let position = positions[state.cursor.min(positions.len().saturating_sub(1))];
+    let cursor_body_row = 3 + position.row;
+    let body_height = usize::from(area_height).saturating_sub(2).max(1);
+    state.scroll = cursor_body_row
+        .saturating_add(1)
+        .saturating_sub(body_height);
+}
+
 fn insert_at_cursor(value: &mut String, cursor: &mut usize, character: char) {
     let byte = value
         .char_indices()
@@ -1963,6 +2215,16 @@ fn insert_at_cursor(value: &mut String, cursor: &mut usize, character: char) {
         .unwrap_or(value.len());
     value.insert(byte, character);
     *cursor += 1;
+}
+
+fn insert_text_at_cursor(value: &mut String, cursor: &mut usize, text_value: &str) {
+    let byte = value
+        .char_indices()
+        .nth(*cursor)
+        .map(|(index, _)| index)
+        .unwrap_or(value.len());
+    value.insert_str(byte, text_value);
+    *cursor += text_value.chars().count();
 }
 
 fn backspace_at_cursor(value: &mut String, cursor: &mut usize) {
@@ -5174,7 +5436,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(rendered.contains("coffee with milk"));
-        assert!(rendered.contains("[enter] Log that fuel"));
+        assert!(rendered.contains("[ctrl/cmd+enter] Log that fuel · 16/2000"));
         assert!(rendered.contains("200 ml  [+/-] 200 ml"));
         assert!(
             rendered.contains("Today’s nutrition\n120 kcal · P 3.0g · C 14.0g · F 5.0g · S 8.0g")
@@ -5217,10 +5479,185 @@ mod tests {
                 KeyModifiers::NONE,
                 &env,
                 &store,
+                120,
+                40,
             ));
         }
 
         assert_eq!(ui.add_fuel.unwrap().water.milliliters, 200.0);
+    }
+
+    #[test]
+    fn add_fuel_accepts_and_renders_a_multiline_whole_day_paste() {
+        let pasted = "August 16th:\r\n11 am - single espresso with 80 ml of 3.2% milk\r\n1 pm - 200 g of mashed potatoes, 50 g of peas\r\n9 pm - 5 hard boiled eggs";
+        let mut ui = TuiState {
+            add_fuel: Some(add_fuel_state_for_test()),
+            ..TuiState::default()
+        };
+
+        handle_add_fuel_paste(&mut ui, pasted, 100, 40);
+
+        let state = ui.add_fuel.as_ref().unwrap();
+        assert_eq!(state.input.matches('\n').count(), 3);
+        assert!(!state.input.contains('\r'));
+        let rendered = meal_editor_lines(state, 100)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("August 16th:"));
+        assert!(rendered.contains("11 am - single espresso"));
+        assert!(rendered.contains("9 pm - 5 hard boiled eggs"));
+    }
+
+    #[test]
+    fn add_fuel_enter_inserts_newline_and_modified_enter_submits() {
+        let root = tempdir().unwrap().keep();
+        let env = test_env(root.clone());
+        let store = Store::open(&root.join("svarog.sqlite3")).unwrap();
+        let mut state = add_fuel_state_for_test();
+        state.backend = RecommenderBackend::Local;
+        state.input = "meal".into();
+        state.cursor = 4;
+        let mut ui = TuiState {
+            add_fuel: Some(state),
+            ..TuiState::default()
+        };
+
+        assert!(!handle_add_fuel_key(
+            &mut ui,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+            &env,
+            &store,
+            80,
+            24,
+        ));
+        assert_eq!(ui.add_fuel.as_ref().unwrap().input, "meal\n");
+
+        for modifier in [KeyModifiers::CONTROL, KeyModifiers::SUPER] {
+            assert!(!handle_add_fuel_key(
+                &mut ui,
+                KeyCode::Enter,
+                modifier,
+                &env,
+                &store,
+                80,
+                24,
+            ));
+            assert!(ui
+                .add_fuel
+                .as_ref()
+                .unwrap()
+                .feedback
+                .as_deref()
+                .unwrap()
+                .contains("needs Codex or an OpenAI backend"));
+        }
+    }
+
+    #[test]
+    fn add_fuel_paste_enforces_limit_and_is_ignored_outside_meal_editing() {
+        let mut state = add_fuel_state_for_test();
+        state.input = "a".repeat(fuel::MAX_FUEL_INPUT_CHARS - 1);
+        state.cursor = state.input.chars().count();
+        let mut ui = TuiState {
+            add_fuel: Some(state),
+            ..TuiState::default()
+        };
+        handle_add_fuel_paste(&mut ui, "bc", 80, 24);
+        let state = ui.add_fuel.as_ref().unwrap();
+        assert_eq!(state.input.chars().count(), fuel::MAX_FUEL_INPUT_CHARS);
+        assert!(state.feedback.as_deref().unwrap().contains("limited"));
+
+        ui.add_fuel.as_mut().unwrap().focus = AddFuelFocus::Water;
+        handle_add_fuel_paste(&mut ui, "ignored", 80, 24);
+        assert!(!ui.add_fuel.as_ref().unwrap().input.contains("ignored"));
+    }
+
+    #[test]
+    fn multiline_editor_moves_vertically_and_keeps_recent_selection_visible() {
+        let (unicode_rows, _) = editor_layout("a界b", 3);
+        assert_eq!(unicode_rows, vec!["a界", "b"]);
+
+        let input = "first line\nsecond line\nthird line";
+        let second_line = input.find("second").unwrap();
+        assert_eq!(
+            move_cursor_vertical(input, second_line, 80, false),
+            input.find("first").unwrap()
+        );
+        assert_eq!(
+            move_cursor_vertical(input, second_line, 80, true),
+            input.find("third").unwrap()
+        );
+
+        let root = tempdir().unwrap().keep();
+        let env = test_env(root.clone());
+        let store = Store::open(&root.join("svarog.sqlite3")).unwrap();
+        let mut state = add_fuel_state_for_test();
+        state.focus = AddFuelFocus::Recent;
+        state.recent = (0..5)
+            .map(|index| FuelEntry {
+                id: i64::from(index),
+                raw_text: format!("meal {index}"),
+                parsed: FuelParseResult {
+                    items: vec![FuelItem {
+                        name: format!("item {index}"),
+                        quantity: None,
+                        unit: None,
+                        nutrition: NutritionTotals::default(),
+                        assumptions: Vec::new(),
+                    }],
+                },
+                totals: NutritionTotals::default(),
+                provider: "codex".into(),
+                model: fuel::FUEL_MODEL.into(),
+                created_at: chrono::Utc::now() - ChronoDuration::minutes(i64::from(index)),
+            })
+            .collect();
+        state.scroll = focus_scroll_hint(&state, 50);
+        let mut ui = TuiState {
+            add_fuel: Some(state),
+            ..TuiState::default()
+        };
+
+        for index in 0..5 {
+            if index > 0 {
+                handle_add_fuel_key(
+                    &mut ui,
+                    KeyCode::Down,
+                    KeyModifiers::NONE,
+                    &env,
+                    &store,
+                    50,
+                    7,
+                );
+            }
+            let rendered = add_fuel_lines(ui.add_fuel.as_ref().unwrap(), false, 50, 7)
+                .into_iter()
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(rendered.contains(&format!("item {index}")));
+        }
+    }
+
+    #[test]
+    fn bracketed_paste_keeps_settings_text_entry_working() {
+        let mut settings = settings_state();
+        settings.editing = true;
+        settings.row = 14;
+        let mut ui = TuiState {
+            settings: Some(settings),
+            ..TuiState::default()
+        };
+
+        handle_settings_paste(&mut ui, "posture and stretching");
+
+        assert_eq!(
+            ui.settings.as_ref().unwrap().edit_value.as_str(),
+            "posture and stretching"
+        );
     }
 
     #[test]
@@ -5293,10 +5730,12 @@ mod tests {
             events: vec![
                 TimedFuelEvent {
                     consumed_at: at(10),
+                    source_text: "breakfast".into(),
                     parsed: parsed.clone(),
                 },
                 TimedFuelEvent {
                     consumed_at: at(14),
+                    source_text: "lunch".into(),
                     parsed,
                 },
             ],
@@ -5315,6 +5754,8 @@ mod tests {
             KeyModifiers::NONE,
             &env,
             &store,
+            120,
+            40,
         ));
 
         let state = ui.add_fuel.unwrap();
@@ -5348,6 +5789,7 @@ mod tests {
         let outcome = FuelParseOutcome {
             events: vec![TimedFuelEvent {
                 consumed_at: chrono::Utc::now(),
+                source_text: "meal".into(),
                 parsed,
             }],
             inferred_yesterday: false,

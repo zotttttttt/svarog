@@ -15,6 +15,8 @@ pub const FUEL_MODEL: &str = "gpt-5.6-luna";
 const MAX_FUEL_ITEMS: usize = 20;
 const MAX_FUEL_EVENTS: usize = 12;
 const MAX_BATCH_ITEMS: usize = 40;
+const MAX_EVENT_SOURCE_CHARS: usize = 500;
+const YESTERDAY_INFERENCE_CUTOFF_HOUR: u32 = 4;
 pub const MAX_FUEL_INPUT_CHARS: usize = 2_000;
 
 #[derive(Debug, Clone)]
@@ -46,6 +48,7 @@ struct FuelTimelineParseResult {
 struct FuelTimelineEvent {
     time: Option<String>,
     inherit_previous_time: bool,
+    source_text: String,
     items: Vec<FuelItem>,
 }
 
@@ -161,6 +164,7 @@ fn resolve_timeline_at(
         .map(parse_meal_time)
         .collect::<Result<Vec<_>>>()?;
     let inferred_yesterday = explicit_date.is_none()
+        && now.time() < NaiveTime::from_hms_opt(YESTERDAY_INFERENCE_CUTOFF_HOUR, 0, 0).unwrap()
         && explicit_times.len() >= 2
         && explicit_times.iter().all(|time| *time > now.time());
     let date = match explicit_date {
@@ -173,21 +177,39 @@ fn resolve_timeline_at(
     };
 
     let mut previous_time = None;
-    let mut grouped = BTreeMap::<NaiveTime, Vec<FuelItem>>::new();
-    for event in timeline.events {
+    let mut grouped = BTreeMap::<NaiveTime, (Vec<String>, Vec<FuelItem>)>::new();
+    for (index, event) in timeline.events.into_iter().enumerate() {
         let explicit_time = event.time.as_deref().map(parse_meal_time).transpose()?;
+        match (explicit_time, event.inherit_previous_time, index) {
+            (Some(_), true, _) => {
+                bail!("nutrition parser returned conflicting meal time fields")
+            }
+            (None, true, 0) => bail!("the first meal event cannot inherit a time"),
+            (None, false, index) if index > 0 => {
+                bail!("a later untimed meal event must inherit the previous time")
+            }
+            _ => {}
+        }
         let time = explicit_time
             .or(previous_time)
             .unwrap_or_else(|| now.time());
-        if event.inherit_previous_time && explicit_time.is_some() {
-            bail!("nutrition parser returned conflicting meal time fields");
-        }
         previous_time = Some(time);
-        grouped.entry(time).or_default().extend(event.items);
+        let source_text = event.source_text.trim();
+        if source_text.is_empty() || source_text.chars().count() > MAX_EVENT_SOURCE_CHARS {
+            bail!("nutrition parser returned an invalid meal description");
+        }
+        let (descriptions, items) = grouped.entry(time).or_default();
+        if !descriptions
+            .iter()
+            .any(|description| description == source_text)
+        {
+            descriptions.push(source_text.to_string());
+        }
+        items.extend(event.items);
     }
 
     let mut events = Vec::with_capacity(grouped.len());
-    for (time, items) in grouped {
+    for (time, (descriptions, items)) in grouped {
         let parsed = FuelParseResult { items };
         let local = Local
             .from_local_datetime(&date.and_time(time))
@@ -195,6 +217,7 @@ fn resolve_timeline_at(
             .context("the requested local meal time does not exist")?;
         events.push(TimedFuelEvent {
             consumed_at: local.with_timezone(&Utc),
+            source_text: descriptions.join("; "),
             parsed,
         });
     }
@@ -314,6 +337,11 @@ pub(crate) fn validate_timed_events(events: &[TimedFuelEvent]) -> Result<()> {
     }
     let mut totals = NutritionTotals::default();
     for event in events {
+        if event.source_text.trim().is_empty()
+            || event.source_text.chars().count() > MAX_EVENT_SOURCE_CHARS
+        {
+            bail!("fuel batch contains an invalid meal description");
+        }
         validate_parsed(&event.parsed)?;
         totals.add_assign(&event.parsed.totals());
     }
@@ -385,13 +413,18 @@ fn fuel_schema() -> serde_json::Value {
                 "items": {
                     "type": "object",
                     "additionalProperties": false,
-                    "required": ["time", "inherit_previous_time", "items"],
+                    "required": ["time", "inherit_previous_time", "source_text", "items"],
                     "properties": {
                         "time": {
                             "type": ["string", "null"],
                             "pattern": "^([01][0-9]|2[0-3]):[0-5][0-9]$"
                         },
                         "inherit_previous_time": { "type": "boolean" },
+                        "source_text": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": MAX_EVENT_SOURCE_CHARS
+                        },
                         "items": {
                             "type": "array",
                             "minItems": 1,
@@ -445,6 +478,11 @@ mod tests {
             20
         );
         assert_eq!(
+            schema["properties"]["events"]["items"]["properties"]["source_text"]["maxLength"],
+            500
+        );
+        assert!(include_str!("../prompts/fuel_entry.j2").contains("no more than 40"));
+        assert_eq!(
             schema["properties"]["events"]["items"]["properties"]["items"]["items"]
                 ["additionalProperties"],
             false
@@ -487,6 +525,7 @@ mod tests {
                 .map(|(index, time)| FuelTimelineEvent {
                     time: time.map(str::to_string),
                     inherit_previous_time: time.is_none() && index > 0,
+                    source_text: format!("meal {}", index + 1),
                     items: parsed_item(&format!("item {index}")).items,
                 })
                 .collect(),
@@ -536,9 +575,14 @@ mod tests {
 
     #[test]
     fn mixed_or_single_future_times_stay_today() {
-        for times in [vec![Some("10:00"), Some("19:00")], vec![Some("19:00")]] {
+        for (hour, times) in [
+            (4, vec![Some("10:00"), Some("19:00")]),
+            (8, vec![Some("10:00"), Some("14:00")]),
+            (15, vec![Some("18:00"), Some("20:00")]),
+            (15, vec![Some("19:00")]),
+        ] {
             let (events, inferred) =
-                resolve_timeline_at(timeline(None, &times), local_now(15)).unwrap();
+                resolve_timeline_at(timeline(None, &times), local_now(hour)).unwrap();
             assert!(!inferred);
             assert!(events.iter().all(|event| {
                 event.consumed_at.with_timezone(&Local).date_naive()
@@ -576,6 +620,7 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].parsed.items.len(), 3);
+        assert_eq!(events[0].source_text, "meal 1; meal 2; meal 3");
         assert_eq!(
             events[0]
                 .consumed_at
@@ -584,6 +629,21 @@ mod tests {
                 .to_string(),
             "10:00"
         );
+    }
+
+    #[test]
+    fn contradictory_time_inheritance_is_rejected() {
+        let mut explicit_inherit = timeline(None, &[Some("10:00")]);
+        explicit_inherit.events[0].inherit_previous_time = true;
+        assert!(resolve_timeline_at(explicit_inherit, local_now(12)).is_err());
+
+        let mut first_inherit = timeline(None, &[None]);
+        first_inherit.events[0].inherit_previous_time = true;
+        assert!(resolve_timeline_at(first_inherit, local_now(12)).is_err());
+
+        let mut later_without_inherit = timeline(None, &[Some("10:00"), None]);
+        later_without_inherit.events[1].inherit_previous_time = false;
+        assert!(resolve_timeline_at(later_without_inherit, local_now(12)).is_err());
     }
 
     #[test]

@@ -354,9 +354,9 @@ impl Store {
         created_at: DateTime<Utc>,
     ) -> Result<i64> {
         let ids = self.save_fuel_batch(
-            raw_text,
             &[TimedFuelEvent {
                 consumed_at: created_at,
+                source_text: raw_text.to_string(),
                 parsed: parsed.clone(),
             }],
             provider,
@@ -367,7 +367,6 @@ impl Store {
 
     pub fn save_fuel_batch(
         &self,
-        raw_text: &str,
         events: &[TimedFuelEvent],
         provider: &str,
         model: &str,
@@ -386,7 +385,7 @@ impl Store {
                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
                 "#,
                 params![
-                    raw_text,
+                    event.source_text,
                     serde_json::to_string(&event.parsed)?,
                     totals.calories,
                     totals.protein_g,
@@ -2710,28 +2709,31 @@ mod tests {
         let events = vec![
             TimedFuelEvent {
                 consumed_at: now - Duration::hours(4),
+                source_text: "breakfast".into(),
                 parsed: parsed.clone(),
             },
             TimedFuelEvent {
                 consumed_at: now - Duration::hours(1),
+                source_text: "lunch".into(),
                 parsed: parsed.clone(),
             },
         ];
 
         let ids = store
-            .save_fuel_batch("a whole day", &events, "codex", "gpt-5.6-luna")
+            .save_fuel_batch(&events, "codex", "gpt-5.6-luna")
             .unwrap();
         assert_eq!(ids.len(), 2);
         let recent = store.recent_fuel_entries(5).unwrap();
         assert_eq!(recent.len(), 2);
         assert_eq!(recent[0].created_at, events[1].consumed_at);
         assert_eq!(recent[1].created_at, events[0].consumed_at);
-        assert!(recent.iter().all(|entry| entry.raw_text == "a whole day"));
+        assert_eq!(recent[0].raw_text, "lunch");
+        assert_eq!(recent[1].raw_text, "breakfast");
 
         let mut invalid = events.clone();
         invalid[1].parsed.items[0].name = " ".into();
         assert!(store
-            .save_fuel_batch("invalid batch", &invalid, "codex", "gpt-5.6-luna")
+            .save_fuel_batch(&invalid, "codex", "gpt-5.6-luna")
             .is_err());
         assert_eq!(store.recent_fuel_entries(5).unwrap().len(), 2);
     }
