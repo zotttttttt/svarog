@@ -396,6 +396,49 @@ impl Store {
         self.fuel_entries_between(Some(start), Some(end), limit)
     }
 
+    pub fn nutrition_totals_today(&self) -> Result<NutritionTotals> {
+        self.nutrition_totals_today_at(Local::now())
+    }
+
+    pub fn nutrition_totals_today_at(&self, now: DateTime<Local>) -> Result<NutritionTotals> {
+        let (start, end) = local_day_bounds_at(now)?;
+        let totals = self.conn.query_row(
+            r#"
+            SELECT COALESCE(SUM(calories), 0.0),
+                   COALESCE(SUM(protein_g), 0.0),
+                   COALESCE(SUM(carbohydrates_g), 0.0),
+                   COALESCE(SUM(fat_g), 0.0),
+                   COALESCE(SUM(fiber_g), 0.0),
+                   COALESCE(SUM(sugar_g), 0.0),
+                   COALESCE(SUM(sodium_mg), 0.0),
+                   COALESCE(SUM(potassium_mg), 0.0)
+            FROM fuel_entries
+            WHERE created_at >= ?1 AND created_at < ?2
+            "#,
+            params![start.to_rfc3339(), end.to_rfc3339()],
+            |row| {
+                Ok(NutritionTotals {
+                    calories: row.get(0)?,
+                    protein_g: row.get(1)?,
+                    carbohydrates_g: row.get(2)?,
+                    fat_g: row.get(3)?,
+                    fiber_g: row.get(4)?,
+                    sugar_g: row.get(5)?,
+                    sodium_mg: row.get(6)?,
+                    potassium_mg: row.get(7)?,
+                })
+            },
+        )?;
+        if totals
+            .values()
+            .iter()
+            .any(|value| !value.is_finite() || *value < 0.0)
+        {
+            anyhow::bail!("stored nutrition totals are invalid");
+        }
+        Ok(totals)
+    }
+
     fn fuel_entries_between(
         &self,
         start: Option<DateTime<Utc>>,
@@ -2590,6 +2633,55 @@ mod tests {
         assert_eq!(recent[0].totals.calories, 320.0);
         assert!(store.delete_fuel_entry(id).unwrap());
         assert!(store.recent_fuel_entries(5).unwrap().is_empty());
+    }
+
+    #[test]
+    fn nutrition_totals_sum_only_the_current_local_day() {
+        let store = store();
+        let now = Local::now();
+        assert_eq!(
+            store.nutrition_totals_today_at(now).unwrap(),
+            NutritionTotals::default()
+        );
+        let parsed = FuelParseResult {
+            items: vec![crate::models::FuelItem {
+                name: "meal".into(),
+                quantity: Some(1.0),
+                unit: Some("serving".into()),
+                nutrition: NutritionTotals {
+                    calories: 320.0,
+                    protein_g: 12.0,
+                    carbohydrates_g: 54.0,
+                    fat_g: 7.0,
+                    fiber_g: 8.0,
+                    sugar_g: 10.0,
+                    sodium_mg: 120.0,
+                    potassium_mg: 410.0,
+                },
+                assumptions: Vec::new(),
+            }],
+        };
+        for created_at in [now, now, now - Duration::days(2)] {
+            store
+                .save_fuel_entry(
+                    "meal",
+                    &parsed,
+                    "codex",
+                    "gpt-5.6-luna",
+                    created_at.with_timezone(&Utc),
+                )
+                .unwrap();
+        }
+
+        let totals = store.nutrition_totals_today_at(now).unwrap();
+        assert_eq!(totals.calories, 640.0);
+        assert_eq!(totals.protein_g, 24.0);
+        assert_eq!(totals.carbohydrates_g, 108.0);
+        assert_eq!(totals.fat_g, 14.0);
+        assert_eq!(totals.fiber_g, 16.0);
+        assert_eq!(totals.sugar_g, 20.0);
+        assert_eq!(totals.sodium_mg, 240.0);
+        assert_eq!(totals.potassium_mg, 820.0);
     }
 
     #[test]

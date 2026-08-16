@@ -7,8 +7,9 @@ use crate::exercise_catalog::{self, ExerciseCatalogEntry};
 use crate::exercise_media::{self, PreparedGallery};
 use crate::fuel::{self, FuelParseOutcome};
 use crate::models::{
-    AppStateKind, ForgeActivitySummary, FuelEntry, FuelParseResult, Recommendation,
-    RecommenderTokenProvider, RecommenderTokenUsageByProvider, SetStatus, WaterTotal,
+    AppStateKind, ForgeActivitySummary, FuelEntry, FuelParseResult, NutritionTotals,
+    Recommendation, RecommenderTokenProvider, RecommenderTokenUsageByProvider, SetStatus,
+    WaterTotal,
 };
 use crate::secrets;
 use crate::storage::{ForgeHistoryEntry, Store};
@@ -209,6 +210,7 @@ struct AddFuelState {
     next_parse_id: u64,
     scroll: usize,
     recent: Vec<FuelEntry>,
+    nutrition: NutritionTotals,
     selected_recent: usize,
     confirming_delete: bool,
     water: WaterTotal,
@@ -345,6 +347,7 @@ struct ViewModel {
     recommendation: Option<Recommendation>,
     backend: BackendView,
     activity: ForgeActivitySummary,
+    nutrition: NutritionTotals,
     token_usage: RecommenderTokenUsageByProvider,
     history: Vec<ForgeHistoryEntry>,
     next_forges: Vec<Recommendation>,
@@ -695,6 +698,7 @@ fn load_view(store: &Store, paths: &Paths, saved_openai_key_available: Option<bo
     let state = store.state().ok();
     let recommendation = store.latest_open_recommendation().ok().flatten();
     let activity = store.completed_forge_summary().unwrap_or_default();
+    let nutrition = store.nutrition_totals_today().unwrap_or_default();
     let token_usage = RecommenderTokenUsageByProvider {
         codex: store
             .recommender_token_usage_summary_for(RecommenderTokenProvider::Codex)
@@ -718,6 +722,7 @@ fn load_view(store: &Store, paths: &Paths, saved_openai_key_available: Option<bo
         recommendation,
         backend,
         activity,
+        nutrition,
         token_usage,
         history,
         next_forges,
@@ -848,6 +853,7 @@ fn open_add_fuel(env: &RuntimeEnv, store: &Store) -> Result<AddFuelState> {
         next_parse_id: 1,
         scroll: 0,
         recent: store.recent_fuel_entries_today(5)?,
+        nutrition: store.nutrition_totals_today()?,
         selected_recent: 0,
         confirming_delete: false,
         water: store.water_total_today()?,
@@ -924,6 +930,7 @@ fn refresh_add_fuel_day_at(ui: &mut TuiState, store: &Store, today: chrono::Naiv
     state.local_date = today;
     state.water = store.water_total_today().unwrap_or_default();
     state.recent = store.recent_fuel_entries_today(5).unwrap_or_default();
+    state.nutrition = store.nutrition_totals_today().unwrap_or_default();
     state.selected_recent = 0;
     state.feedback = Some("Started a new local day.".into());
 }
@@ -973,7 +980,7 @@ fn focus_scroll_hint(state: &AddFuelState) -> usize {
     match state.focus {
         AddFuelFocus::Meal => 0,
         AddFuelFocus::Water => 4,
-        AddFuelFocus::Recent => 8,
+        AddFuelFocus::Recent => 11,
     }
 }
 
@@ -1024,6 +1031,7 @@ fn handle_add_fuel_key(
                         state.input.clear();
                         state.cursor = 0;
                         state.recent = store.recent_fuel_entries_today(5).unwrap_or_default();
+                        state.nutrition = store.nutrition_totals_today().unwrap_or_default();
                         state.selected_recent = 0;
                         state.feedback = Some("✓ Meal or drink saved".into());
                     }
@@ -1042,6 +1050,7 @@ fn handle_add_fuel_key(
                     match store.delete_fuel_entry(entry.id) {
                         Ok(true) => {
                             state.recent = store.recent_fuel_entries_today(5).unwrap_or_default();
+                            state.nutrition = store.nutrition_totals_today().unwrap_or_default();
                             state.selected_recent = state
                                 .selected_recent
                                 .min(state.recent.len().saturating_sub(1));
@@ -1091,7 +1100,7 @@ fn handle_add_fuel_key(
         }
         KeyCode::Down if state.focus == AddFuelFocus::Water && !state.recent.is_empty() => {
             state.focus = AddFuelFocus::Recent;
-            state.scroll = 8;
+            state.scroll = focus_scroll_hint(state);
         }
         KeyCode::Enter if state.focus == AddFuelFocus::Meal => start_fuel_parse(state, env),
         KeyCode::Backspace if state.focus == AddFuelFocus::Meal => {
@@ -1206,7 +1215,7 @@ fn add_fuel_lines(
             if state.backend == RecommenderBackend::Local {
                 "Nutrition parsing unavailable with Local recommender"
             } else {
-                "[enter] Parse with Luna"
+                "[enter] Log that fuel"
             },
             muted(),
         )),
@@ -1224,14 +1233,17 @@ fn add_fuel_lines(
             Span::styled(format_water_total(state.water, state.unit_system), accent()),
             Span::styled(
                 match state.unit_system {
-                    UnitSystem::Metric => "  [+/=] +200 ml  [-] -200 ml",
-                    UnitSystem::Imperial => "  [+/=] +8 US fl oz  [-] -8 US fl oz",
+                    UnitSystem::Metric => "  [+/-] 200 ml",
+                    UnitSystem::Imperial => "  [+/-] 8 US fl oz",
                 },
                 muted(),
             ),
         ]),
         Line::from(""),
-        Line::from(Span::styled("Today’s recent fuel", text_bold())),
+        Line::from(Span::styled("Today’s nutrition", text_bold())),
+        nutrition_summary_line(&state.nutrition),
+        Line::from(""),
+        Line::from(Span::styled("Today’s fuel", text_bold())),
     ];
     if state.recent.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -1505,6 +1517,7 @@ fn view_lines(view: &ViewModel, ui: &TuiState) -> Vec<Line<'static>> {
                 idle_lines(
                     &view.backend,
                     &view.activity,
+                    &view.nutrition,
                     &view.token_usage,
                     ui.status_message.as_deref(),
                     queue_regeneration_loader(ui),
@@ -1516,6 +1529,7 @@ fn view_lines(view: &ViewModel, ui: &TuiState) -> Vec<Line<'static>> {
         ViewKind::Cooldown => cooldown_lines(
             &view.backend,
             &view.activity,
+            &view.nutrition,
             &view.token_usage,
             ui.status_message.as_deref(),
             queue_regeneration_loader(ui),
@@ -1526,6 +1540,7 @@ fn view_lines(view: &ViewModel, ui: &TuiState) -> Vec<Line<'static>> {
         ViewKind::Idle => idle_lines(
             &view.backend,
             &view.activity,
+            &view.nutrition,
             &view.token_usage,
             ui.status_message.as_deref(),
             queue_regeneration_loader(ui),
@@ -2486,6 +2501,7 @@ fn exercise_help_lines(
 fn idle_lines(
     backend: &BackendView,
     activity: &ForgeActivitySummary,
+    nutrition: &NutritionTotals,
     token_usage: &RecommenderTokenUsageByProvider,
     status_message: Option<&str>,
     queue_loader_frame: Option<usize>,
@@ -2517,6 +2533,7 @@ fn idle_lines(
         )));
     }
     lines.extend(activity_lines(activity));
+    lines.extend(nutrition_lines(nutrition));
     lines.extend(recommender_usage_lines(backend, token_usage));
     if backend.unavailable {
         lines.push(Line::from(Span::styled(
@@ -2534,6 +2551,7 @@ fn idle_lines(
 fn cooldown_lines(
     backend: &BackendView,
     activity: &ForgeActivitySummary,
+    nutrition: &NutritionTotals,
     token_usage: &RecommenderTokenUsageByProvider,
     status_message: Option<&str>,
     queue_loader_frame: Option<usize>,
@@ -2562,6 +2580,7 @@ fn cooldown_lines(
     lines.push(recommender_line(backend));
     lines.push(settings_control_line());
     lines.extend(activity_lines(activity));
+    lines.extend(nutrition_lines(nutrition));
     lines.extend(recommender_usage_lines(backend, token_usage));
     if backend.unavailable {
         lines.push(Line::from(Span::styled(
@@ -2600,6 +2619,28 @@ fn activity_lines(activity: &ForgeActivitySummary) -> Vec<Line<'static>> {
             ),
         ]),
     ]
+}
+
+fn nutrition_lines(nutrition: &NutritionTotals) -> Vec<Line<'static>> {
+    vec![
+        Line::from(""),
+        Line::from(Span::styled("Today’s nutrition:", muted())),
+        nutrition_summary_line(nutrition),
+    ]
+}
+
+fn nutrition_summary_line(nutrition: &NutritionTotals) -> Line<'static> {
+    Line::from(Span::styled(
+        format!(
+            "{:.0} kcal · P {:.1}g · C {:.1}g · F {:.1}g · S {:.1}g",
+            nutrition.calories,
+            nutrition.protein_g,
+            nutrition.carbohydrates_g,
+            nutrition.fat_g,
+            nutrition.sugar_g,
+        ),
+        text(),
+    ))
 }
 
 fn unavailable_backend_message(backend: &BackendView) -> String {
@@ -3171,6 +3212,7 @@ mod tests {
             next_parse_id: 1,
             scroll: 0,
             recent: Vec::new(),
+            nutrition: NutritionTotals::default(),
             selected_recent: 0,
             confirming_delete: false,
             water: WaterTotal::default(),
@@ -3823,6 +3865,7 @@ mod tests {
         let text = idle_lines(
             &backend,
             &ForgeActivitySummary::default(),
+            &NutritionTotals::default(),
             &RecommenderTokenUsageByProvider::default(),
             None,
             None,
@@ -3884,10 +3927,22 @@ mod tests {
                 reps: 180,
             },
         };
+        let nutrition = NutritionTotals {
+            calories: 1_840.0,
+            protein_g: 122.0,
+            carbohydrates_g: 190.0,
+            fat_g: 61.0,
+            sugar_g: 38.0,
+            ..NutritionTotals::default()
+        };
 
         for lines in [
-            idle_lines(&backend, &activity, &usage, None, None, None, None, false),
-            cooldown_lines(&backend, &activity, &usage, None, None, None, None, false),
+            idle_lines(
+                &backend, &activity, &nutrition, &usage, None, None, None, None, false,
+            ),
+            cooldown_lines(
+                &backend, &activity, &nutrition, &usage, None, None, None, None, false,
+            ),
         ] {
             let text = lines
                 .into_iter()
@@ -3899,12 +3954,15 @@ mod tests {
             assert!(text.contains("[n] Next forges"));
             assert!(text.contains("Today 3 forges / 42 reps"));
             assert!(text.contains("Week 12 forges / 180 reps"));
+            assert!(text.contains("Today’s nutrition:"));
+            assert!(text.contains("1840 kcal · P 122.0g · C 190.0g · F 61.0g · S 38.0g"));
             assert!(text.contains("Svarog Codex tokens (in/out)"));
             assert!(text.contains("Today  12.4k / 320"));
             assert!(text.contains("Week   58.1k / 1.4k"));
             assert!(text.contains("Use fewer Codex tokens with an OpenAI API key"));
+            assert!(text.find("Completed:").unwrap() < text.find("Today’s nutrition:").unwrap());
             assert!(
-                text.find("Completed:").unwrap()
+                text.find("Today’s nutrition:").unwrap()
                     < text.find("Svarog Codex tokens (in/out)").unwrap()
             );
         }
@@ -3920,16 +3978,36 @@ mod tests {
         let activity = ForgeActivitySummary::default();
         let usage = RecommenderTokenUsageByProvider::default();
         let hint = "Tip: Use Codex/OpenAI key recommender in Settings.";
-        let idle = idle_lines(&backend, &activity, &usage, None, None, None, None, false)
-            .into_iter()
-            .map(|line| line.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
-        let cooldown = cooldown_lines(&backend, &activity, &usage, None, None, None, None, false)
-            .into_iter()
-            .map(|line| line.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
+        let idle = idle_lines(
+            &backend,
+            &activity,
+            &NutritionTotals::default(),
+            &usage,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        let cooldown = cooldown_lines(
+            &backend,
+            &activity,
+            &NutritionTotals::default(),
+            &usage,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
 
         assert!(idle.contains(&format!("Recommender: [Local]\n[s] Settings\n{hint}")));
         assert!(!cooldown.contains(hint));
@@ -3945,6 +4023,7 @@ mod tests {
         let lines = cooldown_lines(
             &backend,
             &ForgeActivitySummary::default(),
+            &NutritionTotals::default(),
             &RecommenderTokenUsageByProvider::default(),
             None,
             None,
@@ -3985,6 +4064,7 @@ mod tests {
                 },
                 week: ForgeActivityTotals::default(),
             },
+            nutrition: NutritionTotals::default(),
             token_usage: RecommenderTokenUsageByProvider {
                 codex: RecommenderTokenUsageSummary {
                     today: TokenUsageTotals {
@@ -4412,8 +4492,28 @@ mod tests {
             ..TuiState::default()
         };
         let screens = vec![
-            idle_lines(&backend, &activity, &usage, None, None, None, None, true),
-            cooldown_lines(&backend, &activity, &usage, None, None, None, None, true),
+            idle_lines(
+                &backend,
+                &activity,
+                &NutritionTotals::default(),
+                &usage,
+                None,
+                None,
+                None,
+                None,
+                true,
+            ),
+            cooldown_lines(
+                &backend,
+                &activity,
+                &NutritionTotals::default(),
+                &usage,
+                None,
+                None,
+                None,
+                None,
+                true,
+            ),
             next_forge_lines(&[], true, None, None, None),
             history_lines_for_date(&[], true, Local::now().date_naive()),
             forge_lines(&recommendation, &ui),
@@ -4577,6 +4677,7 @@ mod tests {
         let text = idle_lines(
             &backend,
             &ForgeActivitySummary::default(),
+            &NutritionTotals::default(),
             &RecommenderTokenUsageByProvider::default(),
             None,
             None,
@@ -4651,6 +4752,7 @@ mod tests {
         let text = idle_lines(
             &backend,
             &ForgeActivitySummary::default(),
+            &NutritionTotals::default(),
             &RecommenderTokenUsageByProvider::default(),
             Some("Could not update recommender. Edit: /tmp/svarog/config.toml"),
             None,
@@ -4868,6 +4970,7 @@ mod tests {
                 config_file: "/tmp/config.toml".to_string(),
             },
             activity: ForgeActivitySummary::default(),
+            nutrition: NutritionTotals::default(),
             token_usage: RecommenderTokenUsageByProvider::default(),
             history: Vec::new(),
             next_forges: Vec::new(),
@@ -4979,7 +5082,7 @@ mod tests {
 
     #[test]
     fn add_fuel_screen_uses_selected_units_and_keeps_prompt_keys_separate() {
-        let state = AddFuelState {
+        let mut state = AddFuelState {
             focus: AddFuelFocus::Water,
             input: "coffee with milk".into(),
             cursor: 16,
@@ -4989,6 +5092,14 @@ mod tests {
             next_parse_id: 1,
             scroll: 0,
             recent: Vec::new(),
+            nutrition: NutritionTotals {
+                calories: 120.0,
+                protein_g: 3.0,
+                carbohydrates_g: 14.0,
+                fat_g: 5.0,
+                sugar_g: 8.0,
+                ..NutritionTotals::default()
+            },
             selected_recent: 0,
             confirming_delete: false,
             water: WaterTotal {
@@ -5006,13 +5117,52 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(rendered.contains("coffee with milk"));
-        assert!(rendered.contains("200 ml  [+/=] +200 ml"));
+        assert!(rendered.contains("[enter] Log that fuel"));
+        assert!(rendered.contains("200 ml  [+/-] 200 ml"));
+        assert!(
+            rendered.contains("Today’s nutrition\n120 kcal · P 3.0g · C 14.0g · F 5.0g · S 8.0g")
+        );
+        assert!(rendered.contains("Today’s fuel"));
+        assert!(!rendered.contains("Parse with Luna"));
+        assert!(!rendered.contains("Today’s recent fuel"));
         assert!(rendered.contains("No meals or drinks logged yet."));
 
+        state.unit_system = UnitSystem::Imperial;
+        let imperial = add_fuel_lines(&state, false, 120, 40)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(imperial.contains("6.8 US fl oz  [+/-] 8 US fl oz"));
         assert_eq!(
             format_water_total(state.water, UnitSystem::Imperial),
             "6.8 US fl oz"
         );
+    }
+
+    #[test]
+    fn add_fuel_water_keeps_equals_as_an_add_alias() {
+        let root = tempdir().unwrap().keep();
+        let env = test_env(root.clone());
+        let store = Store::open(&root.join("svarog.sqlite3")).unwrap();
+        let mut state = add_fuel_state_for_test();
+        state.focus = AddFuelFocus::Water;
+        let mut ui = TuiState {
+            add_fuel: Some(state),
+            ..TuiState::default()
+        };
+
+        for key in [KeyCode::Char('+'), KeyCode::Char('='), KeyCode::Char('-')] {
+            assert!(!handle_add_fuel_key(
+                &mut ui,
+                key,
+                KeyModifiers::NONE,
+                &env,
+                &store,
+            ));
+        }
+
+        assert_eq!(ui.add_fuel.unwrap().water.milliliters, 200.0);
     }
 
     #[test]
@@ -5052,6 +5202,7 @@ mod tests {
         let mut state = add_fuel_state_for_test();
         state.local_date -= ChronoDuration::days(1);
         state.water.milliliters = 999.0;
+        state.nutrition.calories = 999.0;
         let mut ui = TuiState {
             add_fuel: Some(state),
             ..TuiState::default()
@@ -5059,6 +5210,10 @@ mod tests {
 
         refresh_add_fuel_day_at(&mut ui, &store, Local::now().date_naive());
         assert_eq!(ui.add_fuel.as_ref().unwrap().water, WaterTotal::default());
+        assert_eq!(
+            ui.add_fuel.as_ref().unwrap().nutrition,
+            NutritionTotals::default()
+        );
         reconcile_add_fuel_view(&mut ui, ViewKind::Forge);
         assert!(ui.add_fuel.is_none());
     }
