@@ -606,9 +606,14 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
                                     daemon::regenerate_queue(env),
                                 );
                             }
-                            Ok(ForgeNowResult::NoSafe) => {
+                            Ok(ForgeNowResult::DailyForgeCeilingReached { completed, limit }) => {
+                                ui.forge_now_feedback = Some(format!(
+                                    "Daily forge ceiling reached: {completed}/{limit} completed today."
+                                ));
+                            }
+                            Ok(ForgeNowResult::CoolingDown) => {
                                 ui.forge_now_feedback = Some(
-                                    "No safe forges are available right now. Keeping current list."
+                                    "Queued forges are still cooling down. Keeping current list."
                                         .into(),
                                 );
                             }
@@ -1810,7 +1815,7 @@ fn settings_lines(
             },
         ),
         (
-            "Daily safety ceiling",
+            "Daily forge ceiling",
             settings.draft.preferences.max_daily_sets.to_string(),
         ),
         ("Units", profile.unit_system.to_string()),
@@ -2424,14 +2429,29 @@ fn remove_saved_openai_key_with(
     Ok(())
 }
 
-fn apply_settings(env: &RuntimeEnv, draft: &Config) -> Result<Receiver<QueueRegenerationResult>> {
+/// Applies Settings synchronously. Changing the recommender backend is the only
+/// Settings change that replaces the future-forge queue; all other changes keep
+/// compatible queued work in place.
+fn apply_settings(
+    env: &RuntimeEnv,
+    draft: &Config,
+) -> Result<Option<Receiver<QueueRegenerationResult>>> {
     let previous = config::load_or_default(&env.paths)?;
+    let recommender_changed = previous.recommender.backend != draft.recommender.backend;
     let config_existed = env.paths.config_file.exists();
     config::save(&env.paths, draft)?;
     let equipment = exercise_catalog::locally_resolved_equipment(&draft.profile.equipment_text);
     let movements = exercise_catalog::movements_for_equipment(&equipment);
+    let equipment_filter = serde_json::to_string(&crate::recommender::normalize_equipment(
+        &draft.profile.equipment_text,
+    ))?;
     let database_result = Store::open(&env.paths.database_file).and_then(|store| {
-        store.apply_user_profile_and_movement_pool(draft, previous.profile.weight_kg, &movements)
+        store.apply_user_profile_and_movement_pool(
+            draft,
+            previous.profile.weight_kg,
+            &movements,
+            &equipment_filter,
+        )
     });
     if let Err(error) = database_result {
         let rollback = if config_existed {
@@ -2447,7 +2467,7 @@ fn apply_settings(env: &RuntimeEnv, draft: &Config) -> Result<Receiver<QueueRege
             )),
         };
     }
-    Ok(daemon::regenerate_queue_after_settings(env))
+    Ok(recommender_changed.then(|| daemon::regenerate_queue_after_settings(env)))
 }
 
 fn handle_settings_key(
@@ -2587,7 +2607,7 @@ fn handle_settings_key(
             return Ok(());
         }
         let draft = settings.draft.clone();
-        let receiver = apply_settings(env, &draft)?;
+        let regeneration = apply_settings(env, &draft)?;
         update_saved_openai_key_cache_after_apply(
             &mut ui.saved_openai_key_available,
             draft.recommender.backend,
@@ -2595,9 +2615,13 @@ fn handle_settings_key(
             || secrets::clear_cached_openai_api_key(&env.paths),
         );
         ui.settings = None;
-        ui.status_message = Some("Settings saved. Refreshing future forges…".into());
-        apply_queue_regeneration_start(ui, QueueRegenerationStart::Started(receiver));
-        ui.settings_regeneration = true;
+        if let Some(receiver) = regeneration {
+            ui.status_message = Some("Settings saved. Refreshing future forges…".into());
+            apply_queue_regeneration_start(ui, QueueRegenerationStart::Started(receiver));
+            ui.settings_regeneration = true;
+        } else {
+            ui.status_message = Some("Settings saved.".into());
+        }
         return Ok(());
     }
     match code {
@@ -3203,7 +3227,7 @@ fn waiting_forge_now_lines(
         }
         Some(QueueRegenerationFeedback::Failure { no_safe_forges }) => {
             let message = if *no_safe_forges {
-                "No safe forges are available right now."
+                "Recommender returned no compatible forges."
             } else {
                 "Could not generate forges."
             };
@@ -3274,7 +3298,7 @@ fn next_forge_lines(
             }
             Some(QueueRegenerationFeedback::Failure { no_safe_forges }) => {
                 let message = if *no_safe_forges {
-                    "No safe forges are available right now. Keeping current list."
+                    "Recommender returned no compatible forges. Keeping current list."
                 } else {
                     "Could not regenerate forges. Keeping current list."
                 };
@@ -4173,22 +4197,52 @@ mod tests {
     }
 
     #[test]
-    fn successful_settings_apply_reports_regeneration_result() {
+    fn settings_apply_without_backend_change_does_not_regenerate_queue() {
         let root = tempdir().unwrap().keep();
         let env = test_env(root);
         let mut draft = Config::default();
-        draft.recommender.backend = RecommenderBackend::Local;
         draft.profile.goals = vec!["mobility".into()];
 
-        let receiver = apply_settings(&env, &draft).unwrap();
-        assert!(receiver
-            .recv_timeout(Duration::from_secs(5))
-            .unwrap()
-            .is_ok());
+        assert!(apply_settings(&env, &draft).unwrap().is_none());
         assert_eq!(
             config::load_or_default(&env.paths).unwrap().profile.goals,
             vec!["mobility"]
         );
+    }
+
+    #[test]
+    fn settings_apply_with_backend_change_regenerates_queue() {
+        let root = tempdir().unwrap().keep();
+        let env = test_env(root);
+        let mut previous = Config::default();
+        previous.recommender.backend = RecommenderBackend::Codex;
+        config::save(&env.paths, &previous).unwrap();
+
+        let receiver = apply_settings(&env, &Config::default()).unwrap();
+        assert!(receiver
+            .expect("backend changes should regenerate future forges")
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .is_ok());
+    }
+
+    #[test]
+    fn settings_save_without_backend_change_reports_plain_success() {
+        let root = tempdir().unwrap().keep();
+        let env = test_env(root);
+        let mut settings = settings_state();
+        settings.draft.profile.goals = vec!["mobility".into()];
+        let mut ui = TuiState {
+            settings: Some(settings),
+            ..TuiState::default()
+        };
+
+        handle_settings_key(&mut ui, KeyCode::Char('s'), KeyModifiers::CONTROL, &env).unwrap();
+
+        assert!(ui.settings.is_none());
+        assert!(ui.queue_regeneration.is_none());
+        assert!(!ui.settings_regeneration);
+        assert_eq!(ui.status_message.as_deref(), Some("Settings saved."));
     }
 
     fn rec() -> Recommendation {
@@ -4648,7 +4702,9 @@ mod tests {
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(no_safe.contains("No safe forges are available right now. Keeping current list."));
+        assert!(
+            no_safe.contains("Recommender returned no compatible forges. Keeping current list.")
+        );
     }
 
     #[test]
@@ -4658,14 +4714,14 @@ mod tests {
             false,
             None,
             None,
-            Some("No safe forges are available right now. Keeping current list."),
+            Some("Queued forges are still cooling down. Keeping current list."),
         )
         .into_iter()
         .map(|line| line.to_string())
         .collect::<Vec<_>>()
         .join("\n");
 
-        assert!(text.contains("No safe forges are available right now. Keeping current list."));
+        assert!(text.contains("Queued forges are still cooling down. Keeping current list."));
         assert!(text.contains("[f] Forge now  [r] Regenerate forges"));
     }
 
@@ -4689,9 +4745,9 @@ mod tests {
         let no_safe = render(waiting_forge_now_lines(
             None,
             None,
-            Some("No safe forges are available right now. Keeping current list."),
+            Some("Queued forges are still cooling down. Keeping current list."),
         ));
-        assert!(no_safe.contains("No safe forges are available right now."));
+        assert!(no_safe.contains("Queued forges are still cooling down."));
     }
 
     #[test]

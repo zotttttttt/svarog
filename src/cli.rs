@@ -528,6 +528,9 @@ fn init(env: &RuntimeEnv) -> Result<()> {
     store.save_user_profile(&config)?;
     let equipment =
         crate::exercise_catalog::locally_resolved_equipment(&config.profile.equipment_text);
+    store.save_exercise_filter(&crate::recommender::normalize_equipment(
+        &config.profile.equipment_text,
+    ))?;
     store.replace_movement_pool(&crate::exercise_catalog::movements_for_equipment(
         &equipment,
     ))?;
@@ -817,7 +820,7 @@ fn status(env: &RuntimeEnv) -> Result<()> {
     if db_exists {
         let store = Store::open(&paths.database_file)?;
         let (sets, reps, breaks) = store.stats_today()?;
-        println!("Today: {sets} sets, {reps} reps, {breaks} breaks");
+        println!("Today: {sets} forges, {reps} reps, {breaks} breaks");
         println!("Queued: {}", store.queued_recommendation_count()?);
         if let Some(rec) = store.latest_open_recommendation()? {
             println!("Current: {} {}", rec.reps, rec.display_name());

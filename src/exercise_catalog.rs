@@ -2,12 +2,14 @@ use crate::models::{Movement, MovementSidedness, MovementStatus};
 #[cfg(test)]
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+#[cfg(test)]
 use std::collections::HashSet;
 use std::sync::OnceLock;
 
 const CATALOG_JSON: &str = include_str!("../data/free-exercise-db.compact.json");
 pub const CATALOG_REVISION: &str = "b0eed061e1c832b3ed815fbaa4b45b3cdc14df49";
-const MOVEMENT_POOL_POLICY_REVISION: &str = "solo-v1";
+const MOVEMENT_POOL_POLICY_REVISION: &str = "equipment-v2";
 const PARTNER_REQUIRED_EXERCISE_IDS: &[&str] = &[
     "Adductor_Groin",
     "Barbell_Seated_Calf_Raise",
@@ -15,6 +17,7 @@ const PARTNER_REQUIRED_EXERCISE_IDS: &[&str] = &[
     "Cable_Preacher_Curl",
     "Cable_Seated_Lateral_Raise",
     "Flat_Bench_Cable_Flyes",
+    "Hyperextensions_With_No_Hyperextension_Bench",
     "Lying_Bent_Leg_Groin",
     "Lying_Crossover",
     "Lying_Glute",
@@ -33,6 +36,65 @@ const PARTNER_REQUIRED_EXERCISE_IDS: &[&str] = &[
     "Standing_Towel_Triceps_Extension",
     "Weighted_Bench_Dip",
 ];
+
+const PULL_UP_BAR_EXERCISE_IDS: &[&str] = &[
+    "Chin-Up",
+    "Gorilla_Chin_Crunch",
+    "Hanging_Leg_Raise",
+    "Hanging_Pike",
+    "Pullups",
+    "V-Bar_Pullup",
+    "Wide-Grip_Rear_Pull-Up",
+    "Wind_Sprints",
+];
+
+const BENCH_OR_BOX_EXERCISE_IDS: &[&str] = &[
+    "Bench_Dips",
+    "Bench_Jump",
+    "Decline_Crunch",
+    "Decline_Oblique_Crunch",
+    "Decline_Reverse_Crunch",
+    "Flat_Bench_Lying_Leg_Raise",
+    "Flutter_Kicks",
+    "Incline_Push-Up",
+    "Incline_Push-Up_Close-Grip",
+    "Incline_Push-Up_Medium",
+    "Incline_Push-Up_Reverse_Grip",
+    "Incline_Push-Up_Wide",
+    "Push-Ups_With_Feet_Elevated",
+    "Seated_Flat_Bench_Leg_Pull-In",
+    "Seated_Leg_Tucks",
+    "Step-up_with_Knee_Raise",
+];
+
+const STABLE_SUPPORT_EXERCISE_IDS: &[&str] =
+    &["Front_Leg_Raises", "Leg_Lift", "Standing_Hip_Circles"];
+
+const DOUBLE_KETTLEBELL_EXERCISE_IDS: &[&str] = &[
+    "Alternating_Floor_Press",
+    "Alternating_Hang_Clean",
+    "Alternating_Kettlebell_Press",
+    "Alternating_Kettlebell_Row",
+    "Alternating_Renegade_Row",
+    "Double_Kettlebell_Alternating_Hang_Clean",
+    "Double_Kettlebell_Jerk",
+    "Double_Kettlebell_Push_Press",
+    "Double_Kettlebell_Snatch",
+    "Double_Kettlebell_Windmill",
+    "Front_Squats_With_Two_Kettlebells",
+    "Kettlebell_Seesaw_Press",
+    "Kettlebell_Thruster",
+    "Two-Arm_Kettlebell_Clean",
+    "Two-Arm_Kettlebell_Jerk",
+    "Two-Arm_Kettlebell_Military_Press",
+    "Two-Arm_Kettlebell_Row",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EquipmentRequirement {
+    kind: &'static str,
+    count: usize,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -75,18 +137,35 @@ pub fn candidates(equipment_text: &str) -> Vec<ExerciseCatalogEntry> {
 }
 
 pub fn candidates_for_equipment(available: &[String]) -> Vec<ExerciseCatalogEntry> {
-    let available = available.iter().map(String::as_str).collect::<HashSet<_>>();
+    let available = equipment_counts(available);
     all()
         .iter()
         .filter(|entry| {
-            entry
-                .equipment
-                .as_deref()
-                .and_then(normalize_equipment)
-                .is_some_and(|equipment| available.contains(equipment))
+            equipment_requirements(entry).is_some_and(|requirements| {
+                requirements.iter().all(|required| {
+                    available.get(required.kind).copied().unwrap_or(0) >= required.count
+                })
+            })
         })
         .cloned()
         .collect()
+}
+
+pub fn equipment_text_matches_entry(text: &str, entry: &ExerciseCatalogEntry) -> bool {
+    let available = locally_resolved_equipment(text);
+    let available = equipment_counts(&available);
+    equipment_requirements(entry).is_some_and(|requirements| {
+        requirements
+            .iter()
+            .all(|required| available.get(required.kind).copied().unwrap_or(0) >= required.count)
+    })
+}
+
+fn equipment_counts<'a>(available: &'a [String]) -> HashMap<&'a str, usize> {
+    available.iter().fold(HashMap::new(), |mut counts, kind| {
+        *counts.entry(kind.as_str()).or_insert(0usize) += 1;
+        counts
+    })
 }
 
 pub fn movements_for_equipment(available: &[String]) -> Vec<Movement> {
@@ -206,9 +285,9 @@ pub fn validate() -> Result<()> {
     Ok(())
 }
 
-fn available_equipment(text: &str) -> HashSet<&'static str> {
+fn available_equipment(text: &str) -> Vec<&'static str> {
     let text = text.to_lowercase();
-    let mut available = HashSet::from(["bodyweight"]);
+    let mut available = vec!["bodyweight"];
     for (kind, aliases) in [
         ("dumbbell", &["dumbbell", "dumb bell"][..]),
         ("kettlebell", &["kettlebell", "kettle bell"][..]),
@@ -220,12 +299,110 @@ fn available_equipment(text: &str) -> HashSet<&'static str> {
         ("foam_roll", &["foam roll", "foam roller"][..]),
         ("cable", &["cable machine", "cable"][..]),
         ("machine", &["gym machine", "machines"][..]),
+        (
+            "pull_up_bar",
+            &[
+                "pull-up bar",
+                "pull up bar",
+                "pullup bar",
+                "chin-up bar",
+                "chin up bar",
+                "chinup bar",
+                "doorway bar",
+                "door-frame bar",
+                "door frame bar",
+            ][..],
+        ),
+        ("v_bar", &["v-bar", "v bar", "neutral grip handle"][..]),
+        (
+            "bench_or_box",
+            &[
+                "bench",
+                "plyo box",
+                "plyometric box",
+                "exercise box",
+                "elevated platform",
+                "workout step",
+            ][..],
+        ),
+        (
+            "dip_station",
+            &["dip station", "dip bars", "parallel bars"][..],
+        ),
+        ("rack", &["squat rack", "power rack", "barbell rack"][..]),
+        ("wall", &["wall"][..]),
+        (
+            "stable_support",
+            &[
+                "chair",
+                "railing",
+                "counter",
+                "vertical support",
+                "sturdy support",
+            ][..],
+        ),
+        (
+            "leg_anchor",
+            &[
+                "lat pulldown",
+                "lat-pulldown",
+                "preacher bench",
+                "leg anchor",
+            ][..],
+        ),
     ] {
-        if aliases.iter().any(|alias| text.contains(alias)) {
-            available.insert(kind);
+        let matched = aliases.iter().any(|alias| text.contains(alias))
+            || (kind == "bench_or_box"
+                && text
+                    .split(|ch: char| !ch.is_ascii_alphanumeric())
+                    .any(|word| matches!(word, "box" | "platform" | "step")));
+        if matched {
+            let count = if matches!(kind, "kettlebell" | "dumbbell") {
+                repeated_equipment_count(&text, kind)
+            } else {
+                1
+            };
+            available.extend(std::iter::repeat_n(kind, count));
         }
     }
     available
+}
+
+fn repeated_equipment_count(text: &str, kind: &str) -> usize {
+    let singular = kind;
+    let plural = format!("{kind}s");
+    let words = text
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '.'))
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    let mut count = 1;
+    for (index, word) in words.iter().enumerate() {
+        if *word != singular && *word != plural {
+            continue;
+        }
+        if *word == plural {
+            count = count.max(2);
+        }
+        if let Some(previous) = index.checked_sub(1).and_then(|at| words.get(at)) {
+            if let Ok(explicit) = previous.parse::<usize>() {
+                count = count.max(explicit);
+            }
+            if matches!(*previous, "two" | "pair" | "double") {
+                count = count.max(2);
+            }
+        }
+        if index >= 2 && words[index - 1] == "of" && words[index - 2] == "pair" {
+            count = count.max(2);
+        }
+        for nearby in words[index.saturating_sub(3)..index].iter() {
+            if let Some((multiplier, _)) = nearby.split_once('x') {
+                if let Ok(explicit) = multiplier.parse::<usize>() {
+                    count = count.max(explicit);
+                }
+            }
+        }
+    }
+    count.clamp(1, 16)
 }
 
 pub fn is_supported_equipment(value: &str) -> bool {
@@ -242,7 +419,72 @@ pub fn is_supported_equipment(value: &str) -> bool {
             | "foam_roll"
             | "cable"
             | "machine"
+            | "pull_up_bar"
+            | "v_bar"
+            | "bench_or_box"
+            | "dip_station"
+            | "rack"
+            | "wall"
+            | "stable_support"
+            | "leg_anchor"
     )
+}
+
+fn equipment_requirements(entry: &ExerciseCatalogEntry) -> Option<Vec<EquipmentRequirement>> {
+    let base = entry.equipment.as_deref().and_then(normalize_equipment)?;
+    let mut requirements = vec![EquipmentRequirement {
+        kind: base,
+        count: if base == "kettlebell"
+            && DOUBLE_KETTLEBELL_EXERCISE_IDS.contains(&entry.id.as_str())
+        {
+            2
+        } else {
+            1
+        },
+    }];
+    if PULL_UP_BAR_EXERCISE_IDS.contains(&entry.id.as_str()) {
+        requirements.push(EquipmentRequirement {
+            kind: "pull_up_bar",
+            count: 1,
+        });
+    }
+    if entry.id == "V-Bar_Pullup" {
+        requirements.push(EquipmentRequirement {
+            kind: "v_bar",
+            count: 1,
+        });
+    }
+    if BENCH_OR_BOX_EXERCISE_IDS.contains(&entry.id.as_str()) {
+        requirements.push(EquipmentRequirement {
+            kind: "bench_or_box",
+            count: 1,
+        });
+    }
+    if STABLE_SUPPORT_EXERCISE_IDS.contains(&entry.id.as_str()) {
+        requirements.push(EquipmentRequirement {
+            kind: "stable_support",
+            count: 1,
+        });
+    }
+    let supplemental = match entry.id.as_str() {
+        "Dips_-_Triceps_Version" => Some(("dip_station", 1)),
+        "Body_Tricep_Press" => Some(("barbell", 1)),
+        "Close-Grip_Push-Up_off_of_a_Dumbbell" => Some(("dumbbell", 1)),
+        "Crunch_-_Legs_On_Exercise_Ball" => Some(("exercise_ball", 1)),
+        "Handstand_Push-Ups" => Some(("wall", 1)),
+        "Natural_Glute_Ham_Raise" => Some(("leg_anchor", 1)),
+        _ => None,
+    };
+    if let Some((kind, count)) = supplemental {
+        requirements.push(EquipmentRequirement { kind, count });
+    }
+    if entry.id == "Body_Tricep_Press" {
+        requirements.push(EquipmentRequirement {
+            kind: "rack",
+            count: 1,
+        });
+    }
+    Some(requirements)
 }
 
 fn normalize_equipment(value: &str) -> Option<&'static str> {
@@ -283,14 +525,14 @@ mod tests {
     #[test]
     fn bundled_catalog_is_valid_and_large() {
         validate().unwrap();
-        assert_eq!(all().len(), 850);
+        assert_eq!(all().len(), 849);
         assert!(all().iter().all(|entry| entry.images.len() == 2));
         assert_eq!(
             all()
                 .iter()
                 .filter(|entry| !entry.instructions.is_empty())
                 .count(),
-            845
+            844
         );
         let goblet_squat = find("Goblet_Squat").unwrap();
         assert_eq!(goblet_squat.instructions.len(), 3);
@@ -315,6 +557,15 @@ mod tests {
             "foam_roll",
             "cable",
             "machine",
+            "pull_up_bar",
+            "v_bar",
+            "bench_or_box",
+            "dip_station",
+            "rack",
+            "wall",
+            "stable_support",
+            "leg_anchor",
+            "kettlebell",
         ]
         .into_iter()
         .map(str::to_string)
@@ -322,7 +573,7 @@ mod tests {
         let movements = movements_for_equipment(&all_equipment);
 
         assert_eq!(raw.len(), 873);
-        assert_eq!(PARTNER_REQUIRED_EXERCISE_IDS.len(), 23);
+        assert_eq!(PARTNER_REQUIRED_EXERCISE_IDS.len(), 24);
         for id in PARTNER_REQUIRED_EXERCISE_IDS {
             assert!(raw.iter().any(|entry| entry.id == *id), "missing raw {id}");
             assert!(find(id).is_none(), "catalog exposed {id}");
@@ -350,7 +601,7 @@ mod tests {
         assert_eq!(CATALOG_REVISION, "b0eed061e1c832b3ed815fbaa4b45b3cdc14df49");
         assert_eq!(
             movement_pool_revision(),
-            "b0eed061e1c832b3ed815fbaa4b45b3cdc14df49:solo-v1"
+            "b0eed061e1c832b3ed815fbaa4b45b3cdc14df49:equipment-v2"
         );
     }
 
@@ -366,6 +617,107 @@ mod tests {
         assert!(!entries
             .iter()
             .any(|entry| entry.equipment.as_deref() == Some("barbell")));
+    }
+
+    #[test]
+    fn kettlebell_only_excludes_bodyweight_movements_that_require_props() {
+        let entries = candidates("12kg kettlebell");
+        let ids = entries
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect::<HashSet<_>>();
+
+        assert!(ids.contains("Goblet_Squat"));
+        assert!(ids.contains("Pushups"));
+        for id in PULL_UP_BAR_EXERCISE_IDS
+            .iter()
+            .chain(BENCH_OR_BOX_EXERCISE_IDS)
+            .chain(STABLE_SUPPORT_EXERCISE_IDS)
+            .chain(
+                [
+                    "Dips_-_Triceps_Version",
+                    "Body_Tricep_Press",
+                    "Close-Grip_Push-Up_off_of_a_Dumbbell",
+                    "Crunch_-_Legs_On_Exercise_Ball",
+                    "Handstand_Push-Ups",
+                    "Natural_Glute_Ham_Raise",
+                ]
+                .iter(),
+            )
+        {
+            assert!(!ids.contains(id), "equipment filter exposed {id}");
+        }
+        for id in DOUBLE_KETTLEBELL_EXERCISE_IDS {
+            assert!(!ids.contains(id), "single kettlebell exposed {id}");
+        }
+    }
+
+    #[test]
+    fn explicit_supplemental_equipment_restores_matching_movements() {
+        assert!(candidates("pull-up bar")
+            .iter()
+            .any(|entry| entry.id == "Chin-Up"));
+        assert!(!candidates("pull-up bar")
+            .iter()
+            .any(|entry| entry.id == "V-Bar_Pullup"));
+        assert!(candidates("pull-up bar and v-bar")
+            .iter()
+            .any(|entry| entry.id == "V-Bar_Pullup"));
+        assert!(candidates("flat bench")
+            .iter()
+            .any(|entry| entry.id == "Bench_Dips"));
+        assert!(candidates("barbell and squat rack")
+            .iter()
+            .any(|entry| entry.id == "Body_Tricep_Press"));
+        assert!(candidates("two 12kg kettlebells")
+            .iter()
+            .any(|entry| entry.id == "Double_Kettlebell_Jerk"));
+
+        let complete = candidates(
+            "two 12kg kettlebells, pull-up bar, v-bar, flat bench, dip station, \
+             barbell, squat rack, dumbbell, exercise ball, wall, chair, and lat pulldown",
+        );
+        let ids = complete
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect::<HashSet<_>>();
+        for id in PULL_UP_BAR_EXERCISE_IDS
+            .iter()
+            .chain(BENCH_OR_BOX_EXERCISE_IDS)
+            .chain(STABLE_SUPPORT_EXERCISE_IDS)
+            .chain(DOUBLE_KETTLEBELL_EXERCISE_IDS)
+            .chain(
+                [
+                    "Dips_-_Triceps_Version",
+                    "Body_Tricep_Press",
+                    "Close-Grip_Push-Up_off_of_a_Dumbbell",
+                    "Crunch_-_Legs_On_Exercise_Ball",
+                    "Handstand_Push-Ups",
+                    "Natural_Glute_Ham_Raise",
+                ]
+                .iter(),
+            )
+        {
+            assert!(ids.contains(id), "complete inventory omitted {id}");
+        }
+    }
+
+    #[test]
+    fn equipment_quantity_parser_preserves_singular_and_multiple_kettlebells() {
+        assert_eq!(
+            locally_resolved_equipment("12kg kettlebell")
+                .iter()
+                .filter(|kind| kind.as_str() == "kettlebell")
+                .count(),
+            1
+        );
+        assert_eq!(
+            locally_resolved_equipment("2x8kg kettlebells")
+                .iter()
+                .filter(|kind| kind.as_str() == "kettlebell")
+                .count(),
+            2
+        );
     }
 
     #[test]

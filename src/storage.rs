@@ -856,6 +856,7 @@ impl Store {
         config: &Config,
         previous_weight_kg: Option<f32>,
         movements: &[Movement],
+        equipment_filter_json: &str,
     ) -> Result<()> {
         let transaction = self
             .conn
@@ -878,6 +879,10 @@ impl Store {
             config.profile.weight_kg,
         )?;
         Self::replace_movement_pool_in_transaction(&transaction, movements)?;
+        transaction.execute(
+            "UPDATE exercise_catalog_state SET equipment_json = ?1 WHERE id = 1",
+            [equipment_filter_json],
+        )?;
         transaction.commit().context("committing settings update")
     }
 
@@ -1586,11 +1591,15 @@ impl Store {
     }
 
     pub fn today_set_count(&self) -> Result<u32> {
-        let today = Utc::now().date_naive().to_string();
+        self.today_set_count_at(Local::now())
+    }
+
+    fn today_set_count_at(&self, now: DateTime<Local>) -> Result<u32> {
+        let (start, end) = local_day_bounds_at(now)?;
         self.conn
             .query_row(
-                "SELECT COUNT(*) FROM sets WHERE substr(created_at, 1, 10) = ?1 AND status = 'done'",
-                [today],
+                "SELECT COUNT(*) FROM sets WHERE created_at >= ?1 AND created_at < ?2 AND status = 'done'",
+                params![start.to_rfc3339(), end.to_rfc3339()],
                 |row| row.get::<_, i64>(0).map(|count| count as u32),
             )
             .context("counting today's sets")
@@ -1613,7 +1622,11 @@ impl Store {
     }
 
     pub fn stats_today(&self) -> Result<(u32, u32, u32)> {
-        let today = Utc::now().date_naive().to_string();
+        self.stats_today_at(Local::now())
+    }
+
+    fn stats_today_at(&self, now: DateTime<Local>) -> Result<(u32, u32, u32)> {
+        let (start, end) = local_day_bounds_at(now)?;
         self.conn
             .query_row(
                 r#"
@@ -1622,9 +1635,9 @@ impl Store {
                     COALESCE(SUM(CASE WHEN status = 'done' THEN reps ELSE 0 END), 0),
                     SUM(CASE WHEN status IN ('skipped', 'pain') THEN 1 ELSE 0 END)
                 FROM sets
-                WHERE substr(created_at, 1, 10) = ?1
+                WHERE created_at >= ?1 AND created_at < ?2
                 "#,
-                [today],
+                params![start.to_rfc3339(), end.to_rfc3339()],
                 |row| {
                     Ok((
                         row.get::<_, Option<i64>>(0)?.unwrap_or(0) as u32,
@@ -2367,6 +2380,51 @@ mod tests {
     }
 
     #[test]
+    fn daily_forge_count_is_not_limited_by_total_repetitions() {
+        let store = store();
+        let mut rec = recommendation();
+        rec.id = Some(store.insert_recommendation(&rec).unwrap());
+        for reps in [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 6, 6, 6, 6, 6, 6] {
+            store
+                .record_set_with_reps(&rec, SetStatus::Done, reps)
+                .unwrap();
+        }
+
+        assert_eq!(store.today_set_count().unwrap(), 16);
+        assert_eq!(store.stats_today().unwrap(), (16, 106, 0));
+    }
+
+    #[test]
+    fn today_counts_use_local_calendar_day_boundaries() {
+        let store = store();
+        let now = Local::now();
+        let (start, end) = local_day_bounds_at(now).unwrap();
+        let mut rec = recommendation();
+        rec.id = Some(store.insert_recommendation(&rec).unwrap());
+
+        for (offset, reps) in [
+            (Duration::seconds(-1), 1),
+            (Duration::seconds(0), 2),
+            (end - start - Duration::seconds(1), 3),
+            (end - start, 4),
+        ] {
+            store
+                .record_set_with_reps(&rec, SetStatus::Done, reps)
+                .unwrap();
+            store
+                .conn
+                .execute(
+                    "UPDATE sets SET created_at = ?1 WHERE id = (SELECT MAX(id) FROM sets)",
+                    [(start + offset).to_rfc3339()],
+                )
+                .unwrap();
+        }
+
+        assert_eq!(store.today_set_count().unwrap(), 2);
+        assert_eq!(store.stats_today().unwrap(), (2, 5, 0));
+    }
+
+    #[test]
     fn profile_refresh_does_not_unblock_movement_with_pain_history() {
         let store = store();
         store.seed_movements().unwrap();
@@ -2460,9 +2518,10 @@ mod tests {
         let mut config = Config::default();
         config.profile.goals = vec!["mobility".into()];
         let movements = crate::exercise_catalog::movements_for_equipment(&["bodyweight".into()]);
+        let equipment_filter = r#"[{"kind":"bodyweight","weights_kg":[],"count":1}]"#;
 
         store
-            .apply_user_profile_and_movement_pool(&config, None, &movements)
+            .apply_user_profile_and_movement_pool(&config, None, &movements, equipment_filter)
             .unwrap();
 
         let profile_json: String = store
@@ -2473,6 +2532,33 @@ mod tests {
             .unwrap();
         assert!(profile_json.contains("mobility"));
         assert_eq!(store.movements().unwrap().len(), movements.len());
+        let saved_filter: serde_json::Value = store.exercise_filter().unwrap().unwrap();
+        assert_eq!(saved_filter[0]["count"], 1);
+    }
+
+    #[test]
+    fn settings_pool_update_keeps_compatible_queue_and_retires_incompatible_items() {
+        let store = store();
+        let config = Config::default();
+        let movements = crate::exercise_catalog::movements_for_equipment(&["bodyweight".into()]);
+        let compatible_movement = &movements[0];
+        let mut compatible = recommendation();
+        compatible.movement_id = compatible_movement.id.clone();
+        compatible.movement_name = compatible_movement.name.clone();
+        compatible.primary_muscle = compatible_movement.primary_muscle.clone();
+        compatible.muscles = compatible_movement.muscles.clone();
+        store.insert_queued_recommendation(&compatible).unwrap();
+        store
+            .insert_queued_recommendation(&recommendation())
+            .unwrap();
+
+        store
+            .apply_user_profile_and_movement_pool(&config, None, &movements, "[]")
+            .unwrap();
+
+        let queued = store.queued_recommendations().unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].movement_id, compatible.movement_id);
     }
 
     #[test]
@@ -2879,7 +2965,7 @@ mod tests {
         current.profile.weight_kg = Some(77.0);
 
         store
-            .apply_user_profile_and_movement_pool(&current, Some(80.0), &movements)
+            .apply_user_profile_and_movement_pool(&current, Some(80.0), &movements, "[]")
             .unwrap();
         assert_eq!(
             store.weight_progress().unwrap(),
@@ -2890,7 +2976,7 @@ mod tests {
         );
 
         store
-            .apply_user_profile_and_movement_pool(&current, Some(77.0), &movements)
+            .apply_user_profile_and_movement_pool(&current, Some(77.0), &movements, "[]")
             .unwrap();
         let count: i64 = store
             .conn

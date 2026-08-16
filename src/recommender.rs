@@ -103,9 +103,15 @@ struct ContextSet {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct EquipmentCapability {
+pub(crate) struct EquipmentCapability {
     kind: String,
     weights_kg: Vec<f32>,
+    #[serde(default = "default_equipment_count")]
+    count: u32,
+}
+
+fn default_equipment_count() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -150,6 +156,8 @@ struct LlmExerciseProfile {
 struct LlmEquipmentCapability {
     kind: String,
     weights_kg: Vec<f32>,
+    #[serde(default = "default_equipment_count")]
+    count: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -652,44 +660,25 @@ fn exercise_profile_context(config: &Config) -> ExerciseProfileContext<'_> {
     }
 }
 
-fn normalize_equipment(text: &str) -> Vec<EquipmentCapability> {
+pub(crate) fn normalize_equipment(text: &str) -> Vec<EquipmentCapability> {
     let normalized = text.to_lowercase();
     let weights = extract_weight_values_kg(&normalized);
-    let mut capabilities = Vec::new();
-    for (kind, matches) in [
-        ("kettlebell", ["kettlebell", "kettle bell"].as_slice()),
-        ("dumbbell", ["dumbbell", "dumb bell"].as_slice()),
-        ("band", ["band", "resistance band"].as_slice()),
-        (
-            "medicine_ball",
-            ["medicine ball", "medical ball", "medicine_ball"].as_slice(),
-        ),
-        ("barbell", ["barbell"].as_slice()),
-        ("e_z_curl_bar", ["e-z curl bar", "ez curl bar"].as_slice()),
-        (
-            "exercise_ball",
-            ["exercise ball", "stability ball"].as_slice(),
-        ),
-        ("foam_roll", ["foam roll", "foam roller"].as_slice()),
-        ("cable", ["cable machine", "cable"].as_slice()),
-        ("machine", ["gym machine", "machines"].as_slice()),
-    ] {
-        if matches.iter().any(|needle| normalized.contains(needle)) {
-            capabilities.push(EquipmentCapability {
-                kind: kind.to_string(),
-                weights_kg: if matches!(kind, "kettlebell" | "dumbbell" | "barbell") {
-                    weights.clone()
-                } else {
-                    Vec::new()
-                },
-            });
-        }
+    let mut counts = std::collections::BTreeMap::<String, u32>::new();
+    for kind in exercise_catalog::locally_resolved_equipment(text) {
+        *counts.entry(kind).or_default() += 1;
     }
-    capabilities.push(EquipmentCapability {
-        kind: "bodyweight".to_string(),
-        weights_kg: Vec::new(),
-    });
-    capabilities
+    counts
+        .into_iter()
+        .map(|(kind, count)| EquipmentCapability {
+            weights_kg: if matches!(kind.as_str(), "kettlebell" | "dumbbell" | "barbell") {
+                weights.clone()
+            } else {
+                Vec::new()
+            },
+            kind,
+            count,
+        })
+        .collect()
 }
 
 fn extract_weight_values_kg(text: &str) -> Vec<f32> {
@@ -1322,24 +1311,31 @@ fn exercise_profile_schema() -> serde_json::Value {
             "equipment": {
                 "type": "array",
                 "minItems": 0,
-                "maxItems": 11,
+                "maxItems": 20,
                 "items": {
                     "type": "object",
                     "additionalProperties": false,
-                    "required": ["kind", "weights_kg"],
+                    "required": ["kind", "weights_kg", "count"],
                     "properties": {
                         "kind": {
                             "type": "string",
                             "enum": [
                                 "bodyweight", "dumbbell", "kettlebell", "band",
                                 "medicine_ball", "barbell", "e_z_curl_bar",
-                                "exercise_ball", "foam_roll", "cable", "machine"
+                                "exercise_ball", "foam_roll", "cable", "machine",
+                                "pull_up_bar", "v_bar", "bench_or_box", "dip_station",
+                                "rack", "wall", "stable_support", "leg_anchor"
                             ]
                         },
                         "weights_kg": {
                             "type": "array",
                             "items": { "type": "number", "minimum": 0.25, "maximum": 300 },
                             "maxItems": 16
+                        },
+                        "count": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 16
                         }
                     }
                 }
@@ -1372,6 +1368,7 @@ fn validate_exercise_profile(
     let mut equipment = vec![EquipmentCapability {
         kind: "bodyweight".to_string(),
         weights_kg: Vec::new(),
+        count: 1,
     }];
     for capability in profile.equipment {
         if !exercise_catalog::is_supported_equipment(&capability.kind) {
@@ -1387,16 +1384,22 @@ fn validate_exercise_profile(
         {
             bail!("LLM equipment resolver returned an invalid weight");
         }
+        if !(1..=16).contains(&capability.count) {
+            bail!("LLM equipment resolver returned an invalid equipment count");
+        }
         if seen.insert(capability.kind.clone()) && capability.kind != "bodyweight" {
             equipment.push(EquipmentCapability {
                 kind: capability.kind,
                 weights_kg: capability.weights_kg,
+                count: capability.count,
             });
         }
     }
     let kinds = equipment
         .iter()
-        .map(|capability| capability.kind.clone())
+        .flat_map(|capability| {
+            std::iter::repeat_n(capability.kind.clone(), capability.count as usize)
+        })
         .collect::<Vec<_>>();
     Ok((exercise_catalog::movements_for_equipment(&kinds), equipment))
 }
@@ -1826,10 +1829,14 @@ mod tests {
             "12 kg kettlebell, 2x8 kg dumbbells, resistance band, and a medical ball",
         );
         assert!(capabilities.iter().any(|capability| {
-            capability.kind == "kettlebell" && capability.weights_kg.contains(&12.0)
+            capability.kind == "kettlebell"
+                && capability.count == 1
+                && capability.weights_kg.contains(&12.0)
         }));
         assert!(capabilities.iter().any(|capability| {
-            capability.kind == "dumbbell" && capability.weights_kg.contains(&8.0)
+            capability.kind == "dumbbell"
+                && capability.count == 2
+                && capability.weights_kg.contains(&8.0)
         }));
         assert!(capabilities
             .iter()
@@ -1845,6 +1852,7 @@ mod tests {
             equipment: vec![LlmEquipmentCapability {
                 kind: "dumbbell".into(),
                 weights_kg: vec![10.0],
+                count: 1,
             }],
         })
         .unwrap();
@@ -1862,6 +1870,35 @@ mod tests {
         assert!(movements.iter().all(|movement| {
             movement.equipment == ["bodyweight"] || movement.equipment == ["dumbbell"]
         }));
+    }
+
+    #[test]
+    fn resolved_kettlebell_profile_respects_equipment_quantity() {
+        let resolve = |count| {
+            validate_exercise_profile(LlmExerciseProfile {
+                equipment: vec![LlmEquipmentCapability {
+                    kind: "kettlebell".into(),
+                    weights_kg: vec![12.0],
+                    count,
+                }],
+            })
+            .unwrap()
+            .0
+        };
+
+        assert!(!resolve(1)
+            .iter()
+            .any(|movement| movement.id == "Double_Kettlebell_Jerk"));
+        assert!(resolve(2)
+            .iter()
+            .any(|movement| movement.id == "Double_Kettlebell_Jerk"));
+    }
+
+    #[test]
+    fn legacy_saved_equipment_capabilities_default_to_one_item() {
+        let capability: EquipmentCapability =
+            serde_json::from_str(r#"{"kind":"kettlebell","weights_kg":[12.0]}"#).unwrap();
+        assert_eq!(capability.count, 1);
     }
 
     #[test]

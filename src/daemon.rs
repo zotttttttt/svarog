@@ -68,8 +68,9 @@ pub enum QueueRegenerationStart {
 #[derive(Debug)]
 pub enum ForgeNowResult {
     Started,
+    DailyForgeCeilingReached { completed: u32, limit: u32 },
     NoQueued,
-    NoSafe,
+    CoolingDown,
 }
 
 #[derive(Serialize)]
@@ -371,14 +372,20 @@ pub fn regenerate_queue(env: &RuntimeEnv) -> QueueRegenerationStart {
 }
 
 pub fn forge_now(env: &RuntimeEnv) -> Result<ForgeNowResult> {
+    let config = load_or_default(&env.paths)?;
     let store = Store::open(&env.paths.database_file)?;
+    let completed = store.today_set_count()?;
+    let limit = config.preferences.max_daily_sets;
+    if completed >= limit {
+        return Ok(ForgeNowResult::DailyForgeCeilingReached { completed, limit });
+    }
     if store.queued_recommendation_count()? == 0 {
         return Ok(ForgeNowResult::NoQueued);
     }
     Ok(
         match store.promote_next_queued_recommendation_preserving_metadata()? {
             Some(_) => ForgeNowResult::Started,
-            None => ForgeNowResult::NoSafe,
+            None => ForgeNowResult::CoolingDown,
         },
     )
 }
@@ -423,6 +430,9 @@ fn ensure_exercise_pool(store: &Store, config: &Config) -> Result<()> {
     let equipment =
         crate::exercise_catalog::locally_resolved_equipment(&config.profile.equipment_text);
     let movements = crate::exercise_catalog::movements_for_equipment(&equipment);
+    store.save_exercise_filter(&crate::recommender::normalize_equipment(
+        &config.profile.equipment_text,
+    ))?;
     store.replace_movement_pool(&movements)
 }
 
@@ -634,6 +644,85 @@ mod tests {
         let env = test_env();
 
         assert!(matches!(forge_now(&env).unwrap(), ForgeNowResult::NoQueued));
+    }
+
+    #[test]
+    fn forge_now_reports_when_all_queued_forges_are_cooling_down() {
+        let env = test_env();
+        crate::config::save(&env.paths, &Config::default()).unwrap();
+        let store = Store::open(&env.paths.database_file).unwrap();
+        let mut completed = Recommendation {
+            id: None,
+            movement_id: "cooling-movement".into(),
+            movement_name: "cooling forge".into(),
+            primary_muscle: "cooling-muscle".into(),
+            muscles: vec!["cooling-muscle".into()],
+            reps: 8,
+            weight_kg: None,
+            estimated_seconds: 30,
+            agent: Agent::Codex,
+            project: None,
+            side: None,
+            created_at: chrono::Utc::now(),
+        };
+        completed.id = Some(store.insert_recommendation(&completed).unwrap());
+        store.record_set(&completed, SetStatus::Done).unwrap();
+        let mut queued = completed.clone();
+        queued.id = None;
+        store.insert_queued_recommendation(&queued).unwrap();
+        drop(store);
+
+        assert!(matches!(
+            forge_now(&env).unwrap(),
+            ForgeNowResult::CoolingDown
+        ));
+    }
+
+    #[test]
+    fn forge_now_respects_the_daily_forge_ceiling_not_repetitions() {
+        let env = test_env();
+        crate::config::save(&env.paths, &Config::default()).unwrap();
+        let store = Store::open(&env.paths.database_file).unwrap();
+        let mut completed = Recommendation {
+            id: None,
+            movement_id: "completed-movement".into(),
+            movement_name: "completed forge".into(),
+            primary_muscle: "completed-muscle".into(),
+            muscles: vec!["completed-muscle".into()],
+            reps: 1,
+            weight_kg: None,
+            estimated_seconds: 30,
+            agent: Agent::Codex,
+            project: None,
+            side: None,
+            created_at: chrono::Utc::now(),
+        };
+        completed.id = Some(store.insert_recommendation(&completed).unwrap());
+        for _ in 0..100 {
+            store
+                .record_set_with_reps(&completed, SetStatus::Done, 1)
+                .unwrap();
+        }
+        let mut queued = completed.clone();
+        queued.id = None;
+        queued.movement_id = "queued-movement".into();
+        queued.movement_name = "queued forge".into();
+        queued.primary_muscle = "queued-muscle".into();
+        queued.muscles = vec!["queued-muscle".into()];
+        store.insert_queued_recommendation(&queued).unwrap();
+        drop(store);
+
+        assert!(matches!(
+            forge_now(&env).unwrap(),
+            ForgeNowResult::DailyForgeCeilingReached {
+                completed: 100,
+                limit: 100
+            }
+        ));
+
+        let store = Store::open(&env.paths.database_file).unwrap();
+        assert_eq!(store.queued_recommendation_count().unwrap(), 1);
+        assert!(store.latest_open_recommendation().unwrap().is_some());
     }
 
     fn codex_hook(event_name: &str, turn_id: Option<&str>) -> CodexHookEvent {

@@ -330,7 +330,7 @@ Collect:
 * cautious body parts
 * injuries or hard limitations
 * Forge archetype
-* daily safety ceiling
+* daily forge ceiling (completed forges, not repetitions)
 * exercise preferences as natural-language text
 
 Store in:
@@ -346,7 +346,11 @@ setup collects height in one field using forms such as `5'11`, `6 ft 1 in`, or
 setup input and displayed defaults. Existing configurations without a
 unit-system preference default to metric.
 
-Equipment and exercise preferences are stored as the user's natural-language text. Leaving exercise preferences blank stores `automatic`.
+Equipment and exercise preferences are stored as the user's natural-language
+text. Equipment eligibility is conservative: bodyweight means no external prop,
+fixed equipment such as a pull-up bar, bench, rack, wall, or stable support must
+be named explicitly, and equipment quantities are respected. Leaving exercise
+preferences blank stores `automatic`.
 
 ---
 
