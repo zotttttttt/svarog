@@ -6,8 +6,10 @@ use std::path::{Path, PathBuf};
 
 const EXERCISE_PROFILE_NAME: &str = "exercise_profile.j2";
 const RECOMMENDATION_QUEUE_NAME: &str = "recommendation_queue.j2";
+const FUEL_ENTRY_NAME: &str = "fuel_entry.j2";
 const DEFAULT_EXERCISE_PROFILE: &str = include_str!("../prompts/exercise_profile.j2");
 const DEFAULT_RECOMMENDATION_QUEUE: &str = include_str!("../prompts/recommendation_queue.j2");
+const DEFAULT_FUEL_ENTRY: &str = include_str!("../prompts/fuel_entry.j2");
 const ARCHETYPE_TEMPLATES: [(&str, &str); 12] = [
     (
         "archetypes/common.j2",
@@ -92,6 +94,14 @@ impl<'a> PromptRenderer<'a> {
         )
     }
 
+    pub fn fuel_entry<T: Serialize>(&self, context_value: &T) -> Result<String> {
+        self.render(
+            FUEL_ENTRY_NAME,
+            DEFAULT_FUEL_ENTRY,
+            context!(context => context_value),
+        )
+    }
+
     fn render(
         &self,
         name: &str,
@@ -158,11 +168,16 @@ mod tests {
                 5,
             )
             .unwrap();
+        let fuel = renderer
+            .fuel_entry(&json!({"input": "oatmeal", "recent_entries": []}))
+            .unwrap();
 
         assert!(profile.starts_with(DEFAULT_EXERCISE_PROFILE.lines().next().unwrap()));
         assert!(profile.contains("\"age\":33"));
         assert!(!queue.contains("{{ needed }}"));
         assert!(queue.contains("\"reps\":8"));
+        assert!(fuel.contains("oatmeal"));
+        assert!(fuel.contains("material portion"));
     }
 
     #[test]
@@ -224,5 +239,19 @@ mod tests {
             .unwrap_err();
 
         assert!(format!("{error:#}").contains("undefined value"));
+    }
+
+    #[test]
+    fn fuel_override_edits_apply_to_the_next_render() {
+        let root = tempdir().unwrap();
+        let prompts = root.path().join("prompts");
+        fs::create_dir_all(&prompts).unwrap();
+        fs::write(prompts.join(FUEL_ENTRY_NAME), "fuel {{ context.input }}").unwrap();
+
+        let rendered = PromptRenderer::new(root.path())
+            .fuel_entry(&json!({"input": "tea"}))
+            .unwrap();
+
+        assert_eq!(rendered, "fuel tea");
     }
 }

@@ -137,9 +137,18 @@ While waiting:
 | Key | Action |
 | --- | --- |
 | `f` | Start the next safe movement now |
+| `a` | Open Add fuel to log a meal, drink, or today's plain-water intake |
 | `l` / `n` | View recent / upcoming movements |
 | `r` | Regenerate from the upcoming-movements view |
 | `s` | Open focus-driven Settings; use ↑/↓ to focus and ←/→ to change a field |
+
+Add fuel uses `gpt-5.6-luna` through the selected Codex or OpenAI recommender
+to estimate calories, macros, fiber, sugar, sodium, and potassium. Svarog shows
+the parsed items and assumptions before saving. Meal descriptions are sent only
+when you explicitly press Enter in Add fuel; the Local recommender keeps meal
+parsing disabled. Plain-water tracking is always local and uses `+`/`=` and `-`
+to adjust today's total by 200 ml or 8 US fluid ounces, following your unit
+setting.
 
 <p align="center">
   <a href="./assets/6-next-forges.png">

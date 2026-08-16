@@ -5,6 +5,7 @@ mod daemon;
 mod engine;
 mod exercise_catalog;
 mod exercise_media;
+mod fuel;
 mod hooks;
 mod models;
 mod notifications;

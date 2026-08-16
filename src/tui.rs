@@ -5,9 +5,10 @@ use crate::config::{
 use crate::daemon::{self, ForgeNowResult, QueueRegenerationResult, QueueRegenerationStart};
 use crate::exercise_catalog::{self, ExerciseCatalogEntry};
 use crate::exercise_media::{self, PreparedGallery};
+use crate::fuel::{self, FuelParseOutcome};
 use crate::models::{
-    AppStateKind, ForgeActivitySummary, Recommendation, RecommenderTokenProvider,
-    RecommenderTokenUsageByProvider, SetStatus,
+    AppStateKind, ForgeActivitySummary, FuelEntry, FuelParseResult, Recommendation,
+    RecommenderTokenProvider, RecommenderTokenUsageByProvider, SetStatus, WaterTotal,
 };
 use crate::secrets;
 use crate::storage::{ForgeHistoryEntry, Store};
@@ -187,6 +188,30 @@ struct TuiState {
     demo: bool,
     saved_openai_key_available: Option<bool>,
     settings: Option<SettingsState>,
+    add_fuel: Option<AddFuelState>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AddFuelFocus {
+    Meal,
+    Water,
+    Recent,
+}
+
+#[derive(Debug)]
+struct AddFuelState {
+    focus: AddFuelFocus,
+    input: String,
+    cursor: usize,
+    parsed: Option<FuelParseOutcome>,
+    parsing: Option<Receiver<Result<FuelParseOutcome, String>>>,
+    parsing_started_at: Option<Instant>,
+    recent: Vec<FuelEntry>,
+    selected_recent: usize,
+    confirming_delete: bool,
+    water: WaterTotal,
+    unit_system: UnitSystem,
+    feedback: Option<String>,
 }
 
 struct SettingsState {
@@ -373,6 +398,7 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
 
         let now = Instant::now();
         let queue_regeneration_finished = poll_queue_regeneration(&mut ui);
+        poll_add_fuel(&mut ui);
         if view_refresh_due(
             last_view_refresh,
             now,
@@ -391,6 +417,8 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
         terminal.draw(|frame| {
             let lines = if let Some(settings) = ui.settings.as_ref() {
                 settings_lines(settings, ui.demo, frame.area().width, frame.area().height)
+            } else if let Some(add_fuel) = ui.add_fuel.as_ref() {
+                add_fuel_lines(add_fuel, ui.demo)
             } else {
                 screen_lines(&view, &ui, in_tmux)
             };
@@ -407,6 +435,13 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
 
         if event::poll(Duration::from_millis(200))? {
             if let Event::Key(key) = event::read()? {
+                if ui.add_fuel.is_some() {
+                    let close = handle_add_fuel_key(&mut ui, key.code, key.modifiers, env, &store);
+                    if close {
+                        ui.add_fuel = None;
+                    }
+                    continue;
+                }
                 if ui.settings.is_some() {
                     if let Err(error) = handle_settings_key(&mut ui, key.code, key.modifiers, env) {
                         if let Some(settings) = ui.settings.as_mut() {
@@ -452,6 +487,15 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
                 }
                 if quit_requested(key) {
                     break Ok(());
+                }
+                if add_fuel_requested(key.code, view.kind, ui.show_history, ui.show_next) {
+                    match open_add_fuel(env, &store) {
+                        Ok(state) => ui.add_fuel = Some(state),
+                        Err(error) => {
+                            ui.status_message = Some(format!("Could not open Add fuel: {error}"));
+                        }
+                    }
+                    continue;
                 }
                 if view.kind == ViewKind::Forge && ui.show_help {
                     match key.code {
@@ -772,6 +816,402 @@ fn poll_exercise_media(ui: &mut TuiState, recommendation: Option<&Recommendation
 
 fn poll_queue_regeneration(ui: &mut TuiState) -> bool {
     poll_queue_regeneration_at(ui, Instant::now())
+}
+
+fn open_add_fuel(env: &RuntimeEnv, store: &Store) -> Result<AddFuelState> {
+    let config = config::load_or_default(&env.paths)?;
+    Ok(AddFuelState {
+        focus: AddFuelFocus::Meal,
+        input: String::new(),
+        cursor: 0,
+        parsed: None,
+        parsing: None,
+        parsing_started_at: None,
+        recent: store.recent_fuel_entries_today(5)?,
+        selected_recent: 0,
+        confirming_delete: false,
+        water: store.water_total_today()?,
+        unit_system: config.profile.unit_system,
+        feedback: None,
+    })
+}
+
+fn poll_add_fuel(ui: &mut TuiState) {
+    let Some(state) = ui.add_fuel.as_mut() else {
+        return;
+    };
+    let result = match state.parsing.as_ref().map(Receiver::try_recv) {
+        Some(Ok(result)) => Some(result),
+        Some(Err(TryRecvError::Disconnected)) => {
+            Some(Err("nutrition parser stopped unexpectedly".into()))
+        }
+        Some(Err(TryRecvError::Empty)) | None => None,
+    };
+    let Some(result) = result else {
+        return;
+    };
+    state.parsing = None;
+    state.parsing_started_at = None;
+    match result {
+        Ok(parsed) => {
+            state.parsed = Some(parsed);
+            state.feedback = None;
+        }
+        Err(error) => state.feedback = Some(format!("Could not parse fuel: {error}")),
+    }
+}
+
+fn start_fuel_parse(state: &mut AddFuelState, env: &RuntimeEnv) {
+    let input = state.input.trim().to_string();
+    if input.is_empty() {
+        state.feedback = Some("Describe a meal or drink first.".into());
+        return;
+    }
+    let paths = env.paths.clone();
+    let config = match config::load_or_default(&paths) {
+        Ok(config) => config,
+        Err(error) => {
+            state.feedback = Some(format!("Could not load settings: {error}"));
+            return;
+        }
+    };
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = Store::open(&paths.database_file)
+            .and_then(|store| fuel::parse_fuel(&store, &config, &paths, &input))
+            .map_err(|error| format!("{error:#}"));
+        let _ = sender.send(result);
+    });
+    state.parsing = Some(receiver);
+    state.parsing_started_at = Some(Instant::now());
+    state.feedback = None;
+}
+
+fn handle_add_fuel_key(
+    ui: &mut TuiState,
+    code: KeyCode,
+    _modifiers: KeyModifiers,
+    env: &RuntimeEnv,
+    store: &Store,
+) -> bool {
+    let Some(state) = ui.add_fuel.as_mut() else {
+        return false;
+    };
+    if state.parsing.is_some() {
+        if code == KeyCode::Esc {
+            state.parsing = None;
+            state.parsing_started_at = None;
+            state.feedback = Some("Parsing result dismissed.".into());
+        }
+        return false;
+    }
+    if let Some(outcome) = state.parsed.as_ref() {
+        match code {
+            KeyCode::Esc => state.parsed = None,
+            KeyCode::Enter => {
+                let result = store.save_fuel_entry(
+                    state.input.trim(),
+                    &outcome.parsed,
+                    outcome.provider,
+                    outcome.model,
+                    chrono::Utc::now(),
+                );
+                match result {
+                    Ok(_) => {
+                        state.parsed = None;
+                        state.input.clear();
+                        state.cursor = 0;
+                        state.recent = store.recent_fuel_entries_today(5).unwrap_or_default();
+                        state.selected_recent = 0;
+                        state.feedback = Some("✓ Meal or drink saved".into());
+                    }
+                    Err(error) => state.feedback = Some(format!("Could not save fuel: {error}")),
+                }
+            }
+            _ => {}
+        }
+        return false;
+    }
+    if state.confirming_delete {
+        match code {
+            KeyCode::Esc => state.confirming_delete = false,
+            KeyCode::Enter | KeyCode::Char('y') => {
+                if let Some(entry) = state.recent.get(state.selected_recent) {
+                    match store.delete_fuel_entry(entry.id) {
+                        Ok(true) => {
+                            state.recent = store.recent_fuel_entries_today(5).unwrap_or_default();
+                            state.selected_recent = state
+                                .selected_recent
+                                .min(state.recent.len().saturating_sub(1));
+                            state.feedback = Some("Fuel entry deleted.".into());
+                        }
+                        Ok(false) => {
+                            state.feedback = Some("Fuel entry was already removed.".into())
+                        }
+                        Err(error) => {
+                            state.feedback = Some(format!("Could not delete fuel: {error}"))
+                        }
+                    }
+                }
+                state.confirming_delete = false;
+            }
+            _ => {}
+        }
+        return false;
+    }
+    match code {
+        KeyCode::Esc => return true,
+        KeyCode::Tab => {
+            state.focus = match state.focus {
+                AddFuelFocus::Meal => AddFuelFocus::Water,
+                AddFuelFocus::Water if state.recent.is_empty() => AddFuelFocus::Meal,
+                AddFuelFocus::Water => AddFuelFocus::Recent,
+                AddFuelFocus::Recent => AddFuelFocus::Meal,
+            };
+        }
+        KeyCode::BackTab => {
+            state.focus = match state.focus {
+                AddFuelFocus::Meal if state.recent.is_empty() => AddFuelFocus::Water,
+                AddFuelFocus::Meal => AddFuelFocus::Recent,
+                AddFuelFocus::Water => AddFuelFocus::Meal,
+                AddFuelFocus::Recent => AddFuelFocus::Water,
+            };
+        }
+        KeyCode::Enter if state.focus == AddFuelFocus::Meal => start_fuel_parse(state, env),
+        KeyCode::Backspace if state.focus == AddFuelFocus::Meal => {
+            backspace_at_cursor(&mut state.input, &mut state.cursor)
+        }
+        KeyCode::Delete if state.focus == AddFuelFocus::Meal => {
+            delete_at_cursor(&mut state.input, state.cursor)
+        }
+        KeyCode::Left if state.focus == AddFuelFocus::Meal => {
+            state.cursor = state.cursor.saturating_sub(1)
+        }
+        KeyCode::Right if state.focus == AddFuelFocus::Meal => {
+            state.cursor = (state.cursor + 1).min(state.input.chars().count())
+        }
+        KeyCode::Home if state.focus == AddFuelFocus::Meal => state.cursor = 0,
+        KeyCode::End if state.focus == AddFuelFocus::Meal => {
+            state.cursor = state.input.chars().count()
+        }
+        KeyCode::Char(ch)
+            if state.focus == AddFuelFocus::Meal && state.input.chars().count() < 500 =>
+        {
+            insert_at_cursor(&mut state.input, &mut state.cursor, ch)
+        }
+        KeyCode::Char('+') | KeyCode::Char('=') if state.focus == AddFuelFocus::Water => {
+            adjust_water_from_tui(state, store, 1.0)
+        }
+        KeyCode::Char('-') if state.focus == AddFuelFocus::Water => {
+            adjust_water_from_tui(state, store, -1.0)
+        }
+        KeyCode::Up if state.focus == AddFuelFocus::Recent => {
+            state.selected_recent = state.selected_recent.saturating_sub(1)
+        }
+        KeyCode::Down if state.focus == AddFuelFocus::Recent => {
+            state.selected_recent =
+                (state.selected_recent + 1).min(state.recent.len().saturating_sub(1))
+        }
+        KeyCode::Char('d') if state.focus == AddFuelFocus::Recent && !state.recent.is_empty() => {
+            state.confirming_delete = true
+        }
+        _ => {}
+    }
+    false
+}
+
+fn adjust_water_from_tui(state: &mut AddFuelState, store: &Store, direction: f64) {
+    let step_ml = match state.unit_system {
+        UnitSystem::Metric => 200.0,
+        UnitSystem::Imperial => 8.0 * crate::storage::ML_PER_US_FL_OZ,
+    };
+    match store.adjust_water_today(direction * step_ml, state.unit_system) {
+        Ok(total) => {
+            state.water = total;
+            state.feedback = Some("✓ Water updated".into());
+        }
+        Err(error) => state.feedback = Some(format!("Could not update water: {error}")),
+    }
+}
+
+fn add_fuel_lines(state: &AddFuelState, demo: bool) -> Vec<Line<'static>> {
+    if let Some(outcome) = state.parsed.as_ref() {
+        return fuel_review_lines(&outcome.parsed, demo, state.feedback.as_deref());
+    }
+    let mut lines = vec![
+        with_demo(Line::from(Span::styled("Add fuel", accent_bold())), demo),
+        Line::from(""),
+        Line::from(Span::styled("Meal or drink", text_bold())),
+        Line::from(vec![
+            Span::styled(
+                if state.focus == AddFuelFocus::Meal {
+                    "› "
+                } else {
+                    "  "
+                },
+                accent_bold(),
+            ),
+            Span::styled(
+                if state.input.is_empty() {
+                    "Describe what you ate or drank…".to_string()
+                } else {
+                    editor_window(&state.input, state.cursor, 0, 72)
+                },
+                if state.focus == AddFuelFocus::Meal {
+                    accent()
+                } else {
+                    text()
+                },
+            ),
+        ]),
+        Line::from(Span::styled("[enter] Parse with Luna", muted())),
+        Line::from(""),
+        Line::from(Span::styled("Plain water · today", text_bold())),
+        Line::from(vec![
+            Span::styled(
+                if state.focus == AddFuelFocus::Water {
+                    "› "
+                } else {
+                    "  "
+                },
+                accent_bold(),
+            ),
+            Span::styled(format_water_total(state.water, state.unit_system), accent()),
+            Span::styled(
+                match state.unit_system {
+                    UnitSystem::Metric => "  [+/=] +200 ml  [-] -200 ml",
+                    UnitSystem::Imperial => "  [+/=] +8 US fl oz  [-] -8 US fl oz",
+                },
+                muted(),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled("Today’s recent fuel", text_bold())),
+    ];
+    if state.recent.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  No meals or drinks logged yet.",
+            muted(),
+        )));
+    } else {
+        for (index, entry) in state.recent.iter().enumerate() {
+            let selected = state.focus == AddFuelFocus::Recent && index == state.selected_recent;
+            lines.push(Line::from(vec![
+                Span::styled(if selected { "› " } else { "  " }, accent_bold()),
+                Span::styled(
+                    clipped_text(&entry.raw_text, 46),
+                    if selected { accent() } else { text() },
+                ),
+                Span::styled(format!(" · {:.0} kcal", entry.totals.calories), muted()),
+            ]));
+        }
+        lines.push(Line::from(Span::styled(
+            "[↑/↓] Select  [d] Delete",
+            muted(),
+        )));
+    }
+    lines.push(Line::from(""));
+    if state.parsing.is_some() {
+        let frame = state
+            .parsing_started_at
+            .map(|started| queue_regeneration_loader_frame(started.elapsed().as_millis()))
+            .unwrap_or(0);
+        lines.push(queue_regeneration_loader_line(frame));
+        lines.push(Line::from(Span::styled(
+            "Estimating nutrition with Luna…",
+            muted(),
+        )));
+    } else if state.confirming_delete {
+        lines.push(Line::from(Span::styled(
+            "Delete this fuel entry?",
+            accent(),
+        )));
+        lines.push(Line::from(Span::styled(
+            "[enter/y] Delete  [esc] Cancel",
+            muted(),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "[tab/shift-tab] Move  [esc] Back",
+            muted(),
+        )));
+    }
+    if let Some(feedback) = state.feedback.as_deref() {
+        lines.push(Line::from(Span::styled(feedback.to_string(), muted())));
+    }
+    lines
+}
+
+fn fuel_review_lines(
+    parsed: &FuelParseResult,
+    demo: bool,
+    feedback: Option<&str>,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        with_demo(Line::from(Span::styled("Review fuel", accent_bold())), demo),
+        Line::from(""),
+    ];
+    for item in &parsed.items {
+        let quantity = match (item.quantity, item.unit.as_deref()) {
+            (Some(quantity), Some(unit)) => format!(" · {quantity} {unit}"),
+            (Some(quantity), None) => format!(" · {quantity}"),
+            _ => String::new(),
+        };
+        lines.push(Line::from(vec![
+            Span::styled(item.name.clone(), text_bold()),
+            Span::styled(quantity, muted()),
+        ]));
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  {:.0} kcal · P {:.1}g · C {:.1}g · F {:.1}g · fiber {:.1}g · sugar {:.1}g",
+                item.nutrition.calories,
+                item.nutrition.protein_g,
+                item.nutrition.carbohydrates_g,
+                item.nutrition.fat_g,
+                item.nutrition.fiber_g,
+                item.nutrition.sugar_g,
+            ),
+            text(),
+        )));
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  sodium {:.0}mg · potassium {:.0}mg",
+                item.nutrition.sodium_mg, item.nutrition.potassium_mg
+            ),
+            muted(),
+        )));
+        for assumption in &item.assumptions {
+            lines.push(Line::from(Span::styled(
+                format!("  Estimated: {assumption}"),
+                muted(),
+            )));
+        }
+        lines.push(Line::from(""));
+    }
+    let totals = parsed.totals();
+    lines.push(Line::from(Span::styled(
+        format!(
+            "Total · {:.0} kcal · P {:.1}g · C {:.1}g · F {:.1}g",
+            totals.calories, totals.protein_g, totals.carbohydrates_g, totals.fat_g
+        ),
+        accent_bold(),
+    )));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "[enter] Save  [esc] Edit description",
+        muted(),
+    )));
+    if let Some(feedback) = feedback {
+        lines.push(Line::from(Span::styled(feedback.to_string(), accent())));
+    }
+    lines
+}
+
+fn format_water_total(total: WaterTotal, unit_system: UnitSystem) -> String {
+    match unit_system {
+        UnitSystem::Metric => format!("{:.0} ml", total.milliliters),
+        UnitSystem::Imperial => format!("{:.1} US fl oz", total.fluid_ounces),
+    }
 }
 
 fn poll_queue_regeneration_at(ui: &mut TuiState, now: Instant) -> bool {
@@ -2113,6 +2553,18 @@ fn forge_now_requested(code: KeyCode, kind: ViewKind, history_visible: bool) -> 
         && matches!(kind, ViewKind::Idle | ViewKind::Cooldown)
 }
 
+fn add_fuel_requested(
+    code: KeyCode,
+    kind: ViewKind,
+    history_visible: bool,
+    next_visible: bool,
+) -> bool {
+    code == KeyCode::Char('a')
+        && !history_visible
+        && !next_visible
+        && matches!(kind, ViewKind::Idle | ViewKind::Cooldown)
+}
+
 fn regenerate_queue_requested(code: KeyCode, kind: ViewKind, next_visible: bool) -> bool {
     code == KeyCode::Char('r')
         && next_visible
@@ -2124,7 +2576,7 @@ fn forge_list_controls_line() -> Line<'static> {
 }
 
 fn forge_now_control_line() -> Line<'static> {
-    Line::from(Span::styled("[f] Forge now", muted()))
+    Line::from(Span::styled("[f] Forge now  [a] Add fuel", muted()))
 }
 
 fn waiting_forge_now_lines(
@@ -3173,7 +3625,7 @@ mod tests {
         assert!(text.contains("[l] Latest forges"));
         assert!(text.contains("[n] Next forges"));
         assert!(text.contains(
-            "Waiting for the next forge.\n\n[f] Forge now\n[l] Latest forges [n] Next forges\n\nRecommender: [Codex]\n[s] Settings"
+            "Waiting for the next forge.\n\n[f] Forge now  [a] Add fuel\n[l] Latest forges [n] Next forges\n\nRecommender: [Codex]\n[s] Settings"
         ));
         assert!(text.contains("Recommender: [Codex]\n[s] Settings"));
         assert!(!text.contains("[r] Change recommender"));
@@ -3295,7 +3747,7 @@ mod tests {
         assert!(lines.windows(5).any(|window| {
             window[0].to_string() == "Forged. Waiting for the next forge."
                 && window[1].to_string().is_empty()
-                && window[2].to_string() == "[f] Forge now"
+                && window[2].to_string() == "[f] Forge now  [a] Add fuel"
                 && window[3].to_string() == "[l] Latest forges [n] Next forges"
                 && window[4].to_string().is_empty()
         }));
@@ -4274,5 +4726,73 @@ mod tests {
         assert!(text.contains("[y] Yes"));
         assert!(text.contains("[n] No"));
         assert!(text.contains("[backspace] Skip and remove this exercise"));
+    }
+
+    #[test]
+    fn add_fuel_shortcut_is_limited_to_unobscured_waiting_screens() {
+        assert!(add_fuel_requested(
+            KeyCode::Char('a'),
+            ViewKind::Idle,
+            false,
+            false
+        ));
+        assert!(add_fuel_requested(
+            KeyCode::Char('a'),
+            ViewKind::Cooldown,
+            false,
+            false
+        ));
+        assert!(!add_fuel_requested(
+            KeyCode::Char('a'),
+            ViewKind::Forge,
+            false,
+            false
+        ));
+        assert!(!add_fuel_requested(
+            KeyCode::Char('a'),
+            ViewKind::Idle,
+            true,
+            false
+        ));
+        assert!(!add_fuel_requested(
+            KeyCode::Char('a'),
+            ViewKind::Idle,
+            false,
+            true
+        ));
+    }
+
+    #[test]
+    fn add_fuel_screen_uses_selected_units_and_keeps_prompt_keys_separate() {
+        let state = AddFuelState {
+            focus: AddFuelFocus::Water,
+            input: "coffee with milk".into(),
+            cursor: 16,
+            parsed: None,
+            parsing: None,
+            parsing_started_at: None,
+            recent: Vec::new(),
+            selected_recent: 0,
+            confirming_delete: false,
+            water: WaterTotal {
+                milliliters: 200.0,
+                fluid_ounces: 200.0 / crate::storage::ML_PER_US_FL_OZ,
+            },
+            unit_system: UnitSystem::Metric,
+            feedback: None,
+        };
+        let rendered = add_fuel_lines(&state, false)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("coffee with milk"));
+        assert!(rendered.contains("200 ml  [+/=] +200 ml"));
+        assert!(rendered.contains("No meals or drinks logged yet."));
+
+        assert_eq!(
+            format_water_total(state.water, UnitSystem::Imperial),
+            "6.8 US fl oz"
+        );
     }
 }

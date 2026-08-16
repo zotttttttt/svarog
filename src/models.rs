@@ -191,6 +191,86 @@ pub struct ForgeActivitySummary {
     pub week: ForgeActivityTotals,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct NutritionTotals {
+    pub calories: f64,
+    pub protein_g: f64,
+    pub carbohydrates_g: f64,
+    pub fat_g: f64,
+    pub fiber_g: f64,
+    pub sugar_g: f64,
+    pub sodium_mg: f64,
+    pub potassium_mg: f64,
+}
+
+impl NutritionTotals {
+    pub fn add_assign(&mut self, other: &Self) {
+        self.calories += other.calories;
+        self.protein_g += other.protein_g;
+        self.carbohydrates_g += other.carbohydrates_g;
+        self.fat_g += other.fat_g;
+        self.fiber_g += other.fiber_g;
+        self.sugar_g += other.sugar_g;
+        self.sodium_mg += other.sodium_mg;
+        self.potassium_mg += other.potassium_mg;
+    }
+
+    pub fn values(&self) -> [f64; 8] {
+        [
+            self.calories,
+            self.protein_g,
+            self.carbohydrates_g,
+            self.fat_g,
+            self.fiber_g,
+            self.sugar_g,
+            self.sodium_mg,
+            self.potassium_mg,
+        ]
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FuelItem {
+    pub name: String,
+    pub quantity: Option<f64>,
+    pub unit: Option<String>,
+    #[serde(flatten)]
+    pub nutrition: NutritionTotals,
+    pub assumptions: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FuelParseResult {
+    pub items: Vec<FuelItem>,
+}
+
+impl FuelParseResult {
+    pub fn totals(&self) -> NutritionTotals {
+        let mut totals = NutritionTotals::default();
+        for item in &self.items {
+            totals.add_assign(&item.nutrition);
+        }
+        totals
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FuelEntry {
+    pub id: i64,
+    pub raw_text: String,
+    pub parsed: FuelParseResult,
+    pub totals: NutritionTotals,
+    pub provider: String,
+    pub model: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct WaterTotal {
+    pub milliliters: f64,
+    pub fluid_ounces: f64,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct IncomingEvent {
     pub agent: Agent,

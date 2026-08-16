@@ -214,10 +214,13 @@ Event:
 ✦ Svarog
 
 Waiting for the next forge.
-[f] Latest forges  [n] Next forges
+[f] Forge now  [a] Add fuel
+[l] Latest forges  [n] Next forges
 ```
 
-No animation, stats, action footer, or dashboard content.
+Add fuel is also available during cooldown. It reviews Luna-estimated meals and
+drinks before saving, keeps plain-water tracking local, and displays today's
+water total in the profile's selected unit system.
 
 ---
 

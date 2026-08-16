@@ -1,9 +1,9 @@
-use crate::config::Config;
+use crate::config::{Config, UnitSystem};
 use crate::models::{
     Agent, AgentEvent, AppState, AppStateKind, CodexHookEvent, ForgeActivitySummary,
-    ForgeActivityTotals, Movement, MovementSidedness, MovementStatus, Recommendation,
-    RecommendationSide, RecommenderTokenProvider, RecommenderTokenUsage,
-    RecommenderTokenUsageSummary, SetStatus, TokenUsageTotals,
+    ForgeActivityTotals, FuelEntry, FuelParseResult, Movement, MovementSidedness, MovementStatus,
+    NutritionTotals, Recommendation, RecommendationSide, RecommenderTokenProvider,
+    RecommenderTokenUsage, RecommenderTokenUsageSummary, SetStatus, TokenUsageTotals, WaterTotal,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Local, TimeZone, Utc};
@@ -14,6 +14,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 pub const MUSCLE_COOLDOWN_MINUTES: i64 = 18;
+pub const ML_PER_US_FL_OZ: f64 = 29.573_529_562_5;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SetSummary {
@@ -179,6 +180,40 @@ impl Store {
 
             CREATE INDEX IF NOT EXISTS recommender_token_usage_created_at
                 ON recommender_token_usage(created_at);
+
+            CREATE TABLE IF NOT EXISTS fuel_entries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                raw_text TEXT NOT NULL,
+                items_json TEXT NOT NULL,
+                calories REAL NOT NULL,
+                protein_g REAL NOT NULL,
+                carbohydrates_g REAL NOT NULL,
+                fat_g REAL NOT NULL,
+                fiber_g REAL NOT NULL,
+                sugar_g REAL NOT NULL,
+                sodium_mg REAL NOT NULL,
+                potassium_mg REAL NOT NULL,
+                provider TEXT NOT NULL,
+                model TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS fuel_entries_created_at
+                ON fuel_entries(created_at);
+
+            CREATE TABLE IF NOT EXISTS water_adjustments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                local_date TEXT NOT NULL,
+                delta_ml REAL NOT NULL,
+                delta_fl_oz REAL NOT NULL,
+                total_ml REAL NOT NULL,
+                total_fl_oz REAL NOT NULL,
+                unit_system TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS water_adjustments_local_date
+                ON water_adjustments(local_date, id);
             "#,
         )?;
         let _ = self.conn.execute(
@@ -275,6 +310,8 @@ impl Store {
             DELETE FROM exercise_exclusions;
             DELETE FROM exercise_catalog_state;
             DELETE FROM recommender_token_usage;
+            DELETE FROM fuel_entries;
+            DELETE FROM water_adjustments;
             DELETE FROM users;
             DELETE FROM movements;
             DELETE FROM app_state;
@@ -286,7 +323,9 @@ impl Store {
                 'turns',
                 'sessions',
                 'pain_events',
-                'recommender_token_usage'
+                'recommender_token_usage',
+                'fuel_entries',
+                'water_adjustments'
             );
             "#,
         )?;
@@ -299,6 +338,164 @@ impl Store {
             [Utc::now().to_rfc3339()],
         )?;
         Ok(())
+    }
+
+    pub fn save_fuel_entry(
+        &self,
+        raw_text: &str,
+        parsed: &FuelParseResult,
+        provider: &str,
+        model: &str,
+        created_at: DateTime<Utc>,
+    ) -> Result<i64> {
+        let totals = parsed.totals();
+        self.conn.execute(
+            r#"
+            INSERT INTO fuel_entries (
+                raw_text, items_json, calories, protein_g, carbohydrates_g, fat_g,
+                fiber_g, sugar_g, sodium_mg, potassium_mg, provider, model, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+            "#,
+            params![
+                raw_text,
+                serde_json::to_string(parsed)?,
+                totals.calories,
+                totals.protein_g,
+                totals.carbohydrates_g,
+                totals.fat_g,
+                totals.fiber_g,
+                totals.sugar_g,
+                totals.sodium_mg,
+                totals.potassium_mg,
+                provider,
+                model,
+                created_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn recent_fuel_entries(&self, limit: u32) -> Result<Vec<FuelEntry>> {
+        self.fuel_entries_between(None, None, limit)
+    }
+
+    pub fn recent_fuel_entries_today(&self, limit: u32) -> Result<Vec<FuelEntry>> {
+        self.recent_fuel_entries_today_at(limit, Local::now())
+    }
+
+    pub fn recent_fuel_entries_today_at(
+        &self,
+        limit: u32,
+        now: DateTime<Local>,
+    ) -> Result<Vec<FuelEntry>> {
+        let (start, _) = local_period_starts_at(now)?;
+        let end = start + Duration::days(1);
+        self.fuel_entries_between(Some(start), Some(end), limit)
+    }
+
+    fn fuel_entries_between(
+        &self,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
+        limit: u32,
+    ) -> Result<Vec<FuelEntry>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT id, raw_text, items_json, calories, protein_g, carbohydrates_g,
+                   fat_g, fiber_g, sugar_g, sodium_mg, potassium_mg,
+                   provider, model, created_at
+            FROM fuel_entries
+            WHERE (?1 IS NULL OR created_at >= ?1)
+              AND (?2 IS NULL OR created_at < ?2)
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?3
+            "#,
+        )?;
+        let start = start.map(|value| value.to_rfc3339());
+        let end = end.map(|value| value.to_rfc3339());
+        let rows = stmt.query_map(params![start, end, limit], fuel_entry_from_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("loading fuel entries")
+    }
+
+    pub fn delete_fuel_entry(&self, id: i64) -> Result<bool> {
+        Ok(self
+            .conn
+            .execute("DELETE FROM fuel_entries WHERE id = ?1", [id])?
+            > 0)
+    }
+
+    pub fn water_total_today(&self) -> Result<WaterTotal> {
+        self.water_total_at(Local::now())
+    }
+
+    pub fn water_total_at(&self, now: DateTime<Local>) -> Result<WaterTotal> {
+        let date = now.date_naive().to_string();
+        let milliliters = self.conn.query_row(
+            "SELECT COALESCE(SUM(delta_ml), 0.0) FROM water_adjustments WHERE local_date = ?1",
+            [date],
+            |row| row.get::<_, f64>(0),
+        )?;
+        Ok(WaterTotal {
+            milliliters,
+            fluid_ounces: milliliters / ML_PER_US_FL_OZ,
+        })
+    }
+
+    pub fn adjust_water_today(
+        &self,
+        requested_delta_ml: f64,
+        unit_system: UnitSystem,
+    ) -> Result<WaterTotal> {
+        self.adjust_water_at(requested_delta_ml, unit_system, Local::now())
+    }
+
+    pub fn adjust_water_at(
+        &self,
+        requested_delta_ml: f64,
+        unit_system: UnitSystem,
+        now: DateTime<Local>,
+    ) -> Result<WaterTotal> {
+        if !requested_delta_ml.is_finite() || requested_delta_ml == 0.0 {
+            anyhow::bail!("water adjustment must be a finite non-zero value");
+        }
+        let transaction = self.conn.unchecked_transaction()?;
+        let local_date = now.date_naive().to_string();
+        let current: f64 = transaction.query_row(
+            "SELECT COALESCE(SUM(delta_ml), 0.0) FROM water_adjustments WHERE local_date = ?1",
+            [&local_date],
+            |row| row.get(0),
+        )?;
+        let total_ml = (current + requested_delta_ml).max(0.0);
+        let actual_delta_ml = total_ml - current;
+        if actual_delta_ml == 0.0 {
+            return Ok(WaterTotal {
+                milliliters: current,
+                fluid_ounces: current / ML_PER_US_FL_OZ,
+            });
+        }
+        transaction.execute(
+            r#"
+            INSERT INTO water_adjustments (
+                local_date, delta_ml, delta_fl_oz, total_ml, total_fl_oz,
+                unit_system, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "#,
+            params![
+                local_date,
+                actual_delta_ml,
+                actual_delta_ml / ML_PER_US_FL_OZ,
+                total_ml,
+                total_ml / ML_PER_US_FL_OZ,
+                unit_system.to_string(),
+                now.with_timezone(&Utc).to_rfc3339(),
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(WaterTotal {
+            milliliters: total_ml,
+            fluid_ounces: total_ml / ML_PER_US_FL_OZ,
+        })
     }
 
     pub fn record_recommender_token_usage(
@@ -1440,6 +1637,41 @@ fn local_period_starts_at(now: DateTime<Local>) -> Result<(DateTime<Utc>, DateTi
     Ok((today_start, week_start))
 }
 
+fn fuel_entry_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FuelEntry> {
+    let items_json: String = row.get(2)?;
+    let parsed = serde_json::from_str(&items_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    let created_at: String = row.get(13)?;
+    let created_at = DateTime::parse_from_rfc3339(&created_at)
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                13,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?
+        .with_timezone(&Utc);
+    Ok(FuelEntry {
+        id: row.get(0)?,
+        raw_text: row.get(1)?,
+        parsed,
+        totals: NutritionTotals {
+            calories: row.get(3)?,
+            protein_g: row.get(4)?,
+            carbohydrates_g: row.get(5)?,
+            fat_g: row.get(6)?,
+            fiber_g: row.get(7)?,
+            sugar_g: row.get(8)?,
+            sodium_mg: row.get(9)?,
+            potassium_mg: row.get(10)?,
+        },
+        provider: row.get(11)?,
+        model: row.get(12)?,
+        created_at,
+    })
+}
+
 fn recommendation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Recommendation> {
     let side: Option<String> = row.get(8)?;
     let agent: String = row.get(9)?;
@@ -2004,6 +2236,16 @@ mod tests {
         store.record_set(&rec, SetStatus::Done).unwrap();
         store.save_user_profile(&Config::default()).unwrap();
         store.seed_movements().unwrap();
+        store
+            .save_fuel_entry(
+                "test meal",
+                &FuelParseResult { items: Vec::new() },
+                "codex",
+                "gpt-5.6-luna",
+                Utc::now(),
+            )
+            .unwrap();
+        store.adjust_water_today(200.0, UnitSystem::Metric).unwrap();
 
         store.reset_all_data().unwrap();
 
@@ -2011,6 +2253,8 @@ mod tests {
         assert_eq!((sets, reps, breaks), (0, 0, 0));
         assert!(store.movements().unwrap().is_empty());
         assert!(store.latest_open_recommendation().unwrap().is_none());
+        assert!(store.recent_fuel_entries(5).unwrap().is_empty());
+        assert_eq!(store.water_total_today().unwrap(), WaterTotal::default());
         assert_eq!(store.state().unwrap().kind, AppStateKind::Idle);
     }
 
@@ -2251,5 +2495,81 @@ mod tests {
 
         assert!(store.latest_open_recommendation().unwrap().is_none());
         assert_eq!(store.recent_forge_history(10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn fuel_entries_round_trip_and_delete() {
+        let store = store();
+        let parsed = FuelParseResult {
+            items: vec![crate::models::FuelItem {
+                name: "oatmeal".into(),
+                quantity: Some(250.0),
+                unit: Some("g".into()),
+                nutrition: NutritionTotals {
+                    calories: 320.0,
+                    protein_g: 12.0,
+                    carbohydrates_g: 54.0,
+                    fat_g: 7.0,
+                    fiber_g: 8.0,
+                    sugar_g: 10.0,
+                    sodium_mg: 120.0,
+                    potassium_mg: 410.0,
+                },
+                assumptions: vec!["ordinary cooked oatmeal".into()],
+            }],
+        };
+        let id = store
+            .save_fuel_entry(
+                "oatmeal with milk",
+                &parsed,
+                "codex",
+                "gpt-5.6-luna",
+                Utc::now(),
+            )
+            .unwrap();
+
+        let recent = store.recent_fuel_entries_today(5).unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].id, id);
+        assert_eq!(recent[0].parsed, parsed);
+        assert_eq!(recent[0].totals.calories, 320.0);
+        assert!(store.delete_fuel_entry(id).unwrap());
+        assert!(store.recent_fuel_entries(5).unwrap().is_empty());
+    }
+
+    #[test]
+    fn water_adjustments_store_both_units_clamp_and_roll_over_locally() {
+        let store = store();
+        let now = Local::now();
+        let first = store
+            .adjust_water_at(200.0, UnitSystem::Metric, now)
+            .unwrap();
+        assert_eq!(first.milliliters, 200.0);
+        assert!((first.fluid_ounces - 200.0 / ML_PER_US_FL_OZ).abs() < 0.000_001);
+
+        let imperial_step = 8.0 * ML_PER_US_FL_OZ;
+        let second = store
+            .adjust_water_at(imperial_step, UnitSystem::Imperial, now)
+            .unwrap();
+        assert!((second.fluid_ounces - (first.fluid_ounces + 8.0)).abs() < 0.000_001);
+        let stored: (f64, f64) = store
+            .conn
+            .query_row(
+                "SELECT total_ml, total_fl_oz FROM water_adjustments ORDER BY id DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!((stored.0 / ML_PER_US_FL_OZ - stored.1).abs() < 0.000_001);
+
+        let zero = store
+            .adjust_water_at(-10_000.0, UnitSystem::Metric, now)
+            .unwrap();
+        assert_eq!(zero, WaterTotal::default());
+        assert_eq!(store.water_total_at(now).unwrap(), WaterTotal::default());
+        assert_eq!(
+            store.water_total_at(now + Duration::days(1)).unwrap(),
+            WaterTotal::default()
+        );
     }
 }

@@ -828,6 +828,35 @@ where
     }
 }
 
+pub(crate) fn call_codex_json_for_model<T>(
+    store: &Store,
+    config: &Config,
+    prompt: &str,
+    schema: &serde_json::Value,
+    model: &str,
+) -> Result<T>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let mut schema_file = tempfile::NamedTempFile::new().context("creating Codex output schema")?;
+    serde_json::to_writer(&mut schema_file, schema).context("writing Codex output schema")?;
+    schema_file
+        .flush()
+        .context("flushing Codex output schema")?;
+    let deadline = Instant::now() + Duration::from_millis(config.recommender.timeout_ms);
+    match call_codex_json_attempt(
+        store,
+        config,
+        prompt,
+        schema_file.path(),
+        Some(model),
+        deadline,
+    )? {
+        CodexAttempt::Completed(value) => Ok(value),
+        CodexAttempt::EarlyFailure(error) => bail!(error),
+    }
+}
+
 enum CodexAttempt<T> {
     Completed(T),
     EarlyFailure(String),
@@ -1006,7 +1035,7 @@ fn call_openai_exercise_profile(
     call_openai_json(store, config, paths, body).context("parsing OpenAI exercise profile")
 }
 
-fn call_openai_json<T>(
+pub(crate) fn call_openai_json<T>(
     store: &Store,
     config: &Config,
     paths: &Paths,
