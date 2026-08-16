@@ -621,10 +621,6 @@ fn collect_profile(config: &mut Config, paths: &config::Paths, all: bool) -> Res
             prompt_list("Injuries or hard limitations", &config.profile.injuries)?;
         Ok(())
     })?;
-    onboarding_step(config, paths, config::STEP_ARCHETYPE, all, |config| {
-        config.forge = tui::select_archetype(&config.forge)?;
-        Ok(())
-    })?;
     onboarding_step(
         config,
         paths,
@@ -652,6 +648,10 @@ fn collect_profile(config: &mut Config, paths: &config::Paths, all: bool) -> Res
             Ok(())
         },
     )?;
+    onboarding_step(config, paths, config::STEP_ARCHETYPE, all, |config| {
+        config.forge = tui::select_archetype(&config.forge)?;
+        Ok(())
+    })?;
     Ok(())
 }
 
