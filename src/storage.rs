@@ -7,7 +7,7 @@ use crate::models::{
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Local, TimeZone, Utc};
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::Serialize;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -59,6 +59,8 @@ impl Store {
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
         let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .context("configuring SQLite busy timeout")?;
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))
             .with_context(|| format!("securing {}", path.display()))?;
         let store = Self { conn };
@@ -348,6 +350,7 @@ impl Store {
         model: &str,
         created_at: DateTime<Utc>,
     ) -> Result<i64> {
+        crate::fuel::validate_parsed(parsed).context("validating fuel entry before saving")?;
         let totals = parsed.totals();
         self.conn.execute(
             r#"
@@ -375,6 +378,7 @@ impl Store {
         Ok(self.conn.last_insert_rowid())
     }
 
+    #[cfg(test)]
     pub fn recent_fuel_entries(&self, limit: u32) -> Result<Vec<FuelEntry>> {
         self.fuel_entries_between(None, None, limit)
     }
@@ -388,8 +392,7 @@ impl Store {
         limit: u32,
         now: DateTime<Local>,
     ) -> Result<Vec<FuelEntry>> {
-        let (start, _) = local_period_starts_at(now)?;
-        let end = start + Duration::days(1);
+        let (start, end) = local_day_bounds_at(now)?;
         self.fuel_entries_between(Some(start), Some(end), limit)
     }
 
@@ -436,6 +439,9 @@ impl Store {
             [date],
             |row| row.get::<_, f64>(0),
         )?;
+        if !milliliters.is_finite() || milliliters < 0.0 {
+            anyhow::bail!("stored water total is invalid");
+        }
         Ok(WaterTotal {
             milliliters,
             fluid_ounces: milliliters / ML_PER_US_FL_OZ,
@@ -459,14 +465,20 @@ impl Store {
         if !requested_delta_ml.is_finite() || requested_delta_ml == 0.0 {
             anyhow::bail!("water adjustment must be a finite non-zero value");
         }
-        let transaction = self.conn.unchecked_transaction()?;
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let local_date = now.date_naive().to_string();
         let current: f64 = transaction.query_row(
             "SELECT COALESCE(SUM(delta_ml), 0.0) FROM water_adjustments WHERE local_date = ?1",
             [&local_date],
             |row| row.get(0),
         )?;
+        if !current.is_finite() || current < 0.0 {
+            anyhow::bail!("stored water total is invalid");
+        }
         let total_ml = (current + requested_delta_ml).max(0.0);
+        if !total_ml.is_finite() {
+            anyhow::bail!("water total is too large");
+        }
         let actual_delta_ml = total_ml - current;
         if actual_delta_ml == 0.0 {
             return Ok(WaterTotal {
@@ -1637,6 +1649,37 @@ fn local_period_starts_at(now: DateTime<Local>) -> Result<(DateTime<Utc>, DateTi
     Ok((today_start, week_start))
 }
 
+fn local_day_bounds_at(now: DateTime<Local>) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
+    day_bounds_in_timezone(now)
+}
+
+fn day_bounds_in_timezone<Tz>(now: DateTime<Tz>) -> Result<(DateTime<Utc>, DateTime<Utc>)>
+where
+    Tz: TimeZone,
+{
+    let today = now.date_naive();
+    let timezone = now.timezone();
+    let start = timezone
+        .from_local_datetime(
+            &today
+                .and_hms_opt(0, 0, 0)
+                .context("building local start of today")?,
+        )
+        .earliest()
+        .context("determining local start of today")?
+        .with_timezone(&Utc);
+    let end = timezone
+        .from_local_datetime(
+            &(today + Duration::days(1))
+                .and_hms_opt(0, 0, 0)
+                .context("building local start of tomorrow")?,
+        )
+        .earliest()
+        .context("determining local start of tomorrow")?
+        .with_timezone(&Utc);
+    Ok((start, end))
+}
+
 fn fuel_entry_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FuelEntry> {
     let items_json: String = row.get(2)?;
     let parsed = serde_json::from_str(&items_json).map_err(|error| {
@@ -2239,7 +2282,19 @@ mod tests {
         store
             .save_fuel_entry(
                 "test meal",
-                &FuelParseResult { items: Vec::new() },
+                &FuelParseResult {
+                    items: vec![crate::models::FuelItem {
+                        name: "test meal".into(),
+                        quantity: None,
+                        unit: None,
+                        nutrition: NutritionTotals {
+                            calories: 100.0,
+                            carbohydrates_g: 10.0,
+                            ..NutritionTotals::default()
+                        },
+                        assumptions: Vec::new(),
+                    }],
+                },
                 "codex",
                 "gpt-5.6-luna",
                 Utc::now(),
@@ -2571,5 +2626,47 @@ mod tests {
             store.water_total_at(now + Duration::days(1)).unwrap(),
             WaterTotal::default()
         );
+    }
+
+    #[test]
+    fn local_day_bounds_follow_dst_calendar_midnights() {
+        let spring = chrono_tz::America::New_York
+            .with_ymd_and_hms(2026, 3, 8, 12, 0, 0)
+            .single()
+            .unwrap();
+        let fall = chrono_tz::America::New_York
+            .with_ymd_and_hms(2026, 11, 1, 12, 0, 0)
+            .single()
+            .unwrap();
+
+        let (spring_start, spring_end) = day_bounds_in_timezone(spring).unwrap();
+        let (fall_start, fall_end) = day_bounds_in_timezone(fall).unwrap();
+
+        assert_eq!((spring_end - spring_start).num_hours(), 23);
+        assert_eq!((fall_end - fall_start).num_hours(), 25);
+    }
+
+    #[test]
+    fn concurrent_water_adjustments_serialize() {
+        let root = tempdir().unwrap().keep();
+        let database = root.join("svarog.sqlite3");
+        drop(Store::open(&database).unwrap());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let database = database.clone();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                let store = Store::open(&database).unwrap();
+                barrier.wait();
+                store.adjust_water_today(200.0, UnitSystem::Metric).unwrap();
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        let store = Store::open(&database).unwrap();
+        assert_eq!(store.water_total_today().unwrap().milliliters, 400.0);
     }
 }

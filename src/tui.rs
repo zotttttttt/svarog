@@ -204,14 +204,26 @@ struct AddFuelState {
     input: String,
     cursor: usize,
     parsed: Option<FuelParseOutcome>,
-    parsing: Option<Receiver<Result<FuelParseOutcome, String>>>,
+    parsing: Option<FuelParseJob>,
     parsing_started_at: Option<Instant>,
+    next_parse_id: u64,
+    scroll: usize,
     recent: Vec<FuelEntry>,
     selected_recent: usize,
     confirming_delete: bool,
     water: WaterTotal,
     unit_system: UnitSystem,
+    backend: RecommenderBackend,
+    local_date: chrono::NaiveDate,
     feedback: Option<String>,
+}
+
+#[derive(Debug)]
+struct FuelParseJob {
+    id: u64,
+    receiver: Receiver<(u64, Result<FuelParseOutcome, String>)>,
+    cancel: Arc<AtomicBool>,
+    worker: std::thread::JoinHandle<()>,
 }
 
 struct SettingsState {
@@ -389,6 +401,7 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
 
     let result: Result<()> = loop {
         if shutdown.load(Ordering::Acquire) {
+            cancel_add_fuel(&mut ui);
             break Ok(());
         }
         if last_spark_toggle.elapsed() >= Duration::from_secs(1) {
@@ -399,6 +412,7 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
         let now = Instant::now();
         let queue_regeneration_finished = poll_queue_regeneration(&mut ui);
         poll_add_fuel(&mut ui);
+        refresh_add_fuel_day(&mut ui, &store);
         if view_refresh_due(
             last_view_refresh,
             now,
@@ -412,13 +426,14 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
             ui.show_history = false;
             ui.show_next = false;
         }
+        reconcile_add_fuel_view(&mut ui, view.kind);
         sync_reps(&mut ui, view.recommendation.as_ref());
         poll_exercise_media(&mut ui, view.recommendation.as_ref());
         terminal.draw(|frame| {
             let lines = if let Some(settings) = ui.settings.as_ref() {
                 settings_lines(settings, ui.demo, frame.area().width, frame.area().height)
             } else if let Some(add_fuel) = ui.add_fuel.as_ref() {
-                add_fuel_lines(add_fuel, ui.demo)
+                add_fuel_lines(add_fuel, ui.demo, frame.area().width, frame.area().height)
             } else {
                 screen_lines(&view, &ui, in_tmux)
             };
@@ -647,6 +662,8 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
         }
     };
 
+    cancel_add_fuel(&mut ui);
+
     if keyboard_enhancement {
         let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
     }
@@ -820,6 +837,7 @@ fn poll_queue_regeneration(ui: &mut TuiState) -> bool {
 
 fn open_add_fuel(env: &RuntimeEnv, store: &Store) -> Result<AddFuelState> {
     let config = config::load_or_default(&env.paths)?;
+    let now = Local::now();
     Ok(AddFuelState {
         focus: AddFuelFocus::Meal,
         input: String::new(),
@@ -827,11 +845,15 @@ fn open_add_fuel(env: &RuntimeEnv, store: &Store) -> Result<AddFuelState> {
         parsed: None,
         parsing: None,
         parsing_started_at: None,
+        next_parse_id: 1,
+        scroll: 0,
         recent: store.recent_fuel_entries_today(5)?,
         selected_recent: 0,
         confirming_delete: false,
         water: store.water_total_today()?,
         unit_system: config.profile.unit_system,
+        backend: config.recommender.backend,
+        local_date: now.date_naive(),
         feedback: None,
     })
 }
@@ -840,28 +862,79 @@ fn poll_add_fuel(ui: &mut TuiState) {
     let Some(state) = ui.add_fuel.as_mut() else {
         return;
     };
-    let result = match state.parsing.as_ref().map(Receiver::try_recv) {
-        Some(Ok(result)) => Some(result),
-        Some(Err(TryRecvError::Disconnected)) => {
-            Some(Err("nutrition parser stopped unexpectedly".into()))
-        }
-        Some(Err(TryRecvError::Empty)) | None => None,
+    let active_id = state.parsing.as_ref().map(|job| job.id);
+    let result = match state.parsing.as_ref() {
+        Some(job) => match job.receiver.try_recv() {
+            Ok(result) => Some(result),
+            Err(TryRecvError::Disconnected) => {
+                Some((job.id, Err("nutrition parser stopped unexpectedly".into())))
+            }
+            Err(TryRecvError::Empty) => None,
+        },
+        None => None,
     };
     let Some(result) = result else {
         return;
     };
-    state.parsing = None;
+    if let Some(job) = state.parsing.take() {
+        let _ = job.worker.join();
+    }
     state.parsing_started_at = None;
     match result {
-        Ok(parsed) => {
+        (request_id, Ok(parsed)) if Some(request_id) == active_id => {
             state.parsed = Some(parsed);
+            state.scroll = 0;
             state.feedback = None;
         }
-        Err(error) => state.feedback = Some(format!("Could not parse fuel: {error}")),
+        (request_id, Err(error)) if Some(request_id) == active_id => {
+            state.feedback = Some(format!("Could not parse fuel: {error}"))
+        }
+        _ => {}
     }
 }
 
+fn cancel_add_fuel(ui: &mut TuiState) {
+    if let Some(job) = ui.add_fuel.as_mut().and_then(|state| state.parsing.take()) {
+        job.cancel.store(true, Ordering::Release);
+        let _ = job.worker.join();
+    }
+    if let Some(state) = ui.add_fuel.as_mut() {
+        state.parsing_started_at = None;
+    }
+    ui.add_fuel = None;
+}
+
+fn reconcile_add_fuel_view(ui: &mut TuiState, kind: ViewKind) {
+    if kind == ViewKind::Forge {
+        cancel_add_fuel(ui);
+    }
+}
+
+fn refresh_add_fuel_day(ui: &mut TuiState, store: &Store) {
+    refresh_add_fuel_day_at(ui, store, Local::now().date_naive());
+}
+
+fn refresh_add_fuel_day_at(ui: &mut TuiState, store: &Store, today: chrono::NaiveDate) {
+    let Some(state) = ui.add_fuel.as_mut() else {
+        return;
+    };
+    if state.local_date == today {
+        return;
+    }
+    state.local_date = today;
+    state.water = store.water_total_today().unwrap_or_default();
+    state.recent = store.recent_fuel_entries_today(5).unwrap_or_default();
+    state.selected_recent = 0;
+    state.feedback = Some("Started a new local day.".into());
+}
+
 fn start_fuel_parse(state: &mut AddFuelState, env: &RuntimeEnv) {
+    if state.backend == RecommenderBackend::Local {
+        state.feedback = Some(
+            "Meal and drink parsing needs Codex or an OpenAI backend; water is available.".into(),
+        );
+        return;
+    }
     let input = state.input.trim().to_string();
     if input.is_empty() {
         state.feedback = Some("Describe a meal or drink first.".into());
@@ -876,15 +949,32 @@ fn start_fuel_parse(state: &mut AddFuelState, env: &RuntimeEnv) {
         }
     };
     let (sender, receiver) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
+    let request_id = state.next_parse_id;
+    state.next_parse_id = state.next_parse_id.saturating_add(1);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker_cancel = cancel.clone();
+    let worker = std::thread::spawn(move || {
         let result = Store::open(&paths.database_file)
-            .and_then(|store| fuel::parse_fuel(&store, &config, &paths, &input))
+            .and_then(|store| fuel::parse_fuel(&store, &config, &paths, &input, worker_cancel))
             .map_err(|error| format!("{error:#}"));
-        let _ = sender.send(result);
+        let _ = sender.send((request_id, result));
     });
-    state.parsing = Some(receiver);
+    state.parsing = Some(FuelParseJob {
+        id: request_id,
+        receiver,
+        cancel,
+        worker,
+    });
     state.parsing_started_at = Some(Instant::now());
     state.feedback = None;
+}
+
+fn focus_scroll_hint(state: &AddFuelState) -> usize {
+    match state.focus {
+        AddFuelFocus::Meal => 0,
+        AddFuelFocus::Water => 4,
+        AddFuelFocus::Recent => 8,
+    }
 }
 
 fn handle_add_fuel_key(
@@ -899,15 +989,27 @@ fn handle_add_fuel_key(
     };
     if state.parsing.is_some() {
         if code == KeyCode::Esc {
-            state.parsing = None;
+            if let Some(job) = state.parsing.take() {
+                job.cancel.store(true, Ordering::Release);
+                let _ = job.worker.join();
+            }
             state.parsing_started_at = None;
-            state.feedback = Some("Parsing result dismissed.".into());
+            state.feedback = Some("Nutrition parsing cancelled.".into());
         }
         return false;
     }
     if let Some(outcome) = state.parsed.as_ref() {
         match code {
-            KeyCode::Esc => state.parsed = None,
+            KeyCode::Esc => {
+                state.parsed = None;
+                state.scroll = 0;
+            }
+            KeyCode::Up => state.scroll = state.scroll.saturating_sub(1),
+            KeyCode::Down => state.scroll = state.scroll.saturating_add(1),
+            KeyCode::PageUp => state.scroll = state.scroll.saturating_sub(5),
+            KeyCode::PageDown => state.scroll = state.scroll.saturating_add(5),
+            KeyCode::Home => state.scroll = 0,
+            KeyCode::End => state.scroll = usize::MAX,
             KeyCode::Enter => {
                 let result = store.save_fuel_entry(
                     state.input.trim(),
@@ -968,6 +1070,7 @@ fn handle_add_fuel_key(
                 AddFuelFocus::Water => AddFuelFocus::Recent,
                 AddFuelFocus::Recent => AddFuelFocus::Meal,
             };
+            state.scroll = focus_scroll_hint(state);
         }
         KeyCode::BackTab => {
             state.focus = match state.focus {
@@ -976,6 +1079,19 @@ fn handle_add_fuel_key(
                 AddFuelFocus::Water => AddFuelFocus::Meal,
                 AddFuelFocus::Recent => AddFuelFocus::Water,
             };
+            state.scroll = focus_scroll_hint(state);
+        }
+        KeyCode::Up if state.focus == AddFuelFocus::Water => {
+            state.focus = AddFuelFocus::Meal;
+            state.scroll = 0;
+        }
+        KeyCode::Down if state.focus == AddFuelFocus::Meal => {
+            state.focus = AddFuelFocus::Water;
+            state.scroll = 4;
+        }
+        KeyCode::Down if state.focus == AddFuelFocus::Water && !state.recent.is_empty() => {
+            state.focus = AddFuelFocus::Recent;
+            state.scroll = 8;
         }
         KeyCode::Enter if state.focus == AddFuelFocus::Meal => start_fuel_parse(state, env),
         KeyCode::Backspace if state.focus == AddFuelFocus::Meal => {
@@ -1034,10 +1150,23 @@ fn adjust_water_from_tui(state: &mut AddFuelState, store: &Store, direction: f64
     }
 }
 
-fn add_fuel_lines(state: &AddFuelState, demo: bool) -> Vec<Line<'static>> {
+fn add_fuel_lines(
+    state: &AddFuelState,
+    demo: bool,
+    area_width: u16,
+    area_height: u16,
+) -> Vec<Line<'static>> {
     if let Some(outcome) = state.parsed.as_ref() {
-        return fuel_review_lines(&outcome.parsed, demo, state.feedback.as_deref());
+        return fuel_review_lines(
+            &outcome.parsed,
+            demo,
+            state.feedback.as_deref(),
+            area_width,
+            area_height,
+            state.scroll,
+        );
     }
+    let width = usize::from(area_width.max(1));
     let mut lines = vec![
         with_demo(Line::from(Span::styled("Add fuel", accent_bold())), demo),
         Line::from(""),
@@ -1053,9 +1182,18 @@ fn add_fuel_lines(state: &AddFuelState, demo: bool) -> Vec<Line<'static>> {
             ),
             Span::styled(
                 if state.input.is_empty() {
-                    "Describe what you ate or drank…".to_string()
+                    if state.focus == AddFuelFocus::Meal {
+                        "│ Describe what you ate or drank…".to_string()
+                    } else {
+                        "Describe what you ate or drank…".to_string()
+                    }
                 } else {
-                    editor_window(&state.input, state.cursor, 0, 72)
+                    editor_window(
+                        &state.input,
+                        state.cursor,
+                        0,
+                        width.saturating_sub(3).max(1),
+                    )
                 },
                 if state.focus == AddFuelFocus::Meal {
                     accent()
@@ -1064,7 +1202,14 @@ fn add_fuel_lines(state: &AddFuelState, demo: bool) -> Vec<Line<'static>> {
                 },
             ),
         ]),
-        Line::from(Span::styled("[enter] Parse with Luna", muted())),
+        Line::from(Span::styled(
+            if state.backend == RecommenderBackend::Local {
+                "Nutrition parsing unavailable with Local recommender"
+            } else {
+                "[enter] Parse with Luna"
+            },
+            muted(),
+        )),
         Line::from(""),
         Line::from(Span::styled("Plain water · today", text_bold())),
         Line::from(vec![
@@ -1099,7 +1244,7 @@ fn add_fuel_lines(state: &AddFuelState, demo: bool) -> Vec<Line<'static>> {
             lines.push(Line::from(vec![
                 Span::styled(if selected { "› " } else { "  " }, accent_bold()),
                 Span::styled(
-                    clipped_text(&entry.raw_text, 46),
+                    clipped_text(&entry.raw_text, width.saturating_sub(18).max(4)),
                     if selected { accent() } else { text() },
                 ),
                 Span::styled(format!(" · {:.0} kcal", entry.totals.calories), muted()),
@@ -1118,7 +1263,7 @@ fn add_fuel_lines(state: &AddFuelState, demo: bool) -> Vec<Line<'static>> {
             .unwrap_or(0);
         lines.push(queue_regeneration_loader_line(frame));
         lines.push(Line::from(Span::styled(
-            "Estimating nutrition with Luna…",
+            "Estimating nutrition with Luna…  [esc] Cancel",
             muted(),
         )));
     } else if state.confirming_delete {
@@ -1132,21 +1277,31 @@ fn add_fuel_lines(state: &AddFuelState, demo: bool) -> Vec<Line<'static>> {
         )));
     } else {
         lines.push(Line::from(Span::styled(
-            "[tab/shift-tab] Move  [esc] Back",
+            "[tab/shift-tab/↑/↓] Move  [esc] Back",
             muted(),
         )));
     }
     if let Some(feedback) = state.feedback.as_deref() {
         lines.push(Line::from(Span::styled(feedback.to_string(), muted())));
     }
-    lines
+    let footer_len = if state.parsing.is_some() || state.confirming_delete {
+        2 + usize::from(state.feedback.is_some())
+    } else {
+        1 + usize::from(state.feedback.is_some())
+    };
+    let footer = lines.split_off(lines.len().saturating_sub(footer_len));
+    fuel_viewport(lines, footer, usize::from(area_height), state.scroll)
 }
 
 fn fuel_review_lines(
     parsed: &FuelParseResult,
     demo: bool,
     feedback: Option<&str>,
+    area_width: u16,
+    area_height: u16,
+    scroll: usize,
 ) -> Vec<Line<'static>> {
+    let width = usize::from(area_width.max(1));
     let mut lines = vec![
         with_demo(Line::from(Span::styled("Review fuel", accent_bold())), demo),
         Line::from(""),
@@ -1157,12 +1312,13 @@ fn fuel_review_lines(
             (Some(quantity), None) => format!(" · {quantity}"),
             _ => String::new(),
         };
-        lines.push(Line::from(vec![
-            Span::styled(item.name.clone(), text_bold()),
-            Span::styled(quantity, muted()),
-        ]));
-        lines.push(Line::from(Span::styled(
-            format!(
+        lines.extend(wrapped_styled_lines(
+            &format!("{}{}", item.name, quantity),
+            width,
+            text_bold(),
+        ));
+        lines.extend(wrapped_styled_lines(
+            &format!(
                 "  {:.0} kcal · P {:.1}g · C {:.1}g · F {:.1}g · fiber {:.1}g · sugar {:.1}g",
                 item.nutrition.calories,
                 item.nutrition.protein_g,
@@ -1171,40 +1327,78 @@ fn fuel_review_lines(
                 item.nutrition.fiber_g,
                 item.nutrition.sugar_g,
             ),
+            width,
             text(),
-        )));
-        lines.push(Line::from(Span::styled(
-            format!(
+        ));
+        lines.extend(wrapped_styled_lines(
+            &format!(
                 "  sodium {:.0}mg · potassium {:.0}mg",
                 item.nutrition.sodium_mg, item.nutrition.potassium_mg
             ),
+            width,
             muted(),
-        )));
+        ));
         for assumption in &item.assumptions {
-            lines.push(Line::from(Span::styled(
-                format!("  Estimated: {assumption}"),
+            lines.extend(wrapped_styled_lines(
+                &format!("  Estimated: {assumption}"),
+                width,
                 muted(),
-            )));
+            ));
         }
         lines.push(Line::from(""));
     }
     let totals = parsed.totals();
-    lines.push(Line::from(Span::styled(
-        format!(
+    lines.extend(wrapped_styled_lines(
+        &format!(
             "Total · {:.0} kcal · P {:.1}g · C {:.1}g · F {:.1}g",
             totals.calories, totals.protein_g, totals.carbohydrates_g, totals.fat_g
         ),
+        width,
         accent_bold(),
-    )));
+    ));
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "[enter] Save  [esc] Edit description",
+    let controls = wrapped_styled_lines(
+        "[↑/↓/pgup/pgdn] Scroll  [enter] Save  [esc] Edit",
+        width,
         muted(),
-    )));
+    );
+    let controls_len = controls.len();
+    lines.extend(controls);
     if let Some(feedback) = feedback {
         lines.push(Line::from(Span::styled(feedback.to_string(), accent())));
     }
-    lines
+    let footer_len = controls_len + usize::from(feedback.is_some());
+    let footer = lines.split_off(lines.len().saturating_sub(footer_len));
+    fuel_viewport(lines, footer, usize::from(area_height), scroll)
+}
+
+fn wrapped_styled_lines(text_value: &str, width: usize, style: Style) -> Vec<Line<'static>> {
+    let chars = text_value.chars().collect::<Vec<_>>();
+    let width = width.max(1);
+    if chars.is_empty() {
+        return vec![Line::from("")];
+    }
+    chars
+        .chunks(width)
+        .map(|chunk| Line::from(Span::styled(chunk.iter().collect::<String>(), style)))
+        .collect()
+}
+
+fn fuel_viewport(
+    body: Vec<Line<'static>>,
+    footer: Vec<Line<'static>>,
+    height: usize,
+    requested_scroll: usize,
+) -> Vec<Line<'static>> {
+    let footer = footer.into_iter().take(height).collect::<Vec<_>>();
+    let body_height = height.saturating_sub(footer.len());
+    let max_scroll = body.len().saturating_sub(body_height);
+    let start = requested_scroll.min(max_scroll);
+    body.into_iter()
+        .skip(start)
+        .take(body_height)
+        .chain(footer)
+        .collect()
 }
 
 fn format_water_total(total: WaterTotal, unit_system: UnitSystem) -> String {
@@ -2938,8 +3132,8 @@ mod tests {
     use super::*;
     use crate::config::{Config, Recommender, RecommenderBackend};
     use crate::models::{
-        Agent, ForgeActivityTotals, RecommenderTokenUsage, RecommenderTokenUsageSummary,
-        TokenUsageTotals,
+        Agent, ForgeActivityTotals, FuelItem, NutritionTotals, RecommenderTokenUsage,
+        RecommenderTokenUsageSummary, TokenUsageTotals,
     };
     use crate::recommender::QueueGenerationSource;
     use chrono::{TimeZone, Utc};
@@ -2963,6 +3157,27 @@ mod tests {
             saved_openai_key_error: None,
             confirming_openai_key_delete: false,
             error: None,
+        }
+    }
+
+    fn add_fuel_state_for_test() -> AddFuelState {
+        AddFuelState {
+            focus: AddFuelFocus::Meal,
+            input: String::new(),
+            cursor: 0,
+            parsed: None,
+            parsing: None,
+            parsing_started_at: None,
+            next_parse_id: 1,
+            scroll: 0,
+            recent: Vec::new(),
+            selected_recent: 0,
+            confirming_delete: false,
+            water: WaterTotal::default(),
+            unit_system: UnitSystem::Metric,
+            backend: RecommenderBackend::Codex,
+            local_date: Local::now().date_naive(),
+            feedback: None,
         }
     }
 
@@ -4771,6 +4986,8 @@ mod tests {
             parsed: None,
             parsing: None,
             parsing_started_at: None,
+            next_parse_id: 1,
+            scroll: 0,
             recent: Vec::new(),
             selected_recent: 0,
             confirming_delete: false,
@@ -4779,9 +4996,11 @@ mod tests {
                 fluid_ounces: 200.0 / crate::storage::ML_PER_US_FL_OZ,
             },
             unit_system: UnitSystem::Metric,
+            backend: RecommenderBackend::Codex,
+            local_date: Local::now().date_naive(),
             feedback: None,
         };
-        let rendered = add_fuel_lines(&state, false)
+        let rendered = add_fuel_lines(&state, false, 120, 40)
             .into_iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
@@ -4794,5 +5013,53 @@ mod tests {
             format_water_total(state.water, UnitSystem::Imperial),
             "6.8 US fl oz"
         );
+    }
+
+    #[test]
+    fn fuel_review_wraps_scrolls_and_keeps_save_controls_visible() {
+        let parsed = FuelParseResult {
+            items: (0..20)
+                .map(|index| FuelItem {
+                    name: format!("A deliberately long food item number {index}"),
+                    quantity: Some(1.0),
+                    unit: Some("serving".into()),
+                    nutrition: NutritionTotals {
+                        calories: 100.0,
+                        carbohydrates_g: 10.0,
+                        sugar_g: 2.0,
+                        ..NutritionTotals::default()
+                    },
+                    assumptions: vec![
+                        "A long preparation assumption that must wrap on narrow terminals".into(),
+                    ],
+                })
+                .collect(),
+        };
+
+        let first = fuel_review_lines(&parsed, false, None, 24, 8, 0);
+        let last = fuel_review_lines(&parsed, false, None, 24, 8, usize::MAX);
+        assert!(first.last().unwrap().to_string().contains("[enter] Save"));
+        assert!(last.last().unwrap().to_string().contains("[enter] Save"));
+        assert_ne!(first[0].to_string(), last[0].to_string());
+        assert!(first.iter().all(|line| line.width() <= 24));
+        assert!(last.iter().all(|line| line.width() <= 24));
+    }
+
+    #[test]
+    fn active_forge_closes_add_fuel_and_day_rollover_refreshes_totals() {
+        let root = tempdir().unwrap().keep();
+        let store = Store::open(&root.join("svarog.sqlite3")).unwrap();
+        let mut state = add_fuel_state_for_test();
+        state.local_date -= ChronoDuration::days(1);
+        state.water.milliliters = 999.0;
+        let mut ui = TuiState {
+            add_fuel: Some(state),
+            ..TuiState::default()
+        };
+
+        refresh_add_fuel_day_at(&mut ui, &store, Local::now().date_naive());
+        assert_eq!(ui.add_fuel.as_ref().unwrap().water, WaterTotal::default());
+        reconcile_add_fuel_view(&mut ui, ViewKind::Forge);
+        assert!(ui.add_fuel.is_none());
     }
 }

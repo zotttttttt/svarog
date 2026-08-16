@@ -11,7 +11,8 @@ Rules:
 - Values are totals for the described quantity, not per-100-unit values.
 - Calories, protein, carbohydrates, fat, fiber, sugar, sodium, and potassium must be finite and nonnegative.
 - Do not provide health advice, targets, diagnoses, or recommendations.
-- Use recent entries only as bounded consistency context for clearly similar foods; current explicit user facts always win.
+- Include every food and drink mentioned by the user; do not omit products.
+- Return each distinct product exactly once. Consolidate repeated mentions of the same product instead of duplicating it.
 
 Context JSON:
 {{ context | tojson }}

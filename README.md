@@ -144,9 +144,11 @@ While waiting:
 
 Add fuel uses `gpt-5.6-luna` through the selected Codex or OpenAI recommender
 to estimate calories, macros, fiber, sugar, sodium, and potassium. Svarog shows
-the parsed items and assumptions before saving. Meal descriptions are sent only
-when you explicitly press Enter in Add fuel; the Local recommender keeps meal
-parsing disabled. Plain-water tracking is always local and uses `+`/`=` and `-`
+the parsed items and assumptions before saving. Only the current description
+and unit-system preference are sent, and only when you explicitly press Enter;
+previous fuel entries are never included. The selected Codex or OpenAI provider
+receives that request, while the Local recommender disables meal parsing before
+submission. Plain-water tracking is always local and uses `+`/`=` and `-`
 to adjust today's total by 200 ml or 8 US fluid ounces, following your unit
 setting.
 
