@@ -137,20 +137,23 @@ While waiting:
 | Key | Action |
 | --- | --- |
 | `f` | Start the next safe movement now |
-| `a` | Open Add fuel to log a meal, drink, or today's plain-water intake |
+| `a` | Open Add fuel to log one meal, a whole day of meals, or today's plain-water intake |
 | `l` / `n` | View recent / upcoming movements |
 | `r` | Regenerate from the upcoming-movements view |
 | `s` | Open focus-driven Settings; use ↑/↓ to focus and ←/→ to change a field |
 
 Add fuel uses `gpt-5.6-luna` through the selected Codex or OpenAI recommender
-to estimate calories, macros, fiber, sugar, sodium, and potassium. Svarog shows
-the parsed items and assumptions before saving. Only the current description
-and unit-system preference are sent, and only when you explicitly press Enter;
-previous fuel entries are never included. The selected Codex or OpenAI provider
-receives that request, while the Local recommender disables meal parsing before
-submission. Plain-water tracking is always local and uses `+`/`=` and `-`
-to adjust today's total by 200 ml or 8 US fluid ounces, following your unit
-setting.
+to estimate calories, macros, fiber, sugar, sodium, and potassium. A description
+can contain one meal or a timeline for an entire day; Svarog reviews and saves
+each time block as a separate meal. Natural-language dates are supported. With
+no date, meals default to today, except an all-future multi-meal timeline entered
+after midnight is inferred as yesterday. Only the current description, local
+date/time, timezone, and unit-system preference are sent when you explicitly
+press Enter; previous fuel entries are never included. The selected Codex or
+OpenAI provider receives that request, while the Local recommender disables meal
+parsing before submission. Plain-water tracking is always local and uses `+`/`=`
+and `-` to adjust today's total by 200 ml or 8 US fluid ounces, following your
+unit setting.
 
 <p align="center">
   <a href="./assets/6-next-forges.png">

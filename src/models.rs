@@ -255,6 +255,12 @@ impl FuelParseResult {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct TimedFuelEvent {
+    pub consumed_at: DateTime<Utc>,
+    pub parsed: FuelParseResult,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct FuelEntry {
     pub id: i64,
     pub raw_text: String,

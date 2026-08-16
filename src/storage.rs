@@ -1,9 +1,11 @@
 use crate::config::{Config, UnitSystem};
+#[cfg(test)]
+use crate::models::FuelParseResult;
 use crate::models::{
     Agent, AgentEvent, AppState, AppStateKind, CodexHookEvent, ForgeActivitySummary,
-    ForgeActivityTotals, FuelEntry, FuelParseResult, Movement, MovementSidedness, MovementStatus,
-    NutritionTotals, Recommendation, RecommendationSide, RecommenderTokenProvider,
-    RecommenderTokenUsage, RecommenderTokenUsageSummary, SetStatus, TokenUsageTotals, WaterTotal,
+    ForgeActivityTotals, FuelEntry, Movement, MovementSidedness, MovementStatus, NutritionTotals,
+    Recommendation, RecommendationSide, RecommenderTokenProvider, RecommenderTokenUsage,
+    RecommenderTokenUsageSummary, SetStatus, TimedFuelEvent, TokenUsageTotals, WaterTotal,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Local, TimeZone, Utc};
@@ -342,6 +344,7 @@ impl Store {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn save_fuel_entry(
         &self,
         raw_text: &str,
@@ -350,32 +353,58 @@ impl Store {
         model: &str,
         created_at: DateTime<Utc>,
     ) -> Result<i64> {
-        crate::fuel::validate_parsed(parsed).context("validating fuel entry before saving")?;
-        let totals = parsed.totals();
-        self.conn.execute(
-            r#"
-            INSERT INTO fuel_entries (
-                raw_text, items_json, calories, protein_g, carbohydrates_g, fat_g,
-                fiber_g, sugar_g, sodium_mg, potassium_mg, provider, model, created_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
-            "#,
-            params![
-                raw_text,
-                serde_json::to_string(parsed)?,
-                totals.calories,
-                totals.protein_g,
-                totals.carbohydrates_g,
-                totals.fat_g,
-                totals.fiber_g,
-                totals.sugar_g,
-                totals.sodium_mg,
-                totals.potassium_mg,
-                provider,
-                model,
-                created_at.to_rfc3339(),
-            ],
+        let ids = self.save_fuel_batch(
+            raw_text,
+            &[TimedFuelEvent {
+                consumed_at: created_at,
+                parsed: parsed.clone(),
+            }],
+            provider,
+            model,
         )?;
-        Ok(self.conn.last_insert_rowid())
+        ids.into_iter().next().context("saving fuel entry")
+    }
+
+    pub fn save_fuel_batch(
+        &self,
+        raw_text: &str,
+        events: &[TimedFuelEvent],
+        provider: &str,
+        model: &str,
+    ) -> Result<Vec<i64>> {
+        crate::fuel::validate_timed_events(events)
+            .context("validating fuel batch before saving")?;
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let mut ids = Vec::with_capacity(events.len());
+        for event in events {
+            let totals = event.parsed.totals();
+            transaction.execute(
+                r#"
+                INSERT INTO fuel_entries (
+                    raw_text, items_json, calories, protein_g, carbohydrates_g, fat_g,
+                    fiber_g, sugar_g, sodium_mg, potassium_mg, provider, model, created_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                "#,
+                params![
+                    raw_text,
+                    serde_json::to_string(&event.parsed)?,
+                    totals.calories,
+                    totals.protein_g,
+                    totals.carbohydrates_g,
+                    totals.fat_g,
+                    totals.fiber_g,
+                    totals.sugar_g,
+                    totals.sodium_mg,
+                    totals.potassium_mg,
+                    provider,
+                    model,
+                    event.consumed_at.to_rfc3339(),
+                ],
+            )?;
+            ids.push(transaction.last_insert_rowid());
+        }
+        transaction.commit()?;
+        Ok(ids)
     }
 
     pub fn recent_fuel_entries(&self, limit: u32) -> Result<Vec<FuelEntry>> {
@@ -2659,6 +2688,52 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["meal 0", "meal 1", "meal 2", "meal 3", "meal 4"]
         );
+    }
+
+    #[test]
+    fn fuel_batch_saves_atomically_in_consumption_order() {
+        let store = store();
+        let now = Utc::now();
+        let parsed = FuelParseResult {
+            items: vec![crate::models::FuelItem {
+                name: "meal".into(),
+                quantity: Some(1.0),
+                unit: Some("serving".into()),
+                nutrition: NutritionTotals {
+                    calories: 100.0,
+                    protein_g: 5.0,
+                    ..NutritionTotals::default()
+                },
+                assumptions: Vec::new(),
+            }],
+        };
+        let events = vec![
+            TimedFuelEvent {
+                consumed_at: now - Duration::hours(4),
+                parsed: parsed.clone(),
+            },
+            TimedFuelEvent {
+                consumed_at: now - Duration::hours(1),
+                parsed: parsed.clone(),
+            },
+        ];
+
+        let ids = store
+            .save_fuel_batch("a whole day", &events, "codex", "gpt-5.6-luna")
+            .unwrap();
+        assert_eq!(ids.len(), 2);
+        let recent = store.recent_fuel_entries(5).unwrap();
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0].created_at, events[1].consumed_at);
+        assert_eq!(recent[1].created_at, events[0].consumed_at);
+        assert!(recent.iter().all(|entry| entry.raw_text == "a whole day"));
+
+        let mut invalid = events.clone();
+        invalid[1].parsed.items[0].name = " ".into();
+        assert!(store
+            .save_fuel_batch("invalid batch", &invalid, "codex", "gpt-5.6-luna")
+            .is_err());
+        assert_eq!(store.recent_fuel_entries(5).unwrap().len(), 2);
     }
 
     #[test]

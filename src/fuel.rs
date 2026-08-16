@@ -1,29 +1,60 @@
 use crate::config::{Config, Paths, RecommenderBackend, UnitSystem};
-use crate::models::FuelParseResult;
+use crate::models::{FuelItem, FuelParseResult, NutritionTotals, TimedFuelEvent};
 use crate::prompt_templates::PromptRenderer;
 use crate::recommender;
 use crate::storage::Store;
 use anyhow::{bail, Context, Result};
-use serde::Serialize;
+use chrono::{DateTime, Days, Local, NaiveDate, NaiveTime, TimeZone, Utc};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 pub const FUEL_MODEL: &str = "gpt-5.6-luna";
 const MAX_FUEL_ITEMS: usize = 20;
+const MAX_FUEL_EVENTS: usize = 12;
+const MAX_BATCH_ITEMS: usize = 40;
+pub const MAX_FUEL_INPUT_CHARS: usize = 2_000;
 
 #[derive(Debug, Clone)]
 pub struct FuelParseOutcome {
-    pub parsed: FuelParseResult,
+    pub events: Vec<TimedFuelEvent>,
+    pub inferred_yesterday: bool,
     pub provider: &'static str,
     pub model: &'static str,
+}
+
+impl FuelParseOutcome {
+    pub fn totals(&self) -> NutritionTotals {
+        let mut totals = NutritionTotals::default();
+        for event in &self.events {
+            totals.add_assign(&event.parsed.totals());
+        }
+        totals
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct FuelTimelineParseResult {
+    date: Option<String>,
+    multiple_dates: bool,
+    events: Vec<FuelTimelineEvent>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FuelTimelineEvent {
+    time: Option<String>,
+    inherit_previous_time: bool,
+    items: Vec<FuelItem>,
 }
 
 #[derive(Serialize)]
 struct FuelPromptContext<'a> {
     input: &'a str,
     unit_system: UnitSystem,
+    local_now: String,
+    timezone: String,
 }
 
 pub fn parse_fuel(
@@ -37,48 +68,143 @@ pub fn parse_fuel(
     if input.is_empty() {
         bail!("describe a meal or drink first");
     }
-    if input.chars().count() > 500 {
-        bail!("meal or drink description is limited to 500 characters");
+    if input.chars().count() > MAX_FUEL_INPUT_CHARS {
+        bail!("meal or drink description is limited to {MAX_FUEL_INPUT_CHARS} characters");
     }
+    let now = Local::now();
     let context = FuelPromptContext {
         input,
         unit_system: config.profile.unit_system,
+        local_now: now.to_rfc3339(),
+        timezone: now.format("%Z").to_string(),
     };
     let prompt = PromptRenderer::new(&paths.config_dir).fuel_entry(&context)?;
     let schema = fuel_schema();
-    let (parsed, provider) = match config.recommender.backend {
-        RecommenderBackend::Codex => (
-            recommender::call_codex_json_for_model(
-                store,
-                config,
-                &prompt,
-                &schema,
-                FUEL_MODEL,
-                cancel.as_ref(),
-            )
-            .context("parsing meal or drink with Codex")?,
-            "codex",
-        ),
-        RecommenderBackend::OpenaiEnv | RecommenderBackend::OpenaiKeyring => {
-            let body = openai_fuel_request_body(config, &prompt, schema);
-            (
-                recommender::call_openai_json_cancellable(store, config, paths, body, cancel)
-                    .context("parsing meal or drink with OpenAI")?,
-                "openai",
-            )
-        }
-        RecommenderBackend::Local => {
-            bail!(
+    let (timeline, provider): (FuelTimelineParseResult, &'static str) =
+        match config.recommender.backend {
+            RecommenderBackend::Codex => (
+                recommender::call_codex_json_for_model(
+                    store,
+                    config,
+                    &prompt,
+                    &schema,
+                    FUEL_MODEL,
+                    cancel.as_ref(),
+                )
+                .context("parsing meal or drink with Codex")?,
+                "codex",
+            ),
+            RecommenderBackend::OpenaiEnv | RecommenderBackend::OpenaiKeyring => {
+                let body = openai_fuel_request_body(config, &prompt, schema);
+                (
+                    recommender::call_openai_json_cancellable(store, config, paths, body, cancel)
+                        .context("parsing meal or drink with OpenAI")?,
+                    "openai",
+                )
+            }
+            RecommenderBackend::Local => {
+                bail!(
                 "meal and drink parsing needs Codex or an OpenAI backend; water is still available"
             )
-        }
-    };
-    validate_parsed(&parsed)?;
+            }
+        };
+    let (events, inferred_yesterday) = resolve_timeline_at(timeline, now)?;
     Ok(FuelParseOutcome {
-        parsed,
+        events,
+        inferred_yesterday,
         provider,
         model: FUEL_MODEL,
     })
+}
+
+fn resolve_timeline_at(
+    timeline: FuelTimelineParseResult,
+    now: DateTime<Local>,
+) -> Result<(Vec<TimedFuelEvent>, bool)> {
+    if timeline.multiple_dates {
+        bail!("describe fuel for one calendar date at a time");
+    }
+    if timeline.events.is_empty() {
+        bail!("nutrition parser returned no meal events");
+    }
+    if timeline.events.len() > MAX_FUEL_EVENTS {
+        bail!("nutrition parser returned too many meal events");
+    }
+    let item_count = timeline
+        .events
+        .iter()
+        .map(|event| event.items.len())
+        .sum::<usize>();
+    if item_count == 0 {
+        bail!("nutrition parser returned no food or drink items");
+    }
+    if item_count > MAX_BATCH_ITEMS {
+        bail!("nutrition parser returned too many food or drink items");
+    }
+
+    let explicit_date = timeline
+        .date
+        .as_deref()
+        .map(|value| {
+            NaiveDate::parse_from_str(value, "%Y-%m-%d")
+                .context("nutrition parser returned an invalid date")
+        })
+        .transpose()?;
+    if explicit_date.is_some_and(|date| date > now.date_naive()) {
+        bail!("future dates cannot be logged as fuel");
+    }
+
+    let explicit_times = timeline
+        .events
+        .iter()
+        .filter_map(|event| event.time.as_deref())
+        .map(parse_meal_time)
+        .collect::<Result<Vec<_>>>()?;
+    let inferred_yesterday = explicit_date.is_none()
+        && explicit_times.len() >= 2
+        && explicit_times.iter().all(|time| *time > now.time());
+    let date = match explicit_date {
+        Some(date) => date,
+        None if inferred_yesterday => now
+            .date_naive()
+            .checked_sub_days(Days::new(1))
+            .context("determining yesterday")?,
+        None => now.date_naive(),
+    };
+
+    let mut previous_time = None;
+    let mut grouped = BTreeMap::<NaiveTime, Vec<FuelItem>>::new();
+    for event in timeline.events {
+        let explicit_time = event.time.as_deref().map(parse_meal_time).transpose()?;
+        let time = explicit_time
+            .or(previous_time)
+            .unwrap_or_else(|| now.time());
+        if event.inherit_previous_time && explicit_time.is_some() {
+            bail!("nutrition parser returned conflicting meal time fields");
+        }
+        previous_time = Some(time);
+        grouped.entry(time).or_default().extend(event.items);
+    }
+
+    let mut events = Vec::with_capacity(grouped.len());
+    for (time, items) in grouped {
+        let parsed = FuelParseResult { items };
+        let local = Local
+            .from_local_datetime(&date.and_time(time))
+            .earliest()
+            .context("the requested local meal time does not exist")?;
+        events.push(TimedFuelEvent {
+            consumed_at: local.with_timezone(&Utc),
+            parsed,
+        });
+    }
+    validate_timed_events(&events)?;
+    Ok((events, inferred_yesterday))
+}
+
+fn parse_meal_time(value: &str) -> Result<NaiveTime> {
+    NaiveTime::parse_from_str(value, "%H:%M")
+        .with_context(|| format!("nutrition parser returned an invalid meal time: {value}"))
 }
 
 fn openai_fuel_request_body(
@@ -169,6 +295,32 @@ pub(crate) fn validate_parsed(parsed: &FuelParseResult) -> Result<()> {
         }
     }
     let totals = parsed.totals();
+    validate_aggregate_totals(&totals)
+}
+
+pub(crate) fn validate_timed_events(events: &[TimedFuelEvent]) -> Result<()> {
+    if events.is_empty() {
+        bail!("fuel batch contains no meal events");
+    }
+    if events.len() > MAX_FUEL_EVENTS {
+        bail!("fuel batch contains too many meal events");
+    }
+    let item_count = events
+        .iter()
+        .map(|event| event.parsed.items.len())
+        .sum::<usize>();
+    if item_count > MAX_BATCH_ITEMS {
+        bail!("fuel batch contains too many food or drink items");
+    }
+    let mut totals = NutritionTotals::default();
+    for event in events {
+        validate_parsed(&event.parsed)?;
+        totals.add_assign(&event.parsed.totals());
+    }
+    validate_aggregate_totals(&totals)
+}
+
+fn validate_aggregate_totals(totals: &NutritionTotals) -> Result<()> {
     if totals.values().iter().any(|value| !value.is_finite())
         || totals.calories > 50_000.0
         || [
@@ -189,39 +341,62 @@ pub(crate) fn validate_parsed(parsed: &FuelParseResult) -> Result<()> {
 }
 
 fn fuel_schema() -> serde_json::Value {
+    let item_schema = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "name", "quantity", "unit", "calories", "protein_g",
+            "carbohydrates_g", "fat_g", "fiber_g", "sugar_g",
+            "sodium_mg", "potassium_mg", "assumptions"
+        ],
+        "properties": {
+            "name": { "type": "string", "minLength": 1, "maxLength": 120 },
+            "quantity": { "type": ["number", "null"], "minimum": 0 },
+            "unit": { "type": ["string", "null"], "maxLength": 40 },
+            "calories": { "type": "number", "minimum": 0, "maximum": 20000 },
+            "protein_g": { "type": "number", "minimum": 0, "maximum": 5000 },
+            "carbohydrates_g": { "type": "number", "minimum": 0, "maximum": 5000 },
+            "fat_g": { "type": "number", "minimum": 0, "maximum": 5000 },
+            "fiber_g": { "type": "number", "minimum": 0, "maximum": 5000 },
+            "sugar_g": { "type": "number", "minimum": 0, "maximum": 5000 },
+            "sodium_mg": { "type": "number", "minimum": 0, "maximum": 100000 },
+            "potassium_mg": { "type": "number", "minimum": 0, "maximum": 100000 },
+            "assumptions": {
+                "type": "array",
+                "maxItems": 8,
+                "items": { "type": "string", "maxLength": 200 }
+            }
+        }
+    });
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["items"],
+        "required": ["date", "multiple_dates", "events"],
         "properties": {
-            "items": {
+            "date": {
+                "type": ["string", "null"],
+                "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+            },
+            "multiple_dates": { "type": "boolean" },
+            "events": {
                 "type": "array",
                 "minItems": 1,
-                "maxItems": MAX_FUEL_ITEMS,
+                "maxItems": MAX_FUEL_EVENTS,
                 "items": {
                     "type": "object",
                     "additionalProperties": false,
-                    "required": [
-                        "name", "quantity", "unit", "calories", "protein_g",
-                        "carbohydrates_g", "fat_g", "fiber_g", "sugar_g",
-                        "sodium_mg", "potassium_mg", "assumptions"
-                    ],
+                    "required": ["time", "inherit_previous_time", "items"],
                     "properties": {
-                        "name": { "type": "string", "minLength": 1, "maxLength": 120 },
-                        "quantity": { "type": ["number", "null"], "minimum": 0 },
-                        "unit": { "type": ["string", "null"], "maxLength": 40 },
-                        "calories": { "type": "number", "minimum": 0, "maximum": 20000 },
-                        "protein_g": { "type": "number", "minimum": 0, "maximum": 5000 },
-                        "carbohydrates_g": { "type": "number", "minimum": 0, "maximum": 5000 },
-                        "fat_g": { "type": "number", "minimum": 0, "maximum": 5000 },
-                        "fiber_g": { "type": "number", "minimum": 0, "maximum": 5000 },
-                        "sugar_g": { "type": "number", "minimum": 0, "maximum": 5000 },
-                        "sodium_mg": { "type": "number", "minimum": 0, "maximum": 100000 },
-                        "potassium_mg": { "type": "number", "minimum": 0, "maximum": 100000 },
-                        "assumptions": {
+                        "time": {
+                            "type": ["string", "null"],
+                            "pattern": "^([01][0-9]|2[0-3]):[0-5][0-9]$"
+                        },
+                        "inherit_previous_time": { "type": "boolean" },
+                        "items": {
                             "type": "array",
-                            "maxItems": 8,
-                            "items": { "type": "string", "maxLength": 200 }
+                            "minItems": 1,
+                            "maxItems": MAX_FUEL_ITEMS,
+                            "items": item_schema
                         }
                     }
                 }
@@ -260,9 +435,18 @@ mod tests {
     fn schema_is_strict_and_bounded() {
         let schema = fuel_schema();
         assert_eq!(schema["additionalProperties"], false);
-        assert_eq!(schema["properties"]["items"]["maxItems"], 20);
+        assert_eq!(schema["properties"]["events"]["maxItems"], 12);
         assert_eq!(
-            schema["properties"]["items"]["items"]["additionalProperties"],
+            schema["properties"]["events"]["items"]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            schema["properties"]["events"]["items"]["properties"]["items"]["maxItems"],
+            20
+        );
+        assert_eq!(
+            schema["properties"]["events"]["items"]["properties"]["items"]["items"]
+                ["additionalProperties"],
             false
         );
     }
@@ -283,11 +467,133 @@ mod tests {
         let value = serde_json::to_value(FuelPromptContext {
             input: "oatmeal",
             unit_system: UnitSystem::Metric,
+            local_now: "2026-08-16T01:00:00+04:00".into(),
+            timezone: "+04".into(),
         })
         .unwrap();
-        assert_eq!(value.as_object().unwrap().len(), 2);
+        assert_eq!(value.as_object().unwrap().len(), 4);
         assert_eq!(value["input"], "oatmeal");
+        assert_eq!(value["local_now"], "2026-08-16T01:00:00+04:00");
         assert!(value.get("recent_entries").is_none());
+    }
+
+    fn timeline(date: Option<&str>, times: &[Option<&str>]) -> FuelTimelineParseResult {
+        FuelTimelineParseResult {
+            date: date.map(str::to_string),
+            multiple_dates: false,
+            events: times
+                .iter()
+                .enumerate()
+                .map(|(index, time)| FuelTimelineEvent {
+                    time: time.map(str::to_string),
+                    inherit_previous_time: time.is_none() && index > 0,
+                    items: parsed_item(&format!("item {index}")).items,
+                })
+                .collect(),
+        }
+    }
+
+    fn local_now(hour: u32) -> DateTime<Local> {
+        Local
+            .with_ymd_and_hms(2026, 8, 16, hour, 0, 0)
+            .single()
+            .unwrap()
+    }
+
+    #[test]
+    fn whole_day_with_only_future_times_rolls_back_to_yesterday() {
+        let mut parsed = timeline(None, &[Some("10:00"), Some("14:00"), Some("19:00")]);
+        parsed.events[0].items = ["sunny side up eggs", "peas"]
+            .into_iter()
+            .flat_map(|name| parsed_item(name).items)
+            .collect();
+        parsed.events[1].items = ["Lay's with cheese", "M&M's"]
+            .into_iter()
+            .flat_map(|name| parsed_item(name).items)
+            .collect();
+        parsed.events[2].items = ["beer", "Doritos chips"]
+            .into_iter()
+            .flat_map(|name| parsed_item(name).items)
+            .collect();
+        let (events, inferred) = resolve_timeline_at(parsed, local_now(1)).unwrap();
+
+        assert!(inferred);
+        assert_eq!(events.len(), 3);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.parsed.items.len())
+                .sum::<usize>(),
+            6
+        );
+        assert_eq!(events[0].parsed.items[0].name, "sunny side up eggs");
+        assert_eq!(events[2].parsed.items[1].name, "Doritos chips");
+        assert!(events.iter().all(|event| {
+            event.consumed_at.with_timezone(&Local).date_naive()
+                == NaiveDate::from_ymd_opt(2026, 8, 15).unwrap()
+        }));
+    }
+
+    #[test]
+    fn mixed_or_single_future_times_stay_today() {
+        for times in [vec![Some("10:00"), Some("19:00")], vec![Some("19:00")]] {
+            let (events, inferred) =
+                resolve_timeline_at(timeline(None, &times), local_now(15)).unwrap();
+            assert!(!inferred);
+            assert!(events.iter().all(|event| {
+                event.consumed_at.with_timezone(&Local).date_naive()
+                    == NaiveDate::from_ymd_opt(2026, 8, 16).unwrap()
+            }));
+        }
+    }
+
+    #[test]
+    fn explicit_dates_override_rollover_and_future_dates_are_rejected() {
+        let (events, inferred) = resolve_timeline_at(
+            timeline(Some("2026-08-16"), &[Some("10:00"), Some("19:00")]),
+            local_now(1),
+        )
+        .unwrap();
+        assert!(!inferred);
+        assert_eq!(
+            events[0].consumed_at.with_timezone(&Local).date_naive(),
+            NaiveDate::from_ymd_opt(2026, 8, 16).unwrap()
+        );
+
+        let error =
+            resolve_timeline_at(timeline(Some("2026-08-17"), &[Some("10:00")]), local_now(1))
+                .unwrap_err();
+        assert!(error.to_string().contains("future dates"));
+    }
+
+    #[test]
+    fn untimed_events_inherit_and_equal_times_merge() {
+        let (events, _) = resolve_timeline_at(
+            timeline(None, &[Some("10:00"), None, Some("10:00")]),
+            local_now(12),
+        )
+        .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].parsed.items.len(), 3);
+        assert_eq!(
+            events[0]
+                .consumed_at
+                .with_timezone(&Local)
+                .format("%H:%M")
+                .to_string(),
+            "10:00"
+        );
+    }
+
+    #[test]
+    fn multiple_calendar_dates_are_rejected() {
+        let mut parsed = timeline(None, &[Some("10:00")]);
+        parsed.multiple_dates = true;
+        assert!(resolve_timeline_at(parsed, local_now(12))
+            .unwrap_err()
+            .to_string()
+            .contains("one calendar date"));
     }
 
     #[test]

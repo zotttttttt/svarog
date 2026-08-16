@@ -7,9 +7,8 @@ use crate::exercise_catalog::{self, ExerciseCatalogEntry};
 use crate::exercise_media::{self, PreparedGallery};
 use crate::fuel::{self, FuelParseOutcome};
 use crate::models::{
-    AppStateKind, ForgeActivitySummary, FuelEntry, FuelParseResult, NutritionTotals,
-    Recommendation, RecommenderTokenProvider, RecommenderTokenUsageByProvider, SetStatus,
-    WaterTotal,
+    AppStateKind, ForgeActivitySummary, FuelEntry, NutritionTotals, Recommendation,
+    RecommenderTokenProvider, RecommenderTokenUsageByProvider, SetStatus, WaterTotal,
 };
 use crate::secrets;
 use crate::storage::{ForgeHistoryEntry, Store};
@@ -1018,22 +1017,25 @@ fn handle_add_fuel_key(
             KeyCode::Home => state.scroll = 0,
             KeyCode::End => state.scroll = usize::MAX,
             KeyCode::Enter => {
-                let result = store.save_fuel_entry(
+                let result = store.save_fuel_batch(
                     state.input.trim(),
-                    &outcome.parsed,
+                    &outcome.events,
                     outcome.provider,
                     outcome.model,
-                    chrono::Utc::now(),
                 );
                 match result {
-                    Ok(_) => {
+                    Ok(ids) => {
+                        let meal_count = ids.len();
                         state.parsed = None;
                         state.input.clear();
                         state.cursor = 0;
                         state.recent = store.recent_fuel_entries(5).unwrap_or_default();
                         state.nutrition = store.nutrition_totals_today().unwrap_or_default();
                         state.selected_recent = 0;
-                        state.feedback = Some("✓ Meal or drink saved".into());
+                        state.feedback = Some(format!(
+                            "✓ {meal_count} {} saved",
+                            if meal_count == 1 { "meal" } else { "meals" }
+                        ));
                     }
                     Err(error) => state.feedback = Some(format!("Could not save fuel: {error}")),
                 }
@@ -1120,7 +1122,8 @@ fn handle_add_fuel_key(
             state.cursor = state.input.chars().count()
         }
         KeyCode::Char(ch)
-            if state.focus == AddFuelFocus::Meal && state.input.chars().count() < 500 =>
+            if state.focus == AddFuelFocus::Meal
+                && state.input.chars().count() < fuel::MAX_FUEL_INPUT_CHARS =>
         {
             insert_at_cursor(&mut state.input, &mut state.cursor, ch)
         }
@@ -1167,7 +1170,7 @@ fn add_fuel_lines(
 ) -> Vec<Line<'static>> {
     if let Some(outcome) = state.parsed.as_ref() {
         return fuel_review_lines(
-            &outcome.parsed,
+            outcome,
             demo,
             state.feedback.as_deref(),
             area_width,
@@ -1179,7 +1182,7 @@ fn add_fuel_lines(
     let mut lines = vec![
         with_demo(Line::from(Span::styled("Add fuel", accent_bold())), demo),
         Line::from(""),
-        Line::from(Span::styled("Meal or drink", text_bold())),
+        Line::from(Span::styled("Meals or drinks", text_bold())),
         Line::from(vec![
             Span::styled(
                 if state.focus == AddFuelFocus::Meal {
@@ -1192,9 +1195,9 @@ fn add_fuel_lines(
             Span::styled(
                 if state.input.is_empty() {
                     if state.focus == AddFuelFocus::Meal {
-                        "│ Describe what you ate or drank…".to_string()
+                        "│ Describe one meal or a whole day…".to_string()
                     } else {
-                        "Describe what you ate or drank…".to_string()
+                        "Describe one meal or a whole day…".to_string()
                     }
                 } else {
                     editor_window(
@@ -1251,15 +1254,20 @@ fn add_fuel_lines(
             muted(),
         )));
     } else {
+        let today = Local::now().date_naive();
         for (index, entry) in state.recent.iter().enumerate() {
             let selected = state.focus == AddFuelFocus::Recent && index == state.selected_recent;
+            let calories = format!(" · {:.0} kcal", entry.totals.calories);
             lines.push(Line::from(vec![
                 Span::styled(if selected { "› " } else { "  " }, accent_bold()),
                 Span::styled(
-                    clipped_text(&entry.raw_text, width.saturating_sub(18).max(4)),
+                    clipped_text(
+                        &recent_fuel_label(entry, today),
+                        width.saturating_sub(calories.chars().count() + 2).max(4),
+                    ),
                     if selected { accent() } else { text() },
                 ),
-                Span::styled(format!(" · {:.0} kcal", entry.totals.calories), muted()),
+                Span::styled(calories, muted()),
             ]));
         }
         lines.push(Line::from(Span::styled(
@@ -1305,8 +1313,32 @@ fn add_fuel_lines(
     fuel_viewport(lines, footer, usize::from(area_height), state.scroll)
 }
 
+fn recent_fuel_label(entry: &FuelEntry, today: chrono::NaiveDate) -> String {
+    let consumed_at = entry.created_at.with_timezone(&Local);
+    let date = history_date_label(consumed_at.date_naive(), today);
+    let mut items = entry
+        .parsed
+        .items
+        .iter()
+        .take(2)
+        .map(|item| match (item.quantity, item.unit.as_deref()) {
+            (Some(quantity), Some(unit)) => format!("{quantity} {unit} {}", item.name),
+            (Some(quantity), None) => format!("{quantity} {}", item.name),
+            _ => item.name.clone(),
+        })
+        .collect::<Vec<_>>();
+    if entry.parsed.items.len() > items.len() {
+        items.push(format!("+{} more", entry.parsed.items.len() - items.len()));
+    }
+    format!(
+        "{date} {} · {}",
+        consumed_at.format("%H:%M"),
+        items.join(", ")
+    )
+}
+
 fn fuel_review_lines(
-    parsed: &FuelParseResult,
+    outcome: &FuelParseOutcome,
     demo: bool,
     feedback: Option<&str>,
     area_width: u16,
@@ -1318,48 +1350,69 @@ fn fuel_review_lines(
         with_demo(Line::from(Span::styled("Review fuel", accent_bold())), demo),
         Line::from(""),
     ];
-    for item in &parsed.items {
-        let quantity = match (item.quantity, item.unit.as_deref()) {
-            (Some(quantity), Some(unit)) => format!(" · {quantity} {unit}"),
-            (Some(quantity), None) => format!(" · {quantity}"),
-            _ => String::new(),
-        };
+    if outcome.inferred_yesterday {
         lines.extend(wrapped_styled_lines(
-            &format!("{}{}", item.name, quantity),
-            width,
-            text_bold(),
-        ));
-        lines.extend(wrapped_styled_lines(
-            &format!(
-                "  {:.0} kcal · P {:.1}g · C {:.1}g · F {:.1}g · fiber {:.1}g · sugar {:.1}g",
-                item.nutrition.calories,
-                item.nutrition.protein_g,
-                item.nutrition.carbohydrates_g,
-                item.nutrition.fat_g,
-                item.nutrition.fiber_g,
-                item.nutrition.sugar_g,
-            ),
-            width,
-            text(),
-        ));
-        lines.extend(wrapped_styled_lines(
-            &format!(
-                "  sodium {:.0}mg · potassium {:.0}mg",
-                item.nutrition.sodium_mg, item.nutrition.potassium_mg
-            ),
+            "Date inferred as yesterday because every stated meal time is later than now.",
             width,
             muted(),
         ));
-        for assumption in &item.assumptions {
+        lines.push(Line::from(""));
+    }
+    let today = Local::now().date_naive();
+    for event in &outcome.events {
+        let consumed_at = event.consumed_at.with_timezone(&Local);
+        lines.push(Line::from(Span::styled(
+            format!(
+                "{} · {}",
+                history_date_label(consumed_at.date_naive(), today),
+                consumed_at.format("%H:%M")
+            ),
+            accent_bold(),
+        )));
+        lines.push(Line::from(""));
+        for item in &event.parsed.items {
+            let quantity = match (item.quantity, item.unit.as_deref()) {
+                (Some(quantity), Some(unit)) => format!(" · {quantity} {unit}"),
+                (Some(quantity), None) => format!(" · {quantity}"),
+                _ => String::new(),
+            };
             lines.extend(wrapped_styled_lines(
-                &format!("  Estimated: {assumption}"),
+                &format!("{}{}", item.name, quantity),
+                width,
+                text_bold(),
+            ));
+            lines.extend(wrapped_styled_lines(
+                &format!(
+                    "  {:.0} kcal · P {:.1}g · C {:.1}g · F {:.1}g · fiber {:.1}g · sugar {:.1}g",
+                    item.nutrition.calories,
+                    item.nutrition.protein_g,
+                    item.nutrition.carbohydrates_g,
+                    item.nutrition.fat_g,
+                    item.nutrition.fiber_g,
+                    item.nutrition.sugar_g,
+                ),
+                width,
+                text(),
+            ));
+            lines.extend(wrapped_styled_lines(
+                &format!(
+                    "  sodium {:.0}mg · potassium {:.0}mg",
+                    item.nutrition.sodium_mg, item.nutrition.potassium_mg
+                ),
                 width,
                 muted(),
             ));
+            for assumption in &item.assumptions {
+                lines.extend(wrapped_styled_lines(
+                    &format!("  Estimated: {assumption}"),
+                    width,
+                    muted(),
+                ));
+            }
+            lines.push(Line::from(""));
         }
-        lines.push(Line::from(""));
     }
-    let totals = parsed.totals();
+    let totals = outcome.totals();
     lines.extend(wrapped_styled_lines(
         &format!(
             "Total · {:.0} kcal · P {:.1}g · C {:.1}g · F {:.1}g",
@@ -1369,8 +1422,12 @@ fn fuel_review_lines(
         accent_bold(),
     ));
     lines.push(Line::from(""));
+    let meal_count = outcome.events.len();
     let controls = wrapped_styled_lines(
-        "[↑/↓/pgup/pgdn] Scroll  [enter] Save  [esc] Edit",
+        &format!(
+            "[↑/↓/pgup/pgdn] Scroll  [enter] Save {meal_count} {}  [esc] Edit",
+            if meal_count == 1 { "meal" } else { "meals" }
+        ),
         width,
         muted(),
     );
@@ -3173,8 +3230,8 @@ mod tests {
     use super::*;
     use crate::config::{Config, Recommender, RecommenderBackend};
     use crate::models::{
-        Agent, ForgeActivityTotals, FuelItem, NutritionTotals, RecommenderTokenUsage,
-        RecommenderTokenUsageSummary, TokenUsageTotals,
+        Agent, ForgeActivityTotals, FuelItem, FuelParseResult, NutritionTotals,
+        RecommenderTokenUsage, RecommenderTokenUsageSummary, TimedFuelEvent, TokenUsageTotals,
     };
     use crate::recommender::QueueGenerationSource;
     use chrono::{TimeZone, Utc};
@@ -5167,6 +5224,107 @@ mod tests {
     }
 
     #[test]
+    fn recent_fuel_uses_consumption_time_and_event_items() {
+        let parsed = FuelParseResult {
+            items: vec![
+                FuelItem {
+                    name: "eggs".into(),
+                    quantity: Some(400.0),
+                    unit: Some("g".into()),
+                    nutrition: NutritionTotals::default(),
+                    assumptions: Vec::new(),
+                },
+                FuelItem {
+                    name: "peas".into(),
+                    quantity: Some(200.0),
+                    unit: Some("g".into()),
+                    nutrition: NutritionTotals::default(),
+                    assumptions: Vec::new(),
+                },
+            ],
+        };
+        let consumed_at = (Local::now() - ChronoDuration::days(1)).with_timezone(&chrono::Utc);
+        let entry = FuelEntry {
+            id: 1,
+            raw_text: "the complete original whole-day description".into(),
+            totals: parsed.totals(),
+            parsed,
+            provider: "codex".into(),
+            model: fuel::FUEL_MODEL.into(),
+            created_at: consumed_at,
+        };
+
+        let label = recent_fuel_label(&entry, Local::now().date_naive());
+        assert!(label.starts_with("Yesterday "));
+        assert!(label.contains("400 g eggs, 200 g peas"));
+        assert!(!label.contains("complete original"));
+    }
+
+    #[test]
+    fn reviewed_timeline_saves_each_meal_and_refreshes_today() {
+        let root = tempdir().unwrap().keep();
+        let env = test_env(root.clone());
+        let store = Store::open(&root.join("svarog.sqlite3")).unwrap();
+        let parsed = FuelParseResult {
+            items: vec![FuelItem {
+                name: "meal".into(),
+                quantity: Some(1.0),
+                unit: Some("serving".into()),
+                nutrition: NutritionTotals {
+                    calories: 100.0,
+                    protein_g: 5.0,
+                    ..NutritionTotals::default()
+                },
+                assumptions: Vec::new(),
+            }],
+        };
+        let today = Local::now().date_naive();
+        let at = |hour| {
+            Local
+                .from_local_datetime(&today.and_hms_opt(hour, 0, 0).unwrap())
+                .earliest()
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        };
+        let mut state = add_fuel_state_for_test();
+        state.input = "breakfast at 10 and lunch at 14".into();
+        state.cursor = state.input.chars().count();
+        state.parsed = Some(FuelParseOutcome {
+            events: vec![
+                TimedFuelEvent {
+                    consumed_at: at(10),
+                    parsed: parsed.clone(),
+                },
+                TimedFuelEvent {
+                    consumed_at: at(14),
+                    parsed,
+                },
+            ],
+            inferred_yesterday: false,
+            provider: "codex",
+            model: fuel::FUEL_MODEL,
+        });
+        let mut ui = TuiState {
+            add_fuel: Some(state),
+            ..TuiState::default()
+        };
+
+        assert!(!handle_add_fuel_key(
+            &mut ui,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+            &env,
+            &store,
+        ));
+
+        let state = ui.add_fuel.unwrap();
+        assert!(state.input.is_empty());
+        assert_eq!(state.recent.len(), 2);
+        assert_eq!(state.nutrition.calories, 200.0);
+        assert_eq!(state.feedback.as_deref(), Some("✓ 2 meals saved"));
+    }
+
+    #[test]
     fn fuel_review_wraps_scrolls_and_keeps_save_controls_visible() {
         let parsed = FuelParseResult {
             items: (0..20)
@@ -5187,13 +5345,41 @@ mod tests {
                 .collect(),
         };
 
-        let first = fuel_review_lines(&parsed, false, None, 24, 8, 0);
-        let last = fuel_review_lines(&parsed, false, None, 24, 8, usize::MAX);
-        assert!(first.last().unwrap().to_string().contains("[enter] Save"));
-        assert!(last.last().unwrap().to_string().contains("[enter] Save"));
+        let outcome = FuelParseOutcome {
+            events: vec![TimedFuelEvent {
+                consumed_at: chrono::Utc::now(),
+                parsed,
+            }],
+            inferred_yesterday: false,
+            provider: "codex",
+            model: fuel::FUEL_MODEL,
+        };
+        let first = fuel_review_lines(&outcome, false, None, 24, 8, 0);
+        let last = fuel_review_lines(&outcome, false, None, 24, 8, usize::MAX);
+        assert!(first
+            .iter()
+            .map(Line::to_string)
+            .collect::<String>()
+            .contains("[enter] Save 1 meal"));
+        assert!(last
+            .iter()
+            .map(Line::to_string)
+            .collect::<String>()
+            .contains("[enter] Save 1 meal"));
         assert_ne!(first[0].to_string(), last[0].to_string());
         assert!(first.iter().all(|line| line.width() <= 24));
         assert!(last.iter().all(|line| line.width() <= 24));
+
+        let inferred = FuelParseOutcome {
+            inferred_yesterday: true,
+            ..outcome
+        };
+        let text = fuel_review_lines(&inferred, false, None, 80, 100, 0)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Date inferred as yesterday"));
     }
 
     #[test]
