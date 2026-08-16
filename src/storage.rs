@@ -56,6 +56,12 @@ pub struct WeightProgress {
     pub current_kg: f32,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct LoggedDayNutritionAverage {
+    pub totals: NutritionTotals,
+    pub logged_days: u32,
+}
+
 pub struct Store {
     conn: Connection,
 }
@@ -426,6 +432,12 @@ impl Store {
         self.nutrition_totals_today_at(Local::now())
     }
 
+    pub fn nutrition_average_recent_logged_days(
+        &self,
+    ) -> Result<Option<LoggedDayNutritionAverage>> {
+        self.nutrition_average_recent_logged_days_at(Local::now())
+    }
+
     pub fn weight_progress(&self) -> Result<Option<WeightProgress>> {
         let count: i64 =
             self.conn
@@ -493,6 +505,72 @@ impl Store {
             anyhow::bail!("stored nutrition totals are invalid");
         }
         Ok(totals)
+    }
+
+    fn nutrition_average_recent_logged_days_at(
+        &self,
+        now: DateTime<Local>,
+    ) -> Result<Option<LoggedDayNutritionAverage>> {
+        const MAX_LOGGED_DAYS: usize = 7;
+
+        let (_, end) = local_day_bounds_at(now)?;
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT calories, protein_g, carbohydrates_g, fat_g, fiber_g,
+                   sugar_g, sodium_mg, potassium_mg, created_at
+            FROM fuel_entries
+            WHERE created_at < ?1
+            ORDER BY created_at DESC, id DESC
+            "#,
+        )?;
+        let rows = statement.query_map([end.to_rfc3339()], |row| {
+            Ok((
+                NutritionTotals {
+                    calories: row.get(0)?,
+                    protein_g: row.get(1)?,
+                    carbohydrates_g: row.get(2)?,
+                    fat_g: row.get(3)?,
+                    fiber_g: row.get(4)?,
+                    sugar_g: row.get(5)?,
+                    sodium_mg: row.get(6)?,
+                    potassium_mg: row.get(7)?,
+                },
+                row.get::<_, String>(8)?,
+            ))
+        })?;
+
+        let mut dates = Vec::with_capacity(MAX_LOGGED_DAYS);
+        let mut totals = NutritionTotals::default();
+        for row in rows {
+            let (entry, created_at) = row?;
+            if entry
+                .values()
+                .iter()
+                .any(|value| !value.is_finite() || *value < 0.0)
+            {
+                anyhow::bail!("stored nutrition totals are invalid");
+            }
+            let date = DateTime::parse_from_rfc3339(&created_at)
+                .context("parsing stored fuel timestamp")?
+                .with_timezone(&Local)
+                .date_naive();
+            if !dates.contains(&date) {
+                if dates.len() == MAX_LOGGED_DAYS {
+                    break;
+                }
+                dates.push(date);
+            }
+            totals.add_assign(&entry);
+        }
+
+        if dates.is_empty() {
+            return Ok(None);
+        }
+        totals.scale_assign(1.0 / dates.len() as f64);
+        Ok(Some(LoggedDayNutritionAverage {
+            totals,
+            logged_days: dates.len() as u32,
+        }))
     }
 
     fn fuel_entries_between(
@@ -2082,6 +2160,27 @@ mod tests {
         }
     }
 
+    fn fuel_parse_with_calories(calories: f64) -> FuelParseResult {
+        FuelParseResult {
+            items: vec![crate::models::FuelItem {
+                name: "meal".into(),
+                quantity: Some(1.0),
+                unit: Some("serving".into()),
+                nutrition: NutritionTotals {
+                    calories,
+                    protein_g: calories / 10.0,
+                    carbohydrates_g: calories / 5.0,
+                    fat_g: calories / 20.0,
+                    fiber_g: calories / 100.0,
+                    sugar_g: calories / 25.0,
+                    sodium_mg: calories,
+                    potassium_mg: calories * 2.0,
+                },
+                assumptions: Vec::new(),
+            }],
+        }
+    }
+
     fn event() -> AgentEvent {
         AgentEvent {
             agent: Agent::Codex,
@@ -2955,6 +3054,84 @@ mod tests {
         assert_eq!(totals.sugar_g, 20.0);
         assert_eq!(totals.sodium_mg, 240.0);
         assert_eq!(totals.potassium_mg, 820.0);
+    }
+
+    #[test]
+    fn nutrition_average_uses_the_latest_seven_logged_local_days() {
+        let store = store();
+        let now = Local::now();
+        assert!(store
+            .nutrition_average_recent_logged_days_at(now)
+            .unwrap()
+            .is_none());
+
+        for day_offset in 0..8 {
+            let date = now.date_naive() - Duration::days(day_offset);
+            let noon = Local
+                .from_local_datetime(&date.and_hms_opt(12, 0, 0).unwrap())
+                .earliest()
+                .unwrap();
+            let base_time = if day_offset == 0 {
+                now - Duration::minutes(2)
+            } else {
+                noon
+            };
+            let daily_calories = (day_offset + 1) as f64 * 70.0;
+            let portions = if day_offset == 0 {
+                vec![20.0, daily_calories - 20.0]
+            } else {
+                vec![daily_calories]
+            };
+            for (index, calories) in portions.into_iter().enumerate() {
+                store
+                    .save_fuel_entry(
+                        "meal",
+                        &fuel_parse_with_calories(calories),
+                        "codex",
+                        "gpt-5.6-luna",
+                        (base_time + Duration::minutes(index as i64)).with_timezone(&Utc),
+                    )
+                    .unwrap();
+            }
+        }
+
+        let average = store
+            .nutrition_average_recent_logged_days_at(now)
+            .unwrap()
+            .unwrap();
+        assert_eq!(average.logged_days, 7);
+        assert_eq!(average.totals.calories, 280.0);
+        assert_eq!(average.totals.protein_g, 28.0);
+
+        let partial_root = tempdir().unwrap().keep();
+        let partial_store = Store::open(&partial_root.join("svarog.sqlite3")).unwrap();
+        for day_offset in 0..3 {
+            let date = now.date_naive() - Duration::days(day_offset);
+            let noon = Local
+                .from_local_datetime(&date.and_hms_opt(12, 0, 0).unwrap())
+                .earliest()
+                .unwrap();
+            let created_at = if day_offset == 0 {
+                now - Duration::minutes(1)
+            } else {
+                noon
+            };
+            partial_store
+                .save_fuel_entry(
+                    "meal",
+                    &fuel_parse_with_calories((day_offset + 1) as f64 * 100.0),
+                    "codex",
+                    "gpt-5.6-luna",
+                    created_at.with_timezone(&Utc),
+                )
+                .unwrap();
+        }
+        let partial_average = partial_store
+            .nutrition_average_recent_logged_days_at(now)
+            .unwrap()
+            .unwrap();
+        assert_eq!(partial_average.logged_days, 3);
+        assert_eq!(partial_average.totals.calories, 200.0);
     }
 
     #[test]

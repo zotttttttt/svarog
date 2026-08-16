@@ -220,7 +220,10 @@ Waiting for the next forge.
 
 Add fuel is also available during cooldown. It reviews Luna-estimated meals and
 drinks before saving, keeps plain-water tracking local, and displays today's
-water total in the profile's selected unit system.
+water total in the profile's selected unit system. The waiting dashboard shows
+today's nutrition plus a daily average over the most recent seven distinct local
+calendar dates with logged fuel; before seven dates exist, it averages and labels
+the available logged-day count.
 
 ---
 

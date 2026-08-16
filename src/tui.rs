@@ -11,7 +11,7 @@ use crate::models::{
     RecommenderTokenProvider, RecommenderTokenUsageByProvider, SetStatus, WaterTotal,
 };
 use crate::secrets;
-use crate::storage::{ForgeHistoryEntry, Store, WeightProgress};
+use crate::storage::{ForgeHistoryEntry, LoggedDayNutritionAverage, Store, WeightProgress};
 use anyhow::{Context, Result};
 use chrono::{Datelike, Duration as ChronoDuration, Local};
 use crossterm::event::{
@@ -348,6 +348,7 @@ struct ViewModel {
     backend: BackendView,
     activity: ForgeActivitySummary,
     nutrition: NutritionTotals,
+    nutrition_average: Option<LoggedDayNutritionAverage>,
     weight_progress: Option<WeightProgress>,
     unit_system: UnitSystem,
     token_usage: RecommenderTokenUsageByProvider,
@@ -732,6 +733,7 @@ fn load_view(store: &Store, paths: &Paths, saved_openai_key_available: Option<bo
     let recommendation = store.latest_open_recommendation().ok().flatten();
     let activity = store.completed_forge_summary().unwrap_or_default();
     let nutrition = store.nutrition_totals_today().unwrap_or_default();
+    let nutrition_average = store.nutrition_average_recent_logged_days().ok().flatten();
     let weight_progress = store.weight_progress().ok().flatten();
     let token_usage = RecommenderTokenUsageByProvider {
         codex: store
@@ -757,6 +759,7 @@ fn load_view(store: &Store, paths: &Paths, saved_openai_key_available: Option<bo
         backend,
         activity,
         nutrition,
+        nutrition_average,
         weight_progress,
         unit_system,
         token_usage,
@@ -1676,6 +1679,7 @@ fn view_lines(view: &ViewModel, ui: &TuiState) -> Vec<Line<'static>> {
                     &view.backend,
                     &view.activity,
                     &view.nutrition,
+                    view.nutrition_average.as_ref(),
                     &view.token_usage,
                     ui.status_message.as_deref(),
                     queue_regeneration_loader(ui),
@@ -1688,6 +1692,7 @@ fn view_lines(view: &ViewModel, ui: &TuiState) -> Vec<Line<'static>> {
             &view.backend,
             &view.activity,
             &view.nutrition,
+            view.nutrition_average.as_ref(),
             &view.token_usage,
             ui.status_message.as_deref(),
             queue_regeneration_loader(ui),
@@ -1699,6 +1704,7 @@ fn view_lines(view: &ViewModel, ui: &TuiState) -> Vec<Line<'static>> {
             &view.backend,
             &view.activity,
             &view.nutrition,
+            view.nutrition_average.as_ref(),
             &view.token_usage,
             ui.status_message.as_deref(),
             queue_regeneration_loader(ui),
@@ -2849,6 +2855,7 @@ fn idle_lines(
     backend: &BackendView,
     activity: &ForgeActivitySummary,
     nutrition: &NutritionTotals,
+    nutrition_average: Option<&LoggedDayNutritionAverage>,
     token_usage: &RecommenderTokenUsageByProvider,
     status_message: Option<&str>,
     queue_loader_frame: Option<usize>,
@@ -2880,7 +2887,7 @@ fn idle_lines(
         )));
     }
     lines.extend(activity_lines(activity));
-    lines.extend(nutrition_lines(nutrition));
+    lines.extend(nutrition_lines(nutrition, nutrition_average));
     lines.extend(recommender_usage_lines(backend, token_usage));
     if backend.unavailable {
         lines.push(Line::from(Span::styled(
@@ -2899,6 +2906,7 @@ fn cooldown_lines(
     backend: &BackendView,
     activity: &ForgeActivitySummary,
     nutrition: &NutritionTotals,
+    nutrition_average: Option<&LoggedDayNutritionAverage>,
     token_usage: &RecommenderTokenUsageByProvider,
     status_message: Option<&str>,
     queue_loader_frame: Option<usize>,
@@ -2927,7 +2935,7 @@ fn cooldown_lines(
     lines.push(recommender_line(backend));
     lines.push(settings_control_line());
     lines.extend(activity_lines(activity));
-    lines.extend(nutrition_lines(nutrition));
+    lines.extend(nutrition_lines(nutrition, nutrition_average));
     lines.extend(recommender_usage_lines(backend, token_usage));
     if backend.unavailable {
         lines.push(Line::from(Span::styled(
@@ -2968,12 +2976,28 @@ fn activity_lines(activity: &ForgeActivitySummary) -> Vec<Line<'static>> {
     ]
 }
 
-fn nutrition_lines(nutrition: &NutritionTotals) -> Vec<Line<'static>> {
-    vec![
+fn nutrition_lines(
+    nutrition: &NutritionTotals,
+    average: Option<&LoggedDayNutritionAverage>,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![
         Line::from(""),
         Line::from(Span::styled("Today’s nutrition:", muted())),
         nutrition_summary_line(nutrition),
-    ]
+    ];
+    if let Some(average) = average {
+        let day_label = if average.logged_days == 1 {
+            "logged day"
+        } else {
+            "logged days"
+        };
+        lines.push(Line::from(Span::styled(
+            format!("Daily average ({} {day_label}):", average.logged_days),
+            muted(),
+        )));
+        lines.push(nutrition_summary_line(&average.totals));
+    }
+    lines
 }
 
 fn insert_weight_progress_line(
@@ -2984,10 +3008,10 @@ fn insert_weight_progress_line(
     let Some(line) = weight_progress_line(progress, unit_system) else {
         return;
     };
-    if let Some(index) = lines
-        .iter()
-        .position(|existing| existing.to_string() == "Today’s nutrition:")
-    {
+    if let Some(index) = lines.iter().rposition(|existing| {
+        let text = existing.to_string();
+        text == "Today’s nutrition:" || text.starts_with("Daily average (")
+    }) {
         lines.insert(index + 2, line);
     }
 }
@@ -4289,6 +4313,7 @@ mod tests {
             &backend,
             &ForgeActivitySummary::default(),
             &NutritionTotals::default(),
+            None,
             &RecommenderTokenUsageByProvider::default(),
             None,
             None,
@@ -4358,13 +4383,42 @@ mod tests {
             sugar_g: 38.0,
             ..NutritionTotals::default()
         };
+        let nutrition_average = LoggedDayNutritionAverage {
+            totals: NutritionTotals {
+                calories: 1_720.0,
+                protein_g: 110.0,
+                carbohydrates_g: 180.0,
+                fat_g: 58.0,
+                sugar_g: 34.0,
+                ..NutritionTotals::default()
+            },
+            logged_days: 7,
+        };
 
         for lines in [
             idle_lines(
-                &backend, &activity, &nutrition, &usage, None, None, None, None, false,
+                &backend,
+                &activity,
+                &nutrition,
+                Some(&nutrition_average),
+                &usage,
+                None,
+                None,
+                None,
+                None,
+                false,
             ),
             cooldown_lines(
-                &backend, &activity, &nutrition, &usage, None, None, None, None, false,
+                &backend,
+                &activity,
+                &nutrition,
+                Some(&nutrition_average),
+                &usage,
+                None,
+                None,
+                None,
+                None,
+                false,
             ),
         ] {
             let text = lines
@@ -4379,6 +4433,8 @@ mod tests {
             assert!(text.contains("Week 12 forges / 180 reps"));
             assert!(text.contains("Today’s nutrition:"));
             assert!(text.contains("1840 kcal · P 122.0g · C 190.0g · F 61.0g · S 38.0g"));
+            assert!(text.contains("Daily average (7 logged days):"));
+            assert!(text.contains("1720 kcal · P 110.0g · C 180.0g · F 58.0g · S 34.0g"));
             assert!(text.contains("Svarog Codex tokens (in/out)"));
             assert!(text.contains("Today  12.4k / 320"));
             assert!(text.contains("Week   58.1k / 1.4k"));
@@ -4386,9 +4442,51 @@ mod tests {
             assert!(text.find("Completed:").unwrap() < text.find("Today’s nutrition:").unwrap());
             assert!(
                 text.find("Today’s nutrition:").unwrap()
+                    < text.find("Daily average (7 logged days):").unwrap()
+            );
+            assert!(
+                text.find("Daily average (7 logged days):").unwrap()
                     < text.find("Svarog Codex tokens (in/out)").unwrap()
             );
         }
+    }
+
+    #[test]
+    fn nutrition_average_uses_available_day_label_and_precedes_weight() {
+        let average = LoggedDayNutritionAverage {
+            totals: NutritionTotals {
+                calories: 900.0,
+                ..NutritionTotals::default()
+            },
+            logged_days: 1,
+        };
+        let mut lines = nutrition_lines(&NutritionTotals::default(), Some(&average));
+        insert_weight_progress_line(
+            &mut lines,
+            Some(WeightProgress {
+                starting_kg: 80.0,
+                current_kg: 77.0,
+            }),
+            UnitSystem::Metric,
+        );
+        let text = lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("Daily average (1 logged day):"));
+        assert!(
+            text.find("Today’s nutrition:").unwrap()
+                < text.find("Daily average (1 logged day):").unwrap()
+        );
+        assert!(
+            text.find("Daily average (1 logged day):").unwrap()
+                < text.find("Weight: 3.0 kg lost").unwrap()
+        );
+        assert!(!nutrition_lines(&NutritionTotals::default(), None)
+            .iter()
+            .any(|line| line.to_string().starts_with("Daily average (")));
     }
 
     #[test]
@@ -4405,6 +4503,7 @@ mod tests {
             &backend,
             &activity,
             &NutritionTotals::default(),
+            None,
             &usage,
             None,
             None,
@@ -4420,6 +4519,7 @@ mod tests {
             &backend,
             &activity,
             &NutritionTotals::default(),
+            None,
             &usage,
             None,
             None,
@@ -4447,6 +4547,7 @@ mod tests {
             &backend,
             &ForgeActivitySummary::default(),
             &NutritionTotals::default(),
+            None,
             &RecommenderTokenUsageByProvider::default(),
             None,
             None,
@@ -4488,6 +4589,7 @@ mod tests {
                 week: ForgeActivityTotals::default(),
             },
             nutrition: NutritionTotals::default(),
+            nutrition_average: None,
             weight_progress: None,
             unit_system: UnitSystem::Metric,
             token_usage: RecommenderTokenUsageByProvider {
@@ -4923,6 +5025,7 @@ mod tests {
                 &backend,
                 &activity,
                 &NutritionTotals::default(),
+                None,
                 &usage,
                 None,
                 None,
@@ -4934,6 +5037,7 @@ mod tests {
                 &backend,
                 &activity,
                 &NutritionTotals::default(),
+                None,
                 &usage,
                 None,
                 None,
@@ -5105,6 +5209,7 @@ mod tests {
             &backend,
             &ForgeActivitySummary::default(),
             &NutritionTotals::default(),
+            None,
             &RecommenderTokenUsageByProvider::default(),
             None,
             None,
@@ -5180,6 +5285,7 @@ mod tests {
             &backend,
             &ForgeActivitySummary::default(),
             &NutritionTotals::default(),
+            None,
             &RecommenderTokenUsageByProvider::default(),
             Some("Could not update recommender. Edit: /tmp/svarog/config.toml"),
             None,
@@ -5398,6 +5504,7 @@ mod tests {
             },
             activity: ForgeActivitySummary::default(),
             nutrition: NutritionTotals::default(),
+            nutrition_average: None,
             weight_progress: None,
             unit_system: UnitSystem::Metric,
             token_usage: RecommenderTokenUsageByProvider::default(),

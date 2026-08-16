@@ -215,6 +215,17 @@ impl NutritionTotals {
         self.potassium_mg += other.potassium_mg;
     }
 
+    pub fn scale_assign(&mut self, factor: f64) {
+        self.calories *= factor;
+        self.protein_g *= factor;
+        self.carbohydrates_g *= factor;
+        self.fat_g *= factor;
+        self.fiber_g *= factor;
+        self.sugar_g *= factor;
+        self.sodium_mg *= factor;
+        self.potassium_mg *= factor;
+    }
+
     pub fn values(&self) -> [f64; 8] {
         [
             self.calories,
