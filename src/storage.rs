@@ -50,6 +50,12 @@ pub struct ForgeHistoryEntry {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WeightProgress {
+    pub starting_kg: f32,
+    pub current_kg: f32,
+}
+
 pub struct Store {
     conn: Connection,
 }
@@ -218,6 +224,12 @@ impl Store {
 
             CREATE INDEX IF NOT EXISTS water_adjustments_local_date
                 ON water_adjustments(local_date, id);
+
+            CREATE TABLE IF NOT EXISTS weight_checkins (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                weight_kg REAL NOT NULL,
+                created_at TEXT NOT NULL
+            );
             "#,
         )?;
         let _ = self.conn.execute(
@@ -412,6 +424,36 @@ impl Store {
 
     pub fn nutrition_totals_today(&self) -> Result<NutritionTotals> {
         self.nutrition_totals_today_at(Local::now())
+    }
+
+    pub fn weight_progress(&self) -> Result<Option<WeightProgress>> {
+        let count: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM weight_checkins", [], |row| row.get(0))?;
+        if count < 2 {
+            return Ok(None);
+        }
+        let starting_kg: f32 = self.conn.query_row(
+            "SELECT weight_kg FROM weight_checkins ORDER BY id ASC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )?;
+        let current_kg: f32 = self.conn.query_row(
+            "SELECT weight_kg FROM weight_checkins ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )?;
+        if !starting_kg.is_finite()
+            || !current_kg.is_finite()
+            || starting_kg <= 0.0
+            || current_kg <= 0.0
+        {
+            anyhow::bail!("stored weight check-ins are invalid");
+        }
+        Ok(Some(WeightProgress {
+            starting_kg,
+            current_kg,
+        }))
     }
 
     pub fn nutrition_totals_today_at(&self, now: DateTime<Local>) -> Result<NutritionTotals> {
@@ -812,6 +854,7 @@ impl Store {
     pub fn apply_user_profile_and_movement_pool(
         &self,
         config: &Config,
+        previous_weight_kg: Option<f32>,
         movements: &[Movement],
     ) -> Result<()> {
         let transaction = self
@@ -829,8 +872,49 @@ impl Store {
                 Utc::now().to_rfc3339()
             ],
         )?;
+        Self::record_weight_checkin_in_transaction(
+            &transaction,
+            previous_weight_kg,
+            config.profile.weight_kg,
+        )?;
         Self::replace_movement_pool_in_transaction(&transaction, movements)?;
         transaction.commit().context("committing settings update")
+    }
+
+    fn record_weight_checkin_in_transaction(
+        transaction: &Transaction<'_>,
+        previous_weight_kg: Option<f32>,
+        current_weight_kg: Option<f32>,
+    ) -> Result<()> {
+        let valid = |weight: Option<f32>| weight.filter(|value| value.is_finite() && *value > 0.0);
+        let previous_weight_kg = valid(previous_weight_kg);
+        let current_weight_kg = valid(current_weight_kg);
+        let count: i64 =
+            transaction.query_row("SELECT COUNT(*) FROM weight_checkins", [], |row| row.get(0))?;
+        if count == 0 {
+            if let Some(weight) = previous_weight_kg {
+                transaction.execute(
+                    "INSERT INTO weight_checkins (weight_kg, created_at) VALUES (?1, ?2)",
+                    params![weight, Utc::now().to_rfc3339()],
+                )?;
+            }
+        }
+        let latest_weight_kg = transaction
+            .query_row(
+                "SELECT weight_kg FROM weight_checkins ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get::<_, f32>(0),
+            )
+            .optional()?;
+        if let Some(weight) = current_weight_kg.filter(|weight| {
+            latest_weight_kg.is_none_or(|latest| (latest - *weight).abs() > 0.000_1)
+        }) {
+            transaction.execute(
+                "INSERT INTO weight_checkins (weight_kg, created_at) VALUES (?1, ?2)",
+                params![weight, Utc::now().to_rfc3339()],
+            )?;
+        }
+        Ok(())
     }
 
     fn replace_movement_pool_in_transaction(
@@ -2378,7 +2462,7 @@ mod tests {
         let movements = crate::exercise_catalog::movements_for_equipment(&["bodyweight".into()]);
 
         store
-            .apply_user_profile_and_movement_pool(&config, &movements)
+            .apply_user_profile_and_movement_pool(&config, None, &movements)
             .unwrap();
 
         let profile_json: String = store
@@ -2785,6 +2869,34 @@ mod tests {
         assert_eq!(totals.sugar_g, 20.0);
         assert_eq!(totals.sodium_mg, 240.0);
         assert_eq!(totals.potassium_mg, 820.0);
+    }
+
+    #[test]
+    fn weight_checkins_preserve_the_first_weight_and_record_applied_changes() {
+        let store = store();
+        let movements = crate::exercise_catalog::movements_for_equipment(&["bodyweight".into()]);
+        let mut current = Config::default();
+        current.profile.weight_kg = Some(77.0);
+
+        store
+            .apply_user_profile_and_movement_pool(&current, Some(80.0), &movements)
+            .unwrap();
+        assert_eq!(
+            store.weight_progress().unwrap(),
+            Some(WeightProgress {
+                starting_kg: 80.0,
+                current_kg: 77.0,
+            })
+        );
+
+        store
+            .apply_user_profile_and_movement_pool(&current, Some(77.0), &movements)
+            .unwrap();
+        let count: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM weight_checkins", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
     }
 
     #[test]

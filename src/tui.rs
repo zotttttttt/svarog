@@ -11,7 +11,7 @@ use crate::models::{
     RecommenderTokenProvider, RecommenderTokenUsageByProvider, SetStatus, WaterTotal,
 };
 use crate::secrets;
-use crate::storage::{ForgeHistoryEntry, Store};
+use crate::storage::{ForgeHistoryEntry, Store, WeightProgress};
 use anyhow::{Context, Result};
 use chrono::{Datelike, Duration as ChronoDuration, Local};
 use crossterm::event::{
@@ -348,6 +348,8 @@ struct ViewModel {
     backend: BackendView,
     activity: ForgeActivitySummary,
     nutrition: NutritionTotals,
+    weight_progress: Option<WeightProgress>,
+    unit_system: UnitSystem,
     token_usage: RecommenderTokenUsageByProvider,
     history: Vec<ForgeHistoryEntry>,
     next_forges: Vec<Recommendation>,
@@ -718,10 +720,14 @@ fn view_refresh_due(last_refresh: Instant, now: Instant, force: bool) -> bool {
 
 fn load_view(store: &Store, paths: &Paths, saved_openai_key_available: Option<bool>) -> ViewModel {
     let backend = recommender_backend_view(paths, saved_openai_key_available);
+    let unit_system = config::load_or_default(paths)
+        .map(|config| config.profile.unit_system)
+        .unwrap_or(UnitSystem::Metric);
     let state = store.state().ok();
     let recommendation = store.latest_open_recommendation().ok().flatten();
     let activity = store.completed_forge_summary().unwrap_or_default();
     let nutrition = store.nutrition_totals_today().unwrap_or_default();
+    let weight_progress = store.weight_progress().ok().flatten();
     let token_usage = RecommenderTokenUsageByProvider {
         codex: store
             .recommender_token_usage_summary_for(RecommenderTokenProvider::Codex)
@@ -746,6 +752,8 @@ fn load_view(store: &Store, paths: &Paths, saved_openai_key_available: Option<bo
         backend,
         activity,
         nutrition,
+        weight_progress,
+        unit_system,
         token_usage,
         history,
         next_forges,
@@ -1321,7 +1329,7 @@ fn add_fuel_lines(
                 },
                 accent_bold(),
             ),
-            Span::styled(format_water_total(state.water, state.unit_system), accent()),
+            Span::styled(format_water_total(state.water, state.unit_system), text()),
             Span::styled(
                 match state.unit_system {
                     UnitSystem::Metric => "  [+/-] 200 ml",
@@ -1653,7 +1661,7 @@ fn view_lines(view: &ViewModel, ui: &TuiState) -> Vec<Line<'static>> {
             })
             .unwrap_or_default();
     }
-    match view.kind {
+    let mut lines = match view.kind {
         ViewKind::Forge => view
             .recommendation
             .as_ref()
@@ -1693,7 +1701,11 @@ fn view_lines(view: &ViewModel, ui: &TuiState) -> Vec<Line<'static>> {
             ui.forge_now_feedback.as_deref(),
             ui.demo,
         ),
+    };
+    if view.kind != ViewKind::Forge || view.recommendation.is_none() {
+        insert_weight_progress_line(&mut lines, view.weight_progress, view.unit_system);
     }
+    lines
 }
 
 fn archetype_lines(
@@ -2418,8 +2430,9 @@ fn apply_settings(env: &RuntimeEnv, draft: &Config) -> Result<Receiver<QueueRege
     config::save(&env.paths, draft)?;
     let equipment = exercise_catalog::locally_resolved_equipment(&draft.profile.equipment_text);
     let movements = exercise_catalog::movements_for_equipment(&equipment);
-    let database_result = Store::open(&env.paths.database_file)
-        .and_then(|store| store.apply_user_profile_and_movement_pool(draft, &movements));
+    let database_result = Store::open(&env.paths.database_file).and_then(|store| {
+        store.apply_user_profile_and_movement_pool(draft, previous.profile.weight_kg, &movements)
+    });
     if let Err(error) = database_result {
         let rollback = if config_existed {
             config::save(&env.paths, &previous)
@@ -2937,6 +2950,52 @@ fn nutrition_lines(nutrition: &NutritionTotals) -> Vec<Line<'static>> {
         Line::from(Span::styled("Today’s nutrition:", muted())),
         nutrition_summary_line(nutrition),
     ]
+}
+
+fn insert_weight_progress_line(
+    lines: &mut Vec<Line<'static>>,
+    progress: Option<WeightProgress>,
+    unit_system: UnitSystem,
+) {
+    let Some(line) = weight_progress_line(progress, unit_system) else {
+        return;
+    };
+    if let Some(index) = lines
+        .iter()
+        .position(|existing| existing.to_string() == "Today’s nutrition:")
+    {
+        lines.insert(index + 2, line);
+    }
+}
+
+fn weight_progress_line(
+    progress: Option<WeightProgress>,
+    unit_system: UnitSystem,
+) -> Option<Line<'static>> {
+    let progress = progress?;
+    let factor = if unit_system == UnitSystem::Metric {
+        1.0
+    } else {
+        2.204_622_6
+    };
+    let delta = (progress.current_kg - progress.starting_kg) * factor;
+    if delta.abs() < 0.05 * factor {
+        return None;
+    }
+    let (change, direction) = if delta < 0.0 {
+        (-delta, "lost")
+    } else {
+        (delta, "gained")
+    };
+    let unit = if unit_system == UnitSystem::Metric {
+        "kg"
+    } else {
+        "lb"
+    };
+    Some(Line::from(vec![
+        Span::styled("Weight: ", muted()),
+        Span::styled(format!("{change:.1} {unit} {direction}"), text()),
+    ]))
 }
 
 fn nutrition_summary_line(nutrition: &NutritionTotals) -> Line<'static> {
@@ -4375,6 +4434,8 @@ mod tests {
                 week: ForgeActivityTotals::default(),
             },
             nutrition: NutritionTotals::default(),
+            weight_progress: None,
+            unit_system: UnitSystem::Metric,
             token_usage: RecommenderTokenUsageByProvider {
                 codex: RecommenderTokenUsageSummary {
                     today: TokenUsageTotals {
@@ -5281,6 +5342,8 @@ mod tests {
             },
             activity: ForgeActivitySummary::default(),
             nutrition: NutritionTotals::default(),
+            weight_progress: None,
+            unit_system: UnitSystem::Metric,
             token_usage: RecommenderTokenUsageByProvider::default(),
             history: Vec::new(),
             next_forges: Vec::new(),
@@ -5449,6 +5512,42 @@ mod tests {
             format_water_total(state.water, UnitSystem::Imperial),
             "6.8 US fl oz"
         );
+    }
+
+    #[test]
+    fn add_fuel_water_total_uses_standard_text_color() {
+        let state = add_fuel_state_for_test();
+        let lines = add_fuel_lines(&state, false, 120, 40);
+        let water_line = lines
+            .iter()
+            .find(|line| line.to_string().contains("0 ml  [+/-] 200 ml"))
+            .unwrap();
+        assert_eq!(water_line.spans[1].style.fg, Some(colors::TEXT));
+    }
+
+    #[test]
+    fn weight_progress_renders_lost_and_gained_in_selected_units() {
+        let lost = weight_progress_line(
+            Some(WeightProgress {
+                starting_kg: 80.0,
+                current_kg: 77.0,
+            }),
+            UnitSystem::Metric,
+        )
+        .unwrap();
+        assert_eq!(lost.to_string(), "Weight: 3.0 kg lost");
+
+        let gained = weight_progress_line(
+            Some(WeightProgress {
+                starting_kg: 70.0,
+                current_kg: 71.0,
+            }),
+            UnitSystem::Imperial,
+        )
+        .unwrap();
+        assert_eq!(gained.to_string(), "Weight: 2.2 lb gained");
+
+        assert!(weight_progress_line(None, UnitSystem::Metric).is_none());
     }
 
     #[test]

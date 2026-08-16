@@ -27,6 +27,10 @@ saved immediately in the operating system credential store, not `config.toml`.
 Replacing or removing a key is also immediate and independent of applying the
 selected recommender.
 
+Applied weight changes are retained as local check-ins. Once you have changed a
+saved weight, the dashboard shows total weight lost or gained since the first
+recorded check-in in your selected unit system.
+
 After `svarog setup` completes, press Enter at the final prompt to open the
 dashboard immediately. `svarog setup --dry-run` prints its preview and exits.
 
