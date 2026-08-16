@@ -852,7 +852,7 @@ fn open_add_fuel(env: &RuntimeEnv, store: &Store) -> Result<AddFuelState> {
         parsing_started_at: None,
         next_parse_id: 1,
         scroll: 0,
-        recent: store.recent_fuel_entries_today(5)?,
+        recent: store.recent_fuel_entries(5)?,
         nutrition: store.nutrition_totals_today()?,
         selected_recent: 0,
         confirming_delete: false,
@@ -929,7 +929,7 @@ fn refresh_add_fuel_day_at(ui: &mut TuiState, store: &Store, today: chrono::Naiv
     }
     state.local_date = today;
     state.water = store.water_total_today().unwrap_or_default();
-    state.recent = store.recent_fuel_entries_today(5).unwrap_or_default();
+    state.recent = store.recent_fuel_entries(5).unwrap_or_default();
     state.nutrition = store.nutrition_totals_today().unwrap_or_default();
     state.selected_recent = 0;
     state.feedback = Some("Started a new local day.".into());
@@ -1030,7 +1030,7 @@ fn handle_add_fuel_key(
                         state.parsed = None;
                         state.input.clear();
                         state.cursor = 0;
-                        state.recent = store.recent_fuel_entries_today(5).unwrap_or_default();
+                        state.recent = store.recent_fuel_entries(5).unwrap_or_default();
                         state.nutrition = store.nutrition_totals_today().unwrap_or_default();
                         state.selected_recent = 0;
                         state.feedback = Some("✓ Meal or drink saved".into());
@@ -1049,7 +1049,7 @@ fn handle_add_fuel_key(
                 if let Some(entry) = state.recent.get(state.selected_recent) {
                     match store.delete_fuel_entry(entry.id) {
                         Ok(true) => {
-                            state.recent = store.recent_fuel_entries_today(5).unwrap_or_default();
+                            state.recent = store.recent_fuel_entries(5).unwrap_or_default();
                             state.nutrition = store.nutrition_totals_today().unwrap_or_default();
                             state.selected_recent = state
                                 .selected_recent
@@ -1243,7 +1243,7 @@ fn add_fuel_lines(
         Line::from(Span::styled("Today’s nutrition", text_bold())),
         nutrition_summary_line(&state.nutrition),
         Line::from(""),
-        Line::from(Span::styled("Today’s fuel", text_bold())),
+        Line::from(Span::styled("Recent fuel", text_bold())),
     ];
     if state.recent.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -5122,7 +5122,8 @@ mod tests {
         assert!(
             rendered.contains("Today’s nutrition\n120 kcal · P 3.0g · C 14.0g · F 5.0g · S 8.0g")
         );
-        assert!(rendered.contains("Today’s fuel"));
+        assert!(rendered.contains("Recent fuel"));
+        assert!(!rendered.contains("Today’s fuel"));
         assert!(!rendered.contains("Parse with Luna"));
         assert!(!rendered.contains("Today’s recent fuel"));
         assert!(rendered.contains("No meals or drinks logged yet."));

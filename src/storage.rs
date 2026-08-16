@@ -378,22 +378,8 @@ impl Store {
         Ok(self.conn.last_insert_rowid())
     }
 
-    #[cfg(test)]
     pub fn recent_fuel_entries(&self, limit: u32) -> Result<Vec<FuelEntry>> {
         self.fuel_entries_between(None, None, limit)
-    }
-
-    pub fn recent_fuel_entries_today(&self, limit: u32) -> Result<Vec<FuelEntry>> {
-        self.recent_fuel_entries_today_at(limit, Local::now())
-    }
-
-    pub fn recent_fuel_entries_today_at(
-        &self,
-        limit: u32,
-        now: DateTime<Local>,
-    ) -> Result<Vec<FuelEntry>> {
-        let (start, end) = local_day_bounds_at(now)?;
-        self.fuel_entries_between(Some(start), Some(end), limit)
     }
 
     pub fn nutrition_totals_today(&self) -> Result<NutritionTotals> {
@@ -2626,13 +2612,53 @@ mod tests {
             )
             .unwrap();
 
-        let recent = store.recent_fuel_entries_today(5).unwrap();
+        let recent = store.recent_fuel_entries(5).unwrap();
         assert_eq!(recent.len(), 1);
         assert_eq!(recent[0].id, id);
         assert_eq!(recent[0].parsed, parsed);
         assert_eq!(recent[0].totals.calories, 320.0);
         assert!(store.delete_fuel_entry(id).unwrap());
         assert!(store.recent_fuel_entries(5).unwrap().is_empty());
+    }
+
+    #[test]
+    fn recent_fuel_entries_return_the_latest_five_across_days() {
+        let store = store();
+        let now = Utc::now();
+        let parsed = FuelParseResult {
+            items: vec![crate::models::FuelItem {
+                name: "meal".into(),
+                quantity: Some(1.0),
+                unit: Some("serving".into()),
+                nutrition: NutritionTotals {
+                    calories: 100.0,
+                    protein_g: 5.0,
+                    ..NutritionTotals::default()
+                },
+                assumptions: Vec::new(),
+            }],
+        };
+        for index in (0..7).rev() {
+            store
+                .save_fuel_entry(
+                    &format!("meal {index}"),
+                    &parsed,
+                    "codex",
+                    "gpt-5.6-luna",
+                    now - Duration::days(index),
+                )
+                .unwrap();
+        }
+
+        let recent = store.recent_fuel_entries(5).unwrap();
+        assert_eq!(recent.len(), 5);
+        assert_eq!(
+            recent
+                .iter()
+                .map(|entry| entry.raw_text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["meal 0", "meal 1", "meal 2", "meal 3", "meal 4"]
+        );
     }
 
     #[test]
