@@ -1015,7 +1015,7 @@ fn focus_scroll_hint(state: &AddFuelState, area_width: u16) -> usize {
 fn handle_add_fuel_key(
     ui: &mut TuiState,
     code: KeyCode,
-    modifiers: KeyModifiers,
+    _modifiers: KeyModifiers,
     env: &RuntimeEnv,
     store: &Store,
     area_width: u16,
@@ -1127,16 +1127,7 @@ fn handle_add_fuel_key(
             state.focus = AddFuelFocus::Recent;
             state.scroll = focus_scroll_hint(state, area_width);
         }
-        KeyCode::Enter
-            if state.focus == AddFuelFocus::Meal
-                && modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
-        {
-            start_fuel_parse(state, env)
-        }
-        KeyCode::Enter if state.focus == AddFuelFocus::Meal => {
-            insert_fuel_text(state, "\n");
-            keep_meal_cursor_visible(state, area_width, area_height);
-        }
+        KeyCode::Enter if state.focus == AddFuelFocus::Meal => start_fuel_parse(state, env),
         KeyCode::Backspace if state.focus == AddFuelFocus::Meal => {
             backspace_at_cursor(&mut state.input, &mut state.cursor);
             keep_meal_cursor_visible(state, area_width, area_height);
@@ -1312,7 +1303,7 @@ fn add_fuel_lines(
                 )
             } else {
                 format!(
-                    "[ctrl/cmd+enter] Log that fuel · {}/{}",
+                    "[enter] Log that fuel · {}/{}",
                     state.input.chars().count(),
                     fuel::MAX_FUEL_INPUT_CHARS
                 )
@@ -5436,7 +5427,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(rendered.contains("coffee with milk"));
-        assert!(rendered.contains("[ctrl/cmd+enter] Log that fuel · 16/2000"));
+        assert!(rendered.contains("[enter] Log that fuel · 16/2000"));
         assert!(rendered.contains("200 ml  [+/-] 200 ml"));
         assert!(
             rendered.contains("Today’s nutrition\n120 kcal · P 3.0g · C 14.0g · F 5.0g · S 8.0g")
@@ -5489,7 +5480,7 @@ mod tests {
 
     #[test]
     fn add_fuel_accepts_and_renders_a_multiline_whole_day_paste() {
-        let pasted = "August 16th:\r\n11 am - single espresso with 80 ml of 3.2% milk\r\n1 pm - 200 g of mashed potatoes, 50 g of peas\r\n9 pm - 5 hard boiled eggs";
+        let pasted = "August 16th:\r\n11 am - single espresso with 80 ml of 3.2% milk\r\n1 pm - single espresso with 80 ml of 3.2% milk\r\n1 pm - 200 g of mashed potatoes, 100 g of mashed potatoes, 50 g of peas, 20 g of butter\r\n4 pm - single espresso with 80 ml of 3.2% milk\r\n5 pm - 200 g of mashed potatoes, 100 g of mashed potatoes, 50 g of peas, 20 g of butter\r\n9 pm - single espresso with 80 ml of 3.2% milk\r\n9 pm - 5 hard boiled eggs";
         let mut ui = TuiState {
             add_fuel: Some(add_fuel_state_for_test()),
             ..TuiState::default()
@@ -5498,7 +5489,7 @@ mod tests {
         handle_add_fuel_paste(&mut ui, pasted, 100, 40);
 
         let state = ui.add_fuel.as_ref().unwrap();
-        assert_eq!(state.input.matches('\n').count(), 3);
+        assert_eq!(state.input.matches('\n').count(), 7);
         assert!(!state.input.contains('\r'));
         let rendered = meal_editor_lines(state, 100)
             .into_iter()
@@ -5507,11 +5498,13 @@ mod tests {
             .join("\n");
         assert!(rendered.contains("August 16th:"));
         assert!(rendered.contains("11 am - single espresso"));
+        assert!(rendered.contains("1 pm - 200 g of mashed potatoes"));
+        assert!(rendered.contains("5 pm - 200 g of mashed potatoes"));
         assert!(rendered.contains("9 pm - 5 hard boiled eggs"));
     }
 
     #[test]
-    fn add_fuel_enter_inserts_newline_and_modified_enter_submits() {
+    fn add_fuel_enter_submits_with_or_without_modifiers() {
         let root = tempdir().unwrap().keep();
         let env = test_env(root.clone());
         let store = Store::open(&root.join("svarog.sqlite3")).unwrap();
@@ -5524,18 +5517,11 @@ mod tests {
             ..TuiState::default()
         };
 
-        assert!(!handle_add_fuel_key(
-            &mut ui,
-            KeyCode::Enter,
+        for modifier in [
             KeyModifiers::NONE,
-            &env,
-            &store,
-            80,
-            24,
-        ));
-        assert_eq!(ui.add_fuel.as_ref().unwrap().input, "meal\n");
-
-        for modifier in [KeyModifiers::CONTROL, KeyModifiers::SUPER] {
+            KeyModifiers::CONTROL,
+            KeyModifiers::SUPER,
+        ] {
             assert!(!handle_add_fuel_key(
                 &mut ui,
                 KeyCode::Enter,
@@ -5553,6 +5539,7 @@ mod tests {
                 .as_deref()
                 .unwrap()
                 .contains("needs Codex or an OpenAI backend"));
+            assert_eq!(ui.add_fuel.as_ref().unwrap().input, "meal");
         }
     }
 
