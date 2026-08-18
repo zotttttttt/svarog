@@ -1405,13 +1405,17 @@ fn add_fuel_lines(
             muted(),
         )));
     }
-    if let Some(feedback) = state.feedback.as_deref() {
-        lines.push(Line::from(Span::styled(feedback.to_string(), muted())));
-    }
+    let feedback_lines = state
+        .feedback
+        .as_deref()
+        .map(|feedback| wrapped_styled_lines(feedback, width, muted()))
+        .unwrap_or_default();
+    let feedback_len = feedback_lines.len();
+    lines.extend(feedback_lines);
     let footer_len = if state.parsing.is_some() || state.confirming_delete {
-        2 + usize::from(state.feedback.is_some())
+        2 + feedback_len
     } else {
-        1 + usize::from(state.feedback.is_some())
+        1 + feedback_len
     };
     let footer = lines.split_off(lines.len().saturating_sub(footer_len));
     fuel_viewport(lines, footer, usize::from(area_height), state.scroll)
@@ -1537,10 +1541,12 @@ fn fuel_review_lines(
     );
     let controls_len = controls.len();
     lines.extend(controls);
-    if let Some(feedback) = feedback {
-        lines.push(Line::from(Span::styled(feedback.to_string(), accent())));
-    }
-    let footer_len = controls_len + usize::from(feedback.is_some());
+    let feedback_lines = feedback
+        .map(|feedback| wrapped_styled_lines(feedback, width, accent()))
+        .unwrap_or_default();
+    let feedback_len = feedback_lines.len();
+    lines.extend(feedback_lines);
+    let footer_len = controls_len + feedback_len;
     let footer = lines.split_off(lines.len().saturating_sub(footer_len));
     fuel_viewport(lines, footer, usize::from(area_height), scroll)
 }
@@ -5674,6 +5680,24 @@ mod tests {
     }
 
     #[test]
+    fn add_fuel_wraps_and_preserves_complete_error_feedback() {
+        let mut state = add_fuel_state_for_test();
+        let feedback = "Could not parse fuel: parsing meal or drink with OpenAI: OpenAI Responses API returned 429 Too Many Requests: You exceeded your current quota; check your plan and billing details.";
+        state.feedback = Some(feedback.into());
+
+        let lines = add_fuel_lines(&state, false, 40, 40);
+        assert!(lines
+            .iter()
+            .any(|line| { line.to_string() == feedback.chars().take(40).collect::<String>() }));
+        let rendered_without_line_breaks = lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(rendered_without_line_breaks.contains(feedback));
+    }
+
+    #[test]
     fn add_fuel_water_total_uses_standard_text_color() {
         let state = add_fuel_state_for_test();
         let lines = add_fuel_lines(&state, false, 120, 40);
@@ -5943,13 +5967,13 @@ mod tests {
     }
 
     #[test]
-    fn reviewed_timeline_saves_each_meal_and_refreshes_today() {
+    fn reviewed_timeline_saves_equal_time_repeated_foods_and_refreshes_today() {
         let root = tempdir().unwrap().keep();
         let env = test_env(root.clone());
         let store = Store::open(&root.join("svarog.sqlite3")).unwrap();
         let parsed = FuelParseResult {
             items: vec![FuelItem {
-                name: "meal".into(),
+                name: "milk".into(),
                 quantity: Some(1.0),
                 unit: Some("serving".into()),
                 nutrition: NutritionTotals {
@@ -5969,18 +5993,18 @@ mod tests {
                 .with_timezone(&chrono::Utc)
         };
         let mut state = add_fuel_state_for_test();
-        state.input = "breakfast at 10 and lunch at 14".into();
+        state.input = "milk in coffee at 10 and milk in a shake at 10".into();
         state.cursor = state.input.chars().count();
         state.parsed = Some(FuelParseOutcome {
             events: vec![
                 TimedFuelEvent {
                     consumed_at: at(10),
-                    source_text: "breakfast".into(),
+                    source_text: "milk in coffee".into(),
                     parsed: parsed.clone(),
                 },
                 TimedFuelEvent {
-                    consumed_at: at(14),
-                    source_text: "lunch".into(),
+                    consumed_at: at(10),
+                    source_text: "milk in a shake".into(),
                     parsed,
                 },
             ],
@@ -5992,6 +6016,20 @@ mod tests {
             add_fuel: Some(state),
             ..TuiState::default()
         };
+
+        let review = fuel_review_lines(
+            ui.add_fuel.as_ref().unwrap().parsed.as_ref().unwrap(),
+            false,
+            None,
+            120,
+            40,
+            0,
+        )
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        assert_eq!(review.matches("Today · 10:00").count(), 2);
 
         assert!(!handle_add_fuel_key(
             &mut ui,

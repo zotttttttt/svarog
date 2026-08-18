@@ -3008,6 +3008,48 @@ mod tests {
     }
 
     #[test]
+    fn fuel_batch_preserves_and_sums_equal_time_repeated_foods() {
+        let store = store();
+        let consumed_at = Utc::now();
+        let parsed = FuelParseResult {
+            items: vec![crate::models::FuelItem {
+                name: "milk".into(),
+                quantity: Some(100.0),
+                unit: Some("ml".into()),
+                nutrition: NutritionTotals {
+                    calories: 60.0,
+                    protein_g: 3.0,
+                    ..NutritionTotals::default()
+                },
+                assumptions: Vec::new(),
+            }],
+        };
+        let events = vec![
+            TimedFuelEvent {
+                consumed_at,
+                source_text: "milk in coffee".into(),
+                parsed: parsed.clone(),
+            },
+            TimedFuelEvent {
+                consumed_at,
+                source_text: "milk in protein shake".into(),
+                parsed,
+            },
+        ];
+
+        store
+            .save_fuel_batch(&events, "openai", "gpt-5.6-luna")
+            .unwrap();
+
+        let recent = store.recent_fuel_entries(5).unwrap();
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0].created_at, recent[1].created_at);
+        let totals = store.nutrition_totals_today().unwrap();
+        assert_eq!(totals.calories, 120.0);
+        assert_eq!(totals.protein_g, 6.0);
+    }
+
+    #[test]
     fn nutrition_totals_sum_only_the_current_local_day() {
         let store = store();
         let now = Local::now();

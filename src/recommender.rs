@@ -1083,16 +1083,18 @@ where
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_millis(config.recommender.timeout_ms))
         .build()?;
-    let response: serde_json::Value = client
+    let response = client
         .post("https://api.openai.com/v1/responses")
         .bearer_auth(api_key.as_str())
         .json(&body)
         .send()
-        .context("calling OpenAI Responses API")?
-        .error_for_status()
-        .context("OpenAI Responses API returned an error")?
-        .json()
-        .context("parsing OpenAI response JSON")?;
+        .context("calling OpenAI Responses API")?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().unwrap_or_default();
+        bail!(openai_api_error_message(status, &body));
+    }
+    let response: serde_json::Value = response.json().context("parsing OpenAI response JSON")?;
     if let Some(usage) = parse_openai_usage(&response)? {
         let _ = store.record_recommender_token_usage(
             RecommenderTokenProvider::OpenAi,
@@ -1141,15 +1143,19 @@ where
     let response: serde_json::Value = runtime.block_on(async {
         let client = reqwest::Client::builder().timeout(timeout).build()?;
         let request = async {
-            client
+            let response = client
                 .post("https://api.openai.com/v1/responses")
                 .bearer_auth(api_key.as_str())
                 .json(&body)
                 .send()
                 .await
-                .context("calling OpenAI Responses API")?
-                .error_for_status()
-                .context("OpenAI Responses API returned an error")?
+                .context("calling OpenAI Responses API")?;
+            let status = response.status();
+            if !status.is_success() {
+                let body = response.text().await.unwrap_or_default();
+                bail!(openai_api_error_message(status, &body));
+            }
+            response
                 .json()
                 .await
                 .context("parsing OpenAI response JSON")
@@ -1183,6 +1189,32 @@ where
 async fn wait_for_cancellation(cancel: Arc<AtomicBool>) {
     while !cancel.load(Ordering::Acquire) {
         tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+fn openai_api_error_message(status: reqwest::StatusCode, body: &str) -> String {
+    let error = serde_json::from_str::<serde_json::Value>(body).ok();
+    let detail = error
+        .as_ref()
+        .and_then(|value| value.pointer("/error/message"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_default();
+    let detail = detail.split_whitespace().collect::<Vec<_>>().join(" ");
+    let code = error
+        .as_ref()
+        .and_then(|value| value.pointer("/error/code"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|code| !code.is_empty());
+    let status = match code {
+        Some(code) => format!("{status} ({code})"),
+        None => status.to_string(),
+    };
+    if detail.is_empty() {
+        format!("OpenAI Responses API returned {status}")
+    } else {
+        format!("OpenAI Responses API returned {status}: {detail}")
     }
 }
 
@@ -1775,6 +1807,31 @@ mod tests {
         );
         assert_eq!(parse_openai_usage(&json!({})).unwrap(), None);
         assert_eq!(parse_openai_usage(&json!({ "usage": null })).unwrap(), None);
+    }
+
+    #[test]
+    fn openai_api_errors_include_the_complete_sanitized_message() {
+        let detail = format!("unsupported\n schema {}", "x".repeat(600));
+        let message = openai_api_error_message(
+            reqwest::StatusCode::BAD_REQUEST,
+            &json!({
+                "error": {
+                    "message": detail,
+                    "code": "credit_balance_exhausted"
+                }
+            })
+            .to_string(),
+        );
+
+        assert!(message.starts_with(
+            "OpenAI Responses API returned 400 Bad Request (credit_balance_exhausted): unsupported schema"
+        ));
+        assert!(!message.contains('\n'));
+        assert!(message.ends_with(&"x".repeat(600)));
+        assert_eq!(
+            openai_api_error_message(reqwest::StatusCode::BAD_GATEWAY, "not json"),
+            "OpenAI Responses API returned 502 Bad Gateway"
+        );
     }
 
     #[test]
