@@ -378,9 +378,9 @@ fn fuel_schema() -> serde_json::Value {
             "sodium_mg", "potassium_mg", "assumptions"
         ],
         "properties": {
-            "name": { "type": "string", "minLength": 1, "maxLength": 120 },
+            "name": { "type": "string" },
             "quantity": { "type": ["number", "null"], "minimum": 0 },
-            "unit": { "type": ["string", "null"], "maxLength": 40 },
+            "unit": { "type": ["string", "null"] },
             "calories": { "type": "number", "minimum": 0, "maximum": 20000 },
             "protein_g": { "type": "number", "minimum": 0, "maximum": 5000 },
             "carbohydrates_g": { "type": "number", "minimum": 0, "maximum": 5000 },
@@ -392,7 +392,7 @@ fn fuel_schema() -> serde_json::Value {
             "assumptions": {
                 "type": "array",
                 "maxItems": 8,
-                "items": { "type": "string", "maxLength": 200 }
+                "items": { "type": "string" }
             }
         }
     });
@@ -420,11 +420,7 @@ fn fuel_schema() -> serde_json::Value {
                             "pattern": "^([01][0-9]|2[0-3]):[0-5][0-9]$"
                         },
                         "inherit_previous_time": { "type": "boolean" },
-                        "source_text": {
-                            "type": "string",
-                            "minLength": 1,
-                            "maxLength": MAX_EVENT_SOURCE_CHARS
-                        },
+                        "source_text": { "type": "string" },
                         "items": {
                             "type": "array",
                             "minItems": 1,
@@ -465,7 +461,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_is_strict_and_bounded() {
+    fn schema_is_strict_bounded_and_openai_compatible() {
         let schema = fuel_schema();
         assert_eq!(schema["additionalProperties"], false);
         assert_eq!(schema["properties"]["events"]["maxItems"], 12);
@@ -477,10 +473,9 @@ mod tests {
             schema["properties"]["events"]["items"]["properties"]["items"]["maxItems"],
             20
         );
-        assert_eq!(
-            schema["properties"]["events"]["items"]["properties"]["source_text"]["maxLength"],
-            500
-        );
+        let serialized = schema.to_string();
+        assert!(!serialized.contains("minLength"));
+        assert!(!serialized.contains("maxLength"));
         assert!(include_str!("../prompts/fuel_entry.j2").contains("no more than 40"));
         assert_eq!(
             schema["properties"]["events"]["items"]["properties"]["items"]["items"]
@@ -674,6 +669,24 @@ mod tests {
         let mut sugar = parsed_item("dessert");
         sugar.items[0].nutrition.sugar_g = 60.0;
         assert!(validate_parsed(&sugar).is_err());
+    }
+
+    #[test]
+    fn validation_enforces_string_limits_outside_the_openai_schema() {
+        let mut long_name = parsed_item(&"n".repeat(121));
+        assert!(validate_parsed(&long_name).is_err());
+
+        long_name.items[0].name = "tea".into();
+        long_name.items[0].unit = Some("u".repeat(41));
+        assert!(validate_parsed(&long_name).is_err());
+
+        long_name.items[0].unit = None;
+        long_name.items[0].assumptions = vec!["a".repeat(201)];
+        assert!(validate_parsed(&long_name).is_err());
+
+        let mut long_source = timeline(None, &[Some("10:00")]);
+        long_source.events[0].source_text = "s".repeat(MAX_EVENT_SOURCE_CHARS + 1);
+        assert!(resolve_timeline_at(long_source, local_now(12)).is_err());
     }
 
     #[test]
