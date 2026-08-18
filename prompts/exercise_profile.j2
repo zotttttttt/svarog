@@ -6,6 +6,7 @@ Rules:
 - Resolve only equipment the user explicitly says is available.
 - Use only the equipment kinds allowed by the output schema.
 - Normalize singular/plural and informal equipment names to those kinds.
+- Preserve the explicitly stated quantity of each equipment kind in `count`; do not infer extra matching items.
 - Convert stated weights to kilograms and preserve every distinct available weight.
 - Include bodyweight even when it is not explicitly mentioned.
 - Do not infer gym machines, bars, bands, balls, weights, or other equipment from goals or exercises the user likes.

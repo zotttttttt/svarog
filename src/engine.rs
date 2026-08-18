@@ -85,6 +85,9 @@ pub fn recommend(
 }
 
 fn equipment_matches(equipment_text: &str, movement: &Movement) -> bool {
+    if let Some(entry) = crate::exercise_catalog::find(&movement.id) {
+        return crate::exercise_catalog::equipment_text_matches_entry(equipment_text, entry);
+    }
     let normalized = equipment_text.to_lowercase();
     movement.equipment.iter().any(|needed| {
         needed == "bodyweight"
@@ -249,6 +252,21 @@ mod tests {
         assert_eq!(stats.0, 1);
         assert_eq!(stats.1, rec.reps);
         assert_eq!(stats.2, 1);
+    }
+
+    #[test]
+    fn daily_forge_ceiling_blocks_automatic_recommendations() {
+        let store = test_store();
+        let mut config = Config::default();
+        config.preferences.max_daily_sets = 1;
+        let mut rec = recommend(&store, &config, &event(90)).unwrap().unwrap();
+        rec.id = Some(store.insert_recommendation(&rec).unwrap());
+        store
+            .record_set_with_reps(&rec, SetStatus::Done, 999)
+            .unwrap();
+
+        assert!(recommend(&store, &config, &event(90)).unwrap().is_none());
+        assert!(!opportunity_allows(&store, &config).unwrap());
     }
 
     #[test]

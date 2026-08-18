@@ -6,6 +6,11 @@ Svarog validates every recommendation against your available equipment, safety
 profile, movement history, cooldowns, and local exercise catalog. The selected
 recommender changes how candidates are generated, not those safeguards.
 
+Equipment is interpreted literally. Bodyweight exercises that require a pull-up
+bar, bench, box, wall, rack, or another support are available only when that item
+is listed in your profile. Quantities matter too: one kettlebell does not enable
+two-kettlebell movements.
+
 ## Choose a recommender
 
 On the waiting screen, press `s`, focus **Recommender** with `↑`/`↓`, and use
@@ -18,9 +23,10 @@ On the waiting screen, press `s`, focus **Recommender** with `↑`/`↓`, and us
 | OpenAI (saved key) | Uses the Responses API with a key protected by the operating system credential store |
 | Codex | Uses your installed Codex CLI without requiring a separate API key |
 
-The choice is saved with Ctrl+S or Command+S from Settings. Svarog preserves the
-current movement and old safe queue until a newly generated replacement is
-ready.
+The choice is saved with Ctrl+S or Command+S from Settings. Changing the
+recommender preserves the current movement and old safe queue until a newly
+generated replacement is ready. Other Settings changes do not regenerate the
+queue.
 
 ## OpenAI API setup
 

@@ -12,8 +12,11 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::io::{Read, Write};
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -100,9 +103,15 @@ struct ContextSet {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct EquipmentCapability {
+pub(crate) struct EquipmentCapability {
     kind: String,
     weights_kg: Vec<f32>,
+    #[serde(default = "default_equipment_count")]
+    count: u32,
+}
+
+fn default_equipment_count() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -147,6 +156,8 @@ struct LlmExerciseProfile {
 struct LlmEquipmentCapability {
     kind: String,
     weights_kg: Vec<f32>,
+    #[serde(default = "default_equipment_count")]
+    count: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -649,44 +660,25 @@ fn exercise_profile_context(config: &Config) -> ExerciseProfileContext<'_> {
     }
 }
 
-fn normalize_equipment(text: &str) -> Vec<EquipmentCapability> {
+pub(crate) fn normalize_equipment(text: &str) -> Vec<EquipmentCapability> {
     let normalized = text.to_lowercase();
     let weights = extract_weight_values_kg(&normalized);
-    let mut capabilities = Vec::new();
-    for (kind, matches) in [
-        ("kettlebell", ["kettlebell", "kettle bell"].as_slice()),
-        ("dumbbell", ["dumbbell", "dumb bell"].as_slice()),
-        ("band", ["band", "resistance band"].as_slice()),
-        (
-            "medicine_ball",
-            ["medicine ball", "medical ball", "medicine_ball"].as_slice(),
-        ),
-        ("barbell", ["barbell"].as_slice()),
-        ("e_z_curl_bar", ["e-z curl bar", "ez curl bar"].as_slice()),
-        (
-            "exercise_ball",
-            ["exercise ball", "stability ball"].as_slice(),
-        ),
-        ("foam_roll", ["foam roll", "foam roller"].as_slice()),
-        ("cable", ["cable machine", "cable"].as_slice()),
-        ("machine", ["gym machine", "machines"].as_slice()),
-    ] {
-        if matches.iter().any(|needle| normalized.contains(needle)) {
-            capabilities.push(EquipmentCapability {
-                kind: kind.to_string(),
-                weights_kg: if matches!(kind, "kettlebell" | "dumbbell" | "barbell") {
-                    weights.clone()
-                } else {
-                    Vec::new()
-                },
-            });
-        }
+    let mut counts = std::collections::BTreeMap::<String, u32>::new();
+    for kind in exercise_catalog::locally_resolved_equipment(text) {
+        *counts.entry(kind).or_default() += 1;
     }
-    capabilities.push(EquipmentCapability {
-        kind: "bodyweight".to_string(),
-        weights_kg: Vec::new(),
-    });
-    capabilities
+    counts
+        .into_iter()
+        .map(|(kind, count)| EquipmentCapability {
+            weights_kg: if matches!(kind.as_str(), "kettlebell" | "dumbbell" | "barbell") {
+                weights.clone()
+            } else {
+                Vec::new()
+            },
+            kind,
+            count,
+        })
+        .collect()
 }
 
 fn extract_weight_values_kg(text: &str) -> Vec<f32> {
@@ -812,11 +804,27 @@ where
     let model = (!configured_model.eq_ignore_ascii_case("inherit") && !configured_model.is_empty())
         .then_some(configured_model);
 
-    match call_codex_json_attempt(store, config, prompt, schema_file.path(), model, deadline)? {
+    match call_codex_json_attempt(
+        store,
+        config,
+        prompt,
+        schema_file.path(),
+        model,
+        deadline,
+        None,
+    )? {
         CodexAttempt::Completed(value) => Ok(value),
         CodexAttempt::EarlyFailure(first_error) if model.is_some() => {
-            match call_codex_json_attempt(store, config, prompt, schema_file.path(), None, deadline)
-                .with_context(|| format!("{first_error}; inherited Codex model retry failed"))?
+            match call_codex_json_attempt(
+                store,
+                config,
+                prompt,
+                schema_file.path(),
+                None,
+                deadline,
+                None,
+            )
+            .with_context(|| format!("{first_error}; inherited Codex model retry failed"))?
             {
                 CodexAttempt::Completed(value) => Ok(value),
                 CodexAttempt::EarlyFailure(second_error) => {
@@ -824,6 +832,37 @@ where
                 }
             }
         }
+        CodexAttempt::EarlyFailure(error) => bail!(error),
+    }
+}
+
+pub(crate) fn call_codex_json_for_model<T>(
+    store: &Store,
+    config: &Config,
+    prompt: &str,
+    schema: &serde_json::Value,
+    model: &str,
+    cancel: &AtomicBool,
+) -> Result<T>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let mut schema_file = tempfile::NamedTempFile::new().context("creating Codex output schema")?;
+    serde_json::to_writer(&mut schema_file, schema).context("writing Codex output schema")?;
+    schema_file
+        .flush()
+        .context("flushing Codex output schema")?;
+    let deadline = Instant::now() + Duration::from_millis(config.recommender.timeout_ms);
+    match call_codex_json_attempt(
+        store,
+        config,
+        prompt,
+        schema_file.path(),
+        Some(model),
+        deadline,
+        Some(cancel),
+    )? {
+        CodexAttempt::Completed(value) => Ok(value),
         CodexAttempt::EarlyFailure(error) => bail!(error),
     }
 }
@@ -840,6 +879,7 @@ fn call_codex_json_attempt<T>(
     schema_path: &Path,
     model: Option<&str>,
     deadline: Instant,
+    cancel: Option<&AtomicBool>,
 ) -> Result<CodexAttempt<T>>
 where
     T: for<'de> Deserialize<'de>,
@@ -848,6 +888,7 @@ where
         bail!("codex recommender timed out");
     }
     let mut command = Command::new(&config.recommender.codex.command);
+    command.process_group(0);
     command.args(codex_args_without_output_schema(
         &config.recommender.codex.args,
     ));
@@ -885,6 +926,12 @@ where
     });
 
     loop {
+        if cancel.is_some_and(|cancel| cancel.load(Ordering::Acquire)) {
+            kill_and_reap(&mut child);
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            bail!("nutrition parsing cancelled");
+        }
         if let Some(status) = child.try_wait()? {
             let stdout = stdout_reader
                 .join()
@@ -913,12 +960,21 @@ where
                 .map(CodexAttempt::Completed);
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_and_reap(&mut child);
             bail!("codex recommender timed out");
         }
         thread::sleep(Duration::from_millis(50));
     }
+}
+
+fn kill_and_reap(child: &mut std::process::Child) {
+    let process_group = -(child.id() as i32);
+    // SAFETY: the child was placed in its own process group immediately before spawn.
+    unsafe {
+        libc::kill(process_group, libc::SIGKILL);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn codex_args_without_output_schema(args: &[String]) -> Vec<&str> {
@@ -1006,7 +1062,7 @@ fn call_openai_exercise_profile(
     call_openai_json(store, config, paths, body).context("parsing OpenAI exercise profile")
 }
 
-fn call_openai_json<T>(
+pub(crate) fn call_openai_json<T>(
     store: &Store,
     config: &Config,
     paths: &Paths,
@@ -1053,6 +1109,81 @@ where
         bail!("OpenAI response did not contain output text");
     };
     parse_llm_json(&text)
+}
+
+pub(crate) fn call_openai_json_cancellable<T>(
+    store: &Store,
+    config: &Config,
+    paths: &Paths,
+    body: serde_json::Value,
+    cancel: Arc<AtomicBool>,
+) -> Result<T>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let api_key = match config.recommender.backend {
+        RecommenderBackend::OpenaiEnv => std::env::var(&config.recommender.openai.api_key_env)
+            .map(zeroize::Zeroizing::new)
+            .with_context(|| format!("missing {}", config.recommender.openai.api_key_env))?,
+        RecommenderBackend::OpenaiKeyring => secrets::openai_api_key(paths)?
+            .filter(|key| !key.trim().is_empty())
+            .context("no OpenAI API key is saved in Svarog Settings")?,
+        _ => unreachable!(),
+    };
+    if cancel.load(Ordering::Acquire) {
+        bail!("nutrition parsing cancelled");
+    }
+    let timeout = Duration::from_millis(config.recommender.timeout_ms);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("starting cancellable OpenAI runtime")?;
+    let response: serde_json::Value = runtime.block_on(async {
+        let client = reqwest::Client::builder().timeout(timeout).build()?;
+        let request = async {
+            client
+                .post("https://api.openai.com/v1/responses")
+                .bearer_auth(api_key.as_str())
+                .json(&body)
+                .send()
+                .await
+                .context("calling OpenAI Responses API")?
+                .error_for_status()
+                .context("OpenAI Responses API returned an error")?
+                .json()
+                .await
+                .context("parsing OpenAI response JSON")
+        };
+        tokio::select! {
+            response = request => response,
+            _ = wait_for_cancellation(cancel.clone()) => {
+                bail!("nutrition parsing cancelled");
+            }
+        }
+    })?;
+    if cancel.load(Ordering::Acquire) {
+        bail!("nutrition parsing cancelled");
+    }
+    if let Some(usage) = parse_openai_usage(&response)? {
+        let _ = store.record_recommender_token_usage(
+            RecommenderTokenProvider::OpenAi,
+            &usage,
+            Utc::now(),
+        );
+    }
+    let text = response
+        .get("output_text")
+        .and_then(|value| value.as_str())
+        .map(ToString::to_string)
+        .or_else(|| find_first_text(&response))
+        .context("OpenAI response did not contain output text")?;
+    parse_llm_json(&text)
+}
+
+async fn wait_for_cancellation(cancel: Arc<AtomicBool>) {
+    while !cancel.load(Ordering::Acquire) {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 }
 
 fn parse_openai_usage(response: &serde_json::Value) -> Result<Option<RecommenderTokenUsage>> {
@@ -1180,24 +1311,31 @@ fn exercise_profile_schema() -> serde_json::Value {
             "equipment": {
                 "type": "array",
                 "minItems": 0,
-                "maxItems": 11,
+                "maxItems": 20,
                 "items": {
                     "type": "object",
                     "additionalProperties": false,
-                    "required": ["kind", "weights_kg"],
+                    "required": ["kind", "weights_kg", "count"],
                     "properties": {
                         "kind": {
                             "type": "string",
                             "enum": [
                                 "bodyweight", "dumbbell", "kettlebell", "band",
                                 "medicine_ball", "barbell", "e_z_curl_bar",
-                                "exercise_ball", "foam_roll", "cable", "machine"
+                                "exercise_ball", "foam_roll", "cable", "machine",
+                                "pull_up_bar", "v_bar", "bench_or_box", "dip_station",
+                                "rack", "wall", "stable_support", "leg_anchor"
                             ]
                         },
                         "weights_kg": {
                             "type": "array",
                             "items": { "type": "number", "minimum": 0.25, "maximum": 300 },
                             "maxItems": 16
+                        },
+                        "count": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 16
                         }
                     }
                 }
@@ -1230,6 +1368,7 @@ fn validate_exercise_profile(
     let mut equipment = vec![EquipmentCapability {
         kind: "bodyweight".to_string(),
         weights_kg: Vec::new(),
+        count: 1,
     }];
     for capability in profile.equipment {
         if !exercise_catalog::is_supported_equipment(&capability.kind) {
@@ -1245,16 +1384,22 @@ fn validate_exercise_profile(
         {
             bail!("LLM equipment resolver returned an invalid weight");
         }
+        if !(1..=16).contains(&capability.count) {
+            bail!("LLM equipment resolver returned an invalid equipment count");
+        }
         if seen.insert(capability.kind.clone()) && capability.kind != "bodyweight" {
             equipment.push(EquipmentCapability {
                 kind: capability.kind,
                 weights_kg: capability.weights_kg,
+                count: capability.count,
             });
         }
     }
     let kinds = equipment
         .iter()
-        .map(|capability| capability.kind.clone())
+        .flat_map(|capability| {
+            std::iter::repeat_n(capability.kind.clone(), capability.count as usize)
+        })
         .collect::<Vec<_>>();
     Ok((exercise_catalog::movements_for_equipment(&kinds), equipment))
 }
@@ -1393,7 +1538,7 @@ fn find_first_text(value: &serde_json::Value) -> Option<String> {
 mod tests {
     use super::*;
     use crate::config::{Recommender, RecommenderBackend};
-    use crate::models::{Agent, SetStatus};
+    use crate::models::{Agent, RecommenderTokenUsageSummary, SetStatus};
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
@@ -1684,10 +1829,14 @@ mod tests {
             "12 kg kettlebell, 2x8 kg dumbbells, resistance band, and a medical ball",
         );
         assert!(capabilities.iter().any(|capability| {
-            capability.kind == "kettlebell" && capability.weights_kg.contains(&12.0)
+            capability.kind == "kettlebell"
+                && capability.count == 1
+                && capability.weights_kg.contains(&12.0)
         }));
         assert!(capabilities.iter().any(|capability| {
-            capability.kind == "dumbbell" && capability.weights_kg.contains(&8.0)
+            capability.kind == "dumbbell"
+                && capability.count == 2
+                && capability.weights_kg.contains(&8.0)
         }));
         assert!(capabilities
             .iter()
@@ -1703,6 +1852,7 @@ mod tests {
             equipment: vec![LlmEquipmentCapability {
                 kind: "dumbbell".into(),
                 weights_kg: vec![10.0],
+                count: 1,
             }],
         })
         .unwrap();
@@ -1720,6 +1870,35 @@ mod tests {
         assert!(movements.iter().all(|movement| {
             movement.equipment == ["bodyweight"] || movement.equipment == ["dumbbell"]
         }));
+    }
+
+    #[test]
+    fn resolved_kettlebell_profile_respects_equipment_quantity() {
+        let resolve = |count| {
+            validate_exercise_profile(LlmExerciseProfile {
+                equipment: vec![LlmEquipmentCapability {
+                    kind: "kettlebell".into(),
+                    weights_kg: vec![12.0],
+                    count,
+                }],
+            })
+            .unwrap()
+            .0
+        };
+
+        assert!(!resolve(1)
+            .iter()
+            .any(|movement| movement.id == "Double_Kettlebell_Jerk"));
+        assert!(resolve(2)
+            .iter()
+            .any(|movement| movement.id == "Double_Kettlebell_Jerk"));
+    }
+
+    #[test]
+    fn legacy_saved_equipment_capabilities_default_to_one_item() {
+        let capability: EquipmentCapability =
+            serde_json::from_str(r#"{"kind":"kettlebell","weights_kg":[12.0]}"#).unwrap();
+        assert_eq!(capability.count, 1);
     }
 
     #[test]
@@ -1884,6 +2063,53 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":24763,"cached_in
             .unwrap();
         assert_eq!(usage.today.input_tokens, 24_763);
         assert_eq!(usage.today.output_tokens, 122);
+    }
+
+    #[test]
+    fn dedicated_codex_call_cancels_and_reaps_its_process_group() {
+        let root = tempdir().unwrap();
+        let command = root.path().join("fake-cancellable-codex.sh");
+        fs::write(
+            &command,
+            r#"#!/bin/sh
+sleep 30
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&command).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&command, permissions).unwrap();
+        let mut config = Config::default();
+        config.recommender.codex.command = command.display().to_string();
+        config.recommender.codex.args.clear();
+        config.recommender.timeout_ms = 10_000;
+        let store = test_store();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let signal = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            signal.store(true, Ordering::Release);
+        });
+        let started = Instant::now();
+
+        let error = call_codex_json_for_model::<LlmRecommendationBatch>(
+            &store,
+            &config,
+            "ignored",
+            &recommendation_queue_schema(QUEUE_TARGET),
+            "gpt-5.6-luna",
+            cancel.as_ref(),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("cancelled"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(
+            store
+                .recommender_token_usage_summary_for(RecommenderTokenProvider::Codex)
+                .unwrap(),
+            RecommenderTokenUsageSummary::default()
+        );
     }
 
     #[test]

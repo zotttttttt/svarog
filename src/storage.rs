@@ -1,19 +1,22 @@
-use crate::config::Config;
+use crate::config::{Config, UnitSystem};
+#[cfg(test)]
+use crate::models::FuelParseResult;
 use crate::models::{
     Agent, AgentEvent, AppState, AppStateKind, CodexHookEvent, ForgeActivitySummary,
-    ForgeActivityTotals, Movement, MovementSidedness, MovementStatus, Recommendation,
-    RecommendationSide, RecommenderTokenProvider, RecommenderTokenUsage,
-    RecommenderTokenUsageSummary, SetStatus, TokenUsageTotals,
+    ForgeActivityTotals, FuelEntry, Movement, MovementSidedness, MovementStatus, NutritionTotals,
+    Recommendation, RecommendationSide, RecommenderTokenProvider, RecommenderTokenUsage,
+    RecommenderTokenUsageSummary, SetStatus, TimedFuelEvent, TokenUsageTotals, WaterTotal,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Local, TimeZone, Utc};
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::Serialize;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 pub const MUSCLE_COOLDOWN_MINUTES: i64 = 18;
+pub const ML_PER_US_FL_OZ: f64 = 29.573_529_562_5;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SetSummary {
@@ -47,6 +50,18 @@ pub struct ForgeHistoryEntry {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WeightProgress {
+    pub starting_kg: f32,
+    pub current_kg: f32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LoggedDayNutritionAverage {
+    pub totals: NutritionTotals,
+    pub logged_days: u32,
+}
+
 pub struct Store {
     conn: Connection,
 }
@@ -58,6 +73,8 @@ impl Store {
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
         let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .context("configuring SQLite busy timeout")?;
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))
             .with_context(|| format!("securing {}", path.display()))?;
         let store = Self { conn };
@@ -179,6 +196,46 @@ impl Store {
 
             CREATE INDEX IF NOT EXISTS recommender_token_usage_created_at
                 ON recommender_token_usage(created_at);
+
+            CREATE TABLE IF NOT EXISTS fuel_entries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                raw_text TEXT NOT NULL,
+                items_json TEXT NOT NULL,
+                calories REAL NOT NULL,
+                protein_g REAL NOT NULL,
+                carbohydrates_g REAL NOT NULL,
+                fat_g REAL NOT NULL,
+                fiber_g REAL NOT NULL,
+                sugar_g REAL NOT NULL,
+                sodium_mg REAL NOT NULL,
+                potassium_mg REAL NOT NULL,
+                provider TEXT NOT NULL,
+                model TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS fuel_entries_created_at
+                ON fuel_entries(created_at);
+
+            CREATE TABLE IF NOT EXISTS water_adjustments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                local_date TEXT NOT NULL,
+                delta_ml REAL NOT NULL,
+                delta_fl_oz REAL NOT NULL,
+                total_ml REAL NOT NULL,
+                total_fl_oz REAL NOT NULL,
+                unit_system TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS water_adjustments_local_date
+                ON water_adjustments(local_date, id);
+
+            CREATE TABLE IF NOT EXISTS weight_checkins (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                weight_kg REAL NOT NULL,
+                created_at TEXT NOT NULL
+            );
             "#,
         )?;
         let _ = self.conn.execute(
@@ -275,6 +332,8 @@ impl Store {
             DELETE FROM exercise_exclusions;
             DELETE FROM exercise_catalog_state;
             DELETE FROM recommender_token_usage;
+            DELETE FROM fuel_entries;
+            DELETE FROM water_adjustments;
             DELETE FROM users;
             DELETE FROM movements;
             DELETE FROM app_state;
@@ -286,7 +345,9 @@ impl Store {
                 'turns',
                 'sessions',
                 'pain_events',
-                'recommender_token_usage'
+                'recommender_token_usage',
+                'fuel_entries',
+                'water_adjustments'
             );
             "#,
         )?;
@@ -299,6 +360,331 @@ impl Store {
             [Utc::now().to_rfc3339()],
         )?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn save_fuel_entry(
+        &self,
+        raw_text: &str,
+        parsed: &FuelParseResult,
+        provider: &str,
+        model: &str,
+        created_at: DateTime<Utc>,
+    ) -> Result<i64> {
+        let ids = self.save_fuel_batch(
+            &[TimedFuelEvent {
+                consumed_at: created_at,
+                source_text: raw_text.to_string(),
+                parsed: parsed.clone(),
+            }],
+            provider,
+            model,
+        )?;
+        ids.into_iter().next().context("saving fuel entry")
+    }
+
+    pub fn save_fuel_batch(
+        &self,
+        events: &[TimedFuelEvent],
+        provider: &str,
+        model: &str,
+    ) -> Result<Vec<i64>> {
+        crate::fuel::validate_timed_events(events)
+            .context("validating fuel batch before saving")?;
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let mut ids = Vec::with_capacity(events.len());
+        for event in events {
+            let totals = event.parsed.totals();
+            transaction.execute(
+                r#"
+                INSERT INTO fuel_entries (
+                    raw_text, items_json, calories, protein_g, carbohydrates_g, fat_g,
+                    fiber_g, sugar_g, sodium_mg, potassium_mg, provider, model, created_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                "#,
+                params![
+                    event.source_text,
+                    serde_json::to_string(&event.parsed)?,
+                    totals.calories,
+                    totals.protein_g,
+                    totals.carbohydrates_g,
+                    totals.fat_g,
+                    totals.fiber_g,
+                    totals.sugar_g,
+                    totals.sodium_mg,
+                    totals.potassium_mg,
+                    provider,
+                    model,
+                    event.consumed_at.to_rfc3339(),
+                ],
+            )?;
+            ids.push(transaction.last_insert_rowid());
+        }
+        transaction.commit()?;
+        Ok(ids)
+    }
+
+    pub fn recent_fuel_entries(&self, limit: u32) -> Result<Vec<FuelEntry>> {
+        self.fuel_entries_between(None, None, limit)
+    }
+
+    pub fn nutrition_totals_today(&self) -> Result<NutritionTotals> {
+        self.nutrition_totals_today_at(Local::now())
+    }
+
+    pub fn nutrition_average_recent_logged_days(
+        &self,
+    ) -> Result<Option<LoggedDayNutritionAverage>> {
+        self.nutrition_average_recent_logged_days_at(Local::now())
+    }
+
+    pub fn weight_progress(&self) -> Result<Option<WeightProgress>> {
+        let count: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM weight_checkins", [], |row| row.get(0))?;
+        if count < 2 {
+            return Ok(None);
+        }
+        let starting_kg: f32 = self.conn.query_row(
+            "SELECT weight_kg FROM weight_checkins ORDER BY id ASC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )?;
+        let current_kg: f32 = self.conn.query_row(
+            "SELECT weight_kg FROM weight_checkins ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )?;
+        if !starting_kg.is_finite()
+            || !current_kg.is_finite()
+            || starting_kg <= 0.0
+            || current_kg <= 0.0
+        {
+            anyhow::bail!("stored weight check-ins are invalid");
+        }
+        Ok(Some(WeightProgress {
+            starting_kg,
+            current_kg,
+        }))
+    }
+
+    pub fn nutrition_totals_today_at(&self, now: DateTime<Local>) -> Result<NutritionTotals> {
+        let (start, end) = local_day_bounds_at(now)?;
+        let totals = self.conn.query_row(
+            r#"
+            SELECT COALESCE(SUM(calories), 0.0),
+                   COALESCE(SUM(protein_g), 0.0),
+                   COALESCE(SUM(carbohydrates_g), 0.0),
+                   COALESCE(SUM(fat_g), 0.0),
+                   COALESCE(SUM(fiber_g), 0.0),
+                   COALESCE(SUM(sugar_g), 0.0),
+                   COALESCE(SUM(sodium_mg), 0.0),
+                   COALESCE(SUM(potassium_mg), 0.0)
+            FROM fuel_entries
+            WHERE created_at >= ?1 AND created_at < ?2
+            "#,
+            params![start.to_rfc3339(), end.to_rfc3339()],
+            |row| {
+                Ok(NutritionTotals {
+                    calories: row.get(0)?,
+                    protein_g: row.get(1)?,
+                    carbohydrates_g: row.get(2)?,
+                    fat_g: row.get(3)?,
+                    fiber_g: row.get(4)?,
+                    sugar_g: row.get(5)?,
+                    sodium_mg: row.get(6)?,
+                    potassium_mg: row.get(7)?,
+                })
+            },
+        )?;
+        if totals
+            .values()
+            .iter()
+            .any(|value| !value.is_finite() || *value < 0.0)
+        {
+            anyhow::bail!("stored nutrition totals are invalid");
+        }
+        Ok(totals)
+    }
+
+    fn nutrition_average_recent_logged_days_at(
+        &self,
+        now: DateTime<Local>,
+    ) -> Result<Option<LoggedDayNutritionAverage>> {
+        const MAX_LOGGED_DAYS: usize = 7;
+
+        let (_, end) = local_day_bounds_at(now)?;
+        let mut statement = self.conn.prepare(
+            r#"
+            SELECT calories, protein_g, carbohydrates_g, fat_g, fiber_g,
+                   sugar_g, sodium_mg, potassium_mg, created_at
+            FROM fuel_entries
+            WHERE created_at < ?1
+            ORDER BY created_at DESC, id DESC
+            "#,
+        )?;
+        let rows = statement.query_map([end.to_rfc3339()], |row| {
+            Ok((
+                NutritionTotals {
+                    calories: row.get(0)?,
+                    protein_g: row.get(1)?,
+                    carbohydrates_g: row.get(2)?,
+                    fat_g: row.get(3)?,
+                    fiber_g: row.get(4)?,
+                    sugar_g: row.get(5)?,
+                    sodium_mg: row.get(6)?,
+                    potassium_mg: row.get(7)?,
+                },
+                row.get::<_, String>(8)?,
+            ))
+        })?;
+
+        let mut dates = Vec::with_capacity(MAX_LOGGED_DAYS);
+        let mut totals = NutritionTotals::default();
+        for row in rows {
+            let (entry, created_at) = row?;
+            if entry
+                .values()
+                .iter()
+                .any(|value| !value.is_finite() || *value < 0.0)
+            {
+                anyhow::bail!("stored nutrition totals are invalid");
+            }
+            let date = DateTime::parse_from_rfc3339(&created_at)
+                .context("parsing stored fuel timestamp")?
+                .with_timezone(&Local)
+                .date_naive();
+            if !dates.contains(&date) {
+                if dates.len() == MAX_LOGGED_DAYS {
+                    break;
+                }
+                dates.push(date);
+            }
+            totals.add_assign(&entry);
+        }
+
+        if dates.is_empty() {
+            return Ok(None);
+        }
+        totals.scale_assign(1.0 / dates.len() as f64);
+        Ok(Some(LoggedDayNutritionAverage {
+            totals,
+            logged_days: dates.len() as u32,
+        }))
+    }
+
+    fn fuel_entries_between(
+        &self,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
+        limit: u32,
+    ) -> Result<Vec<FuelEntry>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT id, raw_text, items_json, calories, protein_g, carbohydrates_g,
+                   fat_g, fiber_g, sugar_g, sodium_mg, potassium_mg,
+                   provider, model, created_at
+            FROM fuel_entries
+            WHERE (?1 IS NULL OR created_at >= ?1)
+              AND (?2 IS NULL OR created_at < ?2)
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?3
+            "#,
+        )?;
+        let start = start.map(|value| value.to_rfc3339());
+        let end = end.map(|value| value.to_rfc3339());
+        let rows = stmt.query_map(params![start, end, limit], fuel_entry_from_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("loading fuel entries")
+    }
+
+    pub fn delete_fuel_entry(&self, id: i64) -> Result<bool> {
+        Ok(self
+            .conn
+            .execute("DELETE FROM fuel_entries WHERE id = ?1", [id])?
+            > 0)
+    }
+
+    pub fn water_total_today(&self) -> Result<WaterTotal> {
+        self.water_total_at(Local::now())
+    }
+
+    pub fn water_total_at(&self, now: DateTime<Local>) -> Result<WaterTotal> {
+        let date = now.date_naive().to_string();
+        let milliliters = self.conn.query_row(
+            "SELECT COALESCE(SUM(delta_ml), 0.0) FROM water_adjustments WHERE local_date = ?1",
+            [date],
+            |row| row.get::<_, f64>(0),
+        )?;
+        if !milliliters.is_finite() || milliliters < 0.0 {
+            anyhow::bail!("stored water total is invalid");
+        }
+        Ok(WaterTotal {
+            milliliters,
+            fluid_ounces: milliliters / ML_PER_US_FL_OZ,
+        })
+    }
+
+    pub fn adjust_water_today(
+        &self,
+        requested_delta_ml: f64,
+        unit_system: UnitSystem,
+    ) -> Result<WaterTotal> {
+        self.adjust_water_at(requested_delta_ml, unit_system, Local::now())
+    }
+
+    pub fn adjust_water_at(
+        &self,
+        requested_delta_ml: f64,
+        unit_system: UnitSystem,
+        now: DateTime<Local>,
+    ) -> Result<WaterTotal> {
+        if !requested_delta_ml.is_finite() || requested_delta_ml == 0.0 {
+            anyhow::bail!("water adjustment must be a finite non-zero value");
+        }
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let local_date = now.date_naive().to_string();
+        let current: f64 = transaction.query_row(
+            "SELECT COALESCE(SUM(delta_ml), 0.0) FROM water_adjustments WHERE local_date = ?1",
+            [&local_date],
+            |row| row.get(0),
+        )?;
+        if !current.is_finite() || current < 0.0 {
+            anyhow::bail!("stored water total is invalid");
+        }
+        let total_ml = (current + requested_delta_ml).max(0.0);
+        if !total_ml.is_finite() {
+            anyhow::bail!("water total is too large");
+        }
+        let actual_delta_ml = total_ml - current;
+        if actual_delta_ml == 0.0 {
+            return Ok(WaterTotal {
+                milliliters: current,
+                fluid_ounces: current / ML_PER_US_FL_OZ,
+            });
+        }
+        transaction.execute(
+            r#"
+            INSERT INTO water_adjustments (
+                local_date, delta_ml, delta_fl_oz, total_ml, total_fl_oz,
+                unit_system, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "#,
+            params![
+                local_date,
+                actual_delta_ml,
+                actual_delta_ml / ML_PER_US_FL_OZ,
+                total_ml,
+                total_ml / ML_PER_US_FL_OZ,
+                unit_system.to_string(),
+                now.with_timezone(&Utc).to_rfc3339(),
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(WaterTotal {
+            milliliters: total_ml,
+            fluid_ounces: total_ml / ML_PER_US_FL_OZ,
+        })
     }
 
     pub fn record_recommender_token_usage(
@@ -546,7 +932,9 @@ impl Store {
     pub fn apply_user_profile_and_movement_pool(
         &self,
         config: &Config,
+        previous_weight_kg: Option<f32>,
         movements: &[Movement],
+        equipment_filter_json: &str,
     ) -> Result<()> {
         let transaction = self
             .conn
@@ -563,8 +951,53 @@ impl Store {
                 Utc::now().to_rfc3339()
             ],
         )?;
+        Self::record_weight_checkin_in_transaction(
+            &transaction,
+            previous_weight_kg,
+            config.profile.weight_kg,
+        )?;
         Self::replace_movement_pool_in_transaction(&transaction, movements)?;
+        transaction.execute(
+            "UPDATE exercise_catalog_state SET equipment_json = ?1 WHERE id = 1",
+            [equipment_filter_json],
+        )?;
         transaction.commit().context("committing settings update")
+    }
+
+    fn record_weight_checkin_in_transaction(
+        transaction: &Transaction<'_>,
+        previous_weight_kg: Option<f32>,
+        current_weight_kg: Option<f32>,
+    ) -> Result<()> {
+        let valid = |weight: Option<f32>| weight.filter(|value| value.is_finite() && *value > 0.0);
+        let previous_weight_kg = valid(previous_weight_kg);
+        let current_weight_kg = valid(current_weight_kg);
+        let count: i64 =
+            transaction.query_row("SELECT COUNT(*) FROM weight_checkins", [], |row| row.get(0))?;
+        if count == 0 {
+            if let Some(weight) = previous_weight_kg {
+                transaction.execute(
+                    "INSERT INTO weight_checkins (weight_kg, created_at) VALUES (?1, ?2)",
+                    params![weight, Utc::now().to_rfc3339()],
+                )?;
+            }
+        }
+        let latest_weight_kg = transaction
+            .query_row(
+                "SELECT weight_kg FROM weight_checkins ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get::<_, f32>(0),
+            )
+            .optional()?;
+        if let Some(weight) = current_weight_kg.filter(|weight| {
+            latest_weight_kg.is_none_or(|latest| (latest - *weight).abs() > 0.000_1)
+        }) {
+            transaction.execute(
+                "INSERT INTO weight_checkins (weight_kg, created_at) VALUES (?1, ?2)",
+                params![weight, Utc::now().to_rfc3339()],
+            )?;
+        }
+        Ok(())
     }
 
     fn replace_movement_pool_in_transaction(
@@ -1236,11 +1669,15 @@ impl Store {
     }
 
     pub fn today_set_count(&self) -> Result<u32> {
-        let today = Utc::now().date_naive().to_string();
+        self.today_set_count_at(Local::now())
+    }
+
+    fn today_set_count_at(&self, now: DateTime<Local>) -> Result<u32> {
+        let (start, end) = local_day_bounds_at(now)?;
         self.conn
             .query_row(
-                "SELECT COUNT(*) FROM sets WHERE substr(created_at, 1, 10) = ?1 AND status = 'done'",
-                [today],
+                "SELECT COUNT(*) FROM sets WHERE created_at >= ?1 AND created_at < ?2 AND status = 'done'",
+                params![start.to_rfc3339(), end.to_rfc3339()],
                 |row| row.get::<_, i64>(0).map(|count| count as u32),
             )
             .context("counting today's sets")
@@ -1263,7 +1700,11 @@ impl Store {
     }
 
     pub fn stats_today(&self) -> Result<(u32, u32, u32)> {
-        let today = Utc::now().date_naive().to_string();
+        self.stats_today_at(Local::now())
+    }
+
+    fn stats_today_at(&self, now: DateTime<Local>) -> Result<(u32, u32, u32)> {
+        let (start, end) = local_day_bounds_at(now)?;
         self.conn
             .query_row(
                 r#"
@@ -1272,9 +1713,9 @@ impl Store {
                     COALESCE(SUM(CASE WHEN status = 'done' THEN reps ELSE 0 END), 0),
                     SUM(CASE WHEN status IN ('skipped', 'pain') THEN 1 ELSE 0 END)
                 FROM sets
-                WHERE substr(created_at, 1, 10) = ?1
+                WHERE created_at >= ?1 AND created_at < ?2
                 "#,
-                [today],
+                params![start.to_rfc3339(), end.to_rfc3339()],
                 |row| {
                     Ok((
                         row.get::<_, Option<i64>>(0)?.unwrap_or(0) as u32,
@@ -1438,6 +1879,72 @@ fn local_period_starts_at(now: DateTime<Local>) -> Result<(DateTime<Utc>, DateTi
         .context("determining local start of week")?
         .with_timezone(&Utc);
     Ok((today_start, week_start))
+}
+
+fn local_day_bounds_at(now: DateTime<Local>) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
+    day_bounds_in_timezone(now)
+}
+
+fn day_bounds_in_timezone<Tz>(now: DateTime<Tz>) -> Result<(DateTime<Utc>, DateTime<Utc>)>
+where
+    Tz: TimeZone,
+{
+    let today = now.date_naive();
+    let timezone = now.timezone();
+    let start = timezone
+        .from_local_datetime(
+            &today
+                .and_hms_opt(0, 0, 0)
+                .context("building local start of today")?,
+        )
+        .earliest()
+        .context("determining local start of today")?
+        .with_timezone(&Utc);
+    let end = timezone
+        .from_local_datetime(
+            &(today + Duration::days(1))
+                .and_hms_opt(0, 0, 0)
+                .context("building local start of tomorrow")?,
+        )
+        .earliest()
+        .context("determining local start of tomorrow")?
+        .with_timezone(&Utc);
+    Ok((start, end))
+}
+
+fn fuel_entry_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FuelEntry> {
+    let items_json: String = row.get(2)?;
+    let parsed = serde_json::from_str(&items_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    let created_at: String = row.get(13)?;
+    let created_at = DateTime::parse_from_rfc3339(&created_at)
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                13,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?
+        .with_timezone(&Utc);
+    Ok(FuelEntry {
+        id: row.get(0)?,
+        raw_text: row.get(1)?,
+        parsed,
+        totals: NutritionTotals {
+            calories: row.get(3)?,
+            protein_g: row.get(4)?,
+            carbohydrates_g: row.get(5)?,
+            fat_g: row.get(6)?,
+            fiber_g: row.get(7)?,
+            sugar_g: row.get(8)?,
+            sodium_mg: row.get(9)?,
+            potassium_mg: row.get(10)?,
+        },
+        provider: row.get(11)?,
+        model: row.get(12)?,
+        created_at,
+    })
 }
 
 fn recommendation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Recommendation> {
@@ -1650,6 +2157,27 @@ mod tests {
             project: None,
             side: None,
             created_at: Utc::now(),
+        }
+    }
+
+    fn fuel_parse_with_calories(calories: f64) -> FuelParseResult {
+        FuelParseResult {
+            items: vec![crate::models::FuelItem {
+                name: "meal".into(),
+                quantity: Some(1.0),
+                unit: Some("serving".into()),
+                nutrition: NutritionTotals {
+                    calories,
+                    protein_g: calories / 10.0,
+                    carbohydrates_g: calories / 5.0,
+                    fat_g: calories / 20.0,
+                    fiber_g: calories / 100.0,
+                    sugar_g: calories / 25.0,
+                    sodium_mg: calories,
+                    potassium_mg: calories * 2.0,
+                },
+                assumptions: Vec::new(),
+            }],
         }
     }
 
@@ -1951,6 +2479,51 @@ mod tests {
     }
 
     #[test]
+    fn daily_forge_count_is_not_limited_by_total_repetitions() {
+        let store = store();
+        let mut rec = recommendation();
+        rec.id = Some(store.insert_recommendation(&rec).unwrap());
+        for reps in [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 6, 6, 6, 6, 6, 6] {
+            store
+                .record_set_with_reps(&rec, SetStatus::Done, reps)
+                .unwrap();
+        }
+
+        assert_eq!(store.today_set_count().unwrap(), 16);
+        assert_eq!(store.stats_today().unwrap(), (16, 106, 0));
+    }
+
+    #[test]
+    fn today_counts_use_local_calendar_day_boundaries() {
+        let store = store();
+        let now = Local::now();
+        let (start, end) = local_day_bounds_at(now).unwrap();
+        let mut rec = recommendation();
+        rec.id = Some(store.insert_recommendation(&rec).unwrap());
+
+        for (offset, reps) in [
+            (Duration::seconds(-1), 1),
+            (Duration::seconds(0), 2),
+            (end - start - Duration::seconds(1), 3),
+            (end - start, 4),
+        ] {
+            store
+                .record_set_with_reps(&rec, SetStatus::Done, reps)
+                .unwrap();
+            store
+                .conn
+                .execute(
+                    "UPDATE sets SET created_at = ?1 WHERE id = (SELECT MAX(id) FROM sets)",
+                    [(start + offset).to_rfc3339()],
+                )
+                .unwrap();
+        }
+
+        assert_eq!(store.today_set_count().unwrap(), 2);
+        assert_eq!(store.stats_today().unwrap(), (2, 5, 0));
+    }
+
+    #[test]
     fn profile_refresh_does_not_unblock_movement_with_pain_history() {
         let store = store();
         store.seed_movements().unwrap();
@@ -2004,6 +2577,28 @@ mod tests {
         store.record_set(&rec, SetStatus::Done).unwrap();
         store.save_user_profile(&Config::default()).unwrap();
         store.seed_movements().unwrap();
+        store
+            .save_fuel_entry(
+                "test meal",
+                &FuelParseResult {
+                    items: vec![crate::models::FuelItem {
+                        name: "test meal".into(),
+                        quantity: None,
+                        unit: None,
+                        nutrition: NutritionTotals {
+                            calories: 100.0,
+                            carbohydrates_g: 10.0,
+                            ..NutritionTotals::default()
+                        },
+                        assumptions: Vec::new(),
+                    }],
+                },
+                "codex",
+                "gpt-5.6-luna",
+                Utc::now(),
+            )
+            .unwrap();
+        store.adjust_water_today(200.0, UnitSystem::Metric).unwrap();
 
         store.reset_all_data().unwrap();
 
@@ -2011,6 +2606,8 @@ mod tests {
         assert_eq!((sets, reps, breaks), (0, 0, 0));
         assert!(store.movements().unwrap().is_empty());
         assert!(store.latest_open_recommendation().unwrap().is_none());
+        assert!(store.recent_fuel_entries(5).unwrap().is_empty());
+        assert_eq!(store.water_total_today().unwrap(), WaterTotal::default());
         assert_eq!(store.state().unwrap().kind, AppStateKind::Idle);
     }
 
@@ -2020,9 +2617,10 @@ mod tests {
         let mut config = Config::default();
         config.profile.goals = vec!["mobility".into()];
         let movements = crate::exercise_catalog::movements_for_equipment(&["bodyweight".into()]);
+        let equipment_filter = r#"[{"kind":"bodyweight","weights_kg":[],"count":1}]"#;
 
         store
-            .apply_user_profile_and_movement_pool(&config, &movements)
+            .apply_user_profile_and_movement_pool(&config, None, &movements, equipment_filter)
             .unwrap();
 
         let profile_json: String = store
@@ -2033,6 +2631,33 @@ mod tests {
             .unwrap();
         assert!(profile_json.contains("mobility"));
         assert_eq!(store.movements().unwrap().len(), movements.len());
+        let saved_filter: serde_json::Value = store.exercise_filter().unwrap().unwrap();
+        assert_eq!(saved_filter[0]["count"], 1);
+    }
+
+    #[test]
+    fn settings_pool_update_keeps_compatible_queue_and_retires_incompatible_items() {
+        let store = store();
+        let config = Config::default();
+        let movements = crate::exercise_catalog::movements_for_equipment(&["bodyweight".into()]);
+        let compatible_movement = &movements[0];
+        let mut compatible = recommendation();
+        compatible.movement_id = compatible_movement.id.clone();
+        compatible.movement_name = compatible_movement.name.clone();
+        compatible.primary_muscle = compatible_movement.primary_muscle.clone();
+        compatible.muscles = compatible_movement.muscles.clone();
+        store.insert_queued_recommendation(&compatible).unwrap();
+        store
+            .insert_queued_recommendation(&recommendation())
+            .unwrap();
+
+        store
+            .apply_user_profile_and_movement_pool(&config, None, &movements, "[]")
+            .unwrap();
+
+        let queued = store.queued_recommendations().unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].movement_id, compatible.movement_id);
     }
 
     #[test]
@@ -2251,5 +2876,367 @@ mod tests {
 
         assert!(store.latest_open_recommendation().unwrap().is_none());
         assert_eq!(store.recent_forge_history(10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn fuel_entries_round_trip_and_delete() {
+        let store = store();
+        let parsed = FuelParseResult {
+            items: vec![crate::models::FuelItem {
+                name: "oatmeal".into(),
+                quantity: Some(250.0),
+                unit: Some("g".into()),
+                nutrition: NutritionTotals {
+                    calories: 320.0,
+                    protein_g: 12.0,
+                    carbohydrates_g: 54.0,
+                    fat_g: 7.0,
+                    fiber_g: 8.0,
+                    sugar_g: 10.0,
+                    sodium_mg: 120.0,
+                    potassium_mg: 410.0,
+                },
+                assumptions: vec!["ordinary cooked oatmeal".into()],
+            }],
+        };
+        let id = store
+            .save_fuel_entry(
+                "oatmeal with milk",
+                &parsed,
+                "codex",
+                "gpt-5.6-luna",
+                Utc::now(),
+            )
+            .unwrap();
+
+        let recent = store.recent_fuel_entries(5).unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].id, id);
+        assert_eq!(recent[0].parsed, parsed);
+        assert_eq!(recent[0].totals.calories, 320.0);
+        assert!(store.delete_fuel_entry(id).unwrap());
+        assert!(store.recent_fuel_entries(5).unwrap().is_empty());
+    }
+
+    #[test]
+    fn recent_fuel_entries_return_the_latest_five_across_days() {
+        let store = store();
+        let now = Utc::now();
+        let parsed = FuelParseResult {
+            items: vec![crate::models::FuelItem {
+                name: "meal".into(),
+                quantity: Some(1.0),
+                unit: Some("serving".into()),
+                nutrition: NutritionTotals {
+                    calories: 100.0,
+                    protein_g: 5.0,
+                    ..NutritionTotals::default()
+                },
+                assumptions: Vec::new(),
+            }],
+        };
+        for index in (0..7).rev() {
+            store
+                .save_fuel_entry(
+                    &format!("meal {index}"),
+                    &parsed,
+                    "codex",
+                    "gpt-5.6-luna",
+                    now - Duration::days(index),
+                )
+                .unwrap();
+        }
+
+        let recent = store.recent_fuel_entries(5).unwrap();
+        assert_eq!(recent.len(), 5);
+        assert_eq!(
+            recent
+                .iter()
+                .map(|entry| entry.raw_text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["meal 0", "meal 1", "meal 2", "meal 3", "meal 4"]
+        );
+    }
+
+    #[test]
+    fn fuel_batch_saves_atomically_in_consumption_order() {
+        let store = store();
+        let now = Utc::now();
+        let parsed = FuelParseResult {
+            items: vec![crate::models::FuelItem {
+                name: "meal".into(),
+                quantity: Some(1.0),
+                unit: Some("serving".into()),
+                nutrition: NutritionTotals {
+                    calories: 100.0,
+                    protein_g: 5.0,
+                    ..NutritionTotals::default()
+                },
+                assumptions: Vec::new(),
+            }],
+        };
+        let events = vec![
+            TimedFuelEvent {
+                consumed_at: now - Duration::hours(4),
+                source_text: "breakfast".into(),
+                parsed: parsed.clone(),
+            },
+            TimedFuelEvent {
+                consumed_at: now - Duration::hours(1),
+                source_text: "lunch".into(),
+                parsed: parsed.clone(),
+            },
+        ];
+
+        let ids = store
+            .save_fuel_batch(&events, "codex", "gpt-5.6-luna")
+            .unwrap();
+        assert_eq!(ids.len(), 2);
+        let recent = store.recent_fuel_entries(5).unwrap();
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0].created_at, events[1].consumed_at);
+        assert_eq!(recent[1].created_at, events[0].consumed_at);
+        assert_eq!(recent[0].raw_text, "lunch");
+        assert_eq!(recent[1].raw_text, "breakfast");
+
+        let mut invalid = events.clone();
+        invalid[1].parsed.items[0].name = " ".into();
+        assert!(store
+            .save_fuel_batch(&invalid, "codex", "gpt-5.6-luna")
+            .is_err());
+        assert_eq!(store.recent_fuel_entries(5).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn nutrition_totals_sum_only_the_current_local_day() {
+        let store = store();
+        let now = Local::now();
+        assert_eq!(
+            store.nutrition_totals_today_at(now).unwrap(),
+            NutritionTotals::default()
+        );
+        let parsed = FuelParseResult {
+            items: vec![crate::models::FuelItem {
+                name: "meal".into(),
+                quantity: Some(1.0),
+                unit: Some("serving".into()),
+                nutrition: NutritionTotals {
+                    calories: 320.0,
+                    protein_g: 12.0,
+                    carbohydrates_g: 54.0,
+                    fat_g: 7.0,
+                    fiber_g: 8.0,
+                    sugar_g: 10.0,
+                    sodium_mg: 120.0,
+                    potassium_mg: 410.0,
+                },
+                assumptions: Vec::new(),
+            }],
+        };
+        for created_at in [now, now, now - Duration::days(2)] {
+            store
+                .save_fuel_entry(
+                    "meal",
+                    &parsed,
+                    "codex",
+                    "gpt-5.6-luna",
+                    created_at.with_timezone(&Utc),
+                )
+                .unwrap();
+        }
+
+        let totals = store.nutrition_totals_today_at(now).unwrap();
+        assert_eq!(totals.calories, 640.0);
+        assert_eq!(totals.protein_g, 24.0);
+        assert_eq!(totals.carbohydrates_g, 108.0);
+        assert_eq!(totals.fat_g, 14.0);
+        assert_eq!(totals.fiber_g, 16.0);
+        assert_eq!(totals.sugar_g, 20.0);
+        assert_eq!(totals.sodium_mg, 240.0);
+        assert_eq!(totals.potassium_mg, 820.0);
+    }
+
+    #[test]
+    fn nutrition_average_uses_the_latest_seven_logged_local_days() {
+        let store = store();
+        let now = Local::now();
+        assert!(store
+            .nutrition_average_recent_logged_days_at(now)
+            .unwrap()
+            .is_none());
+
+        for day_offset in 0..8 {
+            let date = now.date_naive() - Duration::days(day_offset);
+            let noon = Local
+                .from_local_datetime(&date.and_hms_opt(12, 0, 0).unwrap())
+                .earliest()
+                .unwrap();
+            let base_time = if day_offset == 0 {
+                now - Duration::minutes(2)
+            } else {
+                noon
+            };
+            let daily_calories = (day_offset + 1) as f64 * 70.0;
+            let portions = if day_offset == 0 {
+                vec![20.0, daily_calories - 20.0]
+            } else {
+                vec![daily_calories]
+            };
+            for (index, calories) in portions.into_iter().enumerate() {
+                store
+                    .save_fuel_entry(
+                        "meal",
+                        &fuel_parse_with_calories(calories),
+                        "codex",
+                        "gpt-5.6-luna",
+                        (base_time + Duration::minutes(index as i64)).with_timezone(&Utc),
+                    )
+                    .unwrap();
+            }
+        }
+
+        let average = store
+            .nutrition_average_recent_logged_days_at(now)
+            .unwrap()
+            .unwrap();
+        assert_eq!(average.logged_days, 7);
+        assert_eq!(average.totals.calories, 280.0);
+        assert_eq!(average.totals.protein_g, 28.0);
+
+        let partial_root = tempdir().unwrap().keep();
+        let partial_store = Store::open(&partial_root.join("svarog.sqlite3")).unwrap();
+        for day_offset in 0..3 {
+            let date = now.date_naive() - Duration::days(day_offset);
+            let noon = Local
+                .from_local_datetime(&date.and_hms_opt(12, 0, 0).unwrap())
+                .earliest()
+                .unwrap();
+            let created_at = if day_offset == 0 {
+                now - Duration::minutes(1)
+            } else {
+                noon
+            };
+            partial_store
+                .save_fuel_entry(
+                    "meal",
+                    &fuel_parse_with_calories((day_offset + 1) as f64 * 100.0),
+                    "codex",
+                    "gpt-5.6-luna",
+                    created_at.with_timezone(&Utc),
+                )
+                .unwrap();
+        }
+        let partial_average = partial_store
+            .nutrition_average_recent_logged_days_at(now)
+            .unwrap()
+            .unwrap();
+        assert_eq!(partial_average.logged_days, 3);
+        assert_eq!(partial_average.totals.calories, 200.0);
+    }
+
+    #[test]
+    fn weight_checkins_preserve_the_first_weight_and_record_applied_changes() {
+        let store = store();
+        let movements = crate::exercise_catalog::movements_for_equipment(&["bodyweight".into()]);
+        let mut current = Config::default();
+        current.profile.weight_kg = Some(77.0);
+
+        store
+            .apply_user_profile_and_movement_pool(&current, Some(80.0), &movements, "[]")
+            .unwrap();
+        assert_eq!(
+            store.weight_progress().unwrap(),
+            Some(WeightProgress {
+                starting_kg: 80.0,
+                current_kg: 77.0,
+            })
+        );
+
+        store
+            .apply_user_profile_and_movement_pool(&current, Some(77.0), &movements, "[]")
+            .unwrap();
+        let count: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM weight_checkins", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn water_adjustments_store_both_units_clamp_and_roll_over_locally() {
+        let store = store();
+        let now = Local::now();
+        let first = store
+            .adjust_water_at(200.0, UnitSystem::Metric, now)
+            .unwrap();
+        assert_eq!(first.milliliters, 200.0);
+        assert!((first.fluid_ounces - 200.0 / ML_PER_US_FL_OZ).abs() < 0.000_001);
+
+        let imperial_step = 8.0 * ML_PER_US_FL_OZ;
+        let second = store
+            .adjust_water_at(imperial_step, UnitSystem::Imperial, now)
+            .unwrap();
+        assert!((second.fluid_ounces - (first.fluid_ounces + 8.0)).abs() < 0.000_001);
+        let stored: (f64, f64) = store
+            .conn
+            .query_row(
+                "SELECT total_ml, total_fl_oz FROM water_adjustments ORDER BY id DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!((stored.0 / ML_PER_US_FL_OZ - stored.1).abs() < 0.000_001);
+
+        let zero = store
+            .adjust_water_at(-10_000.0, UnitSystem::Metric, now)
+            .unwrap();
+        assert_eq!(zero, WaterTotal::default());
+        assert_eq!(store.water_total_at(now).unwrap(), WaterTotal::default());
+        assert_eq!(
+            store.water_total_at(now + Duration::days(1)).unwrap(),
+            WaterTotal::default()
+        );
+    }
+
+    #[test]
+    fn local_day_bounds_follow_dst_calendar_midnights() {
+        let spring = chrono_tz::America::New_York
+            .with_ymd_and_hms(2026, 3, 8, 12, 0, 0)
+            .single()
+            .unwrap();
+        let fall = chrono_tz::America::New_York
+            .with_ymd_and_hms(2026, 11, 1, 12, 0, 0)
+            .single()
+            .unwrap();
+
+        let (spring_start, spring_end) = day_bounds_in_timezone(spring).unwrap();
+        let (fall_start, fall_end) = day_bounds_in_timezone(fall).unwrap();
+
+        assert_eq!((spring_end - spring_start).num_hours(), 23);
+        assert_eq!((fall_end - fall_start).num_hours(), 25);
+    }
+
+    #[test]
+    fn concurrent_water_adjustments_serialize() {
+        let root = tempdir().unwrap().keep();
+        let database = root.join("svarog.sqlite3");
+        drop(Store::open(&database).unwrap());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let database = database.clone();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                let store = Store::open(&database).unwrap();
+                barrier.wait();
+                store.adjust_water_today(200.0, UnitSystem::Metric).unwrap();
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        let store = Store::open(&database).unwrap();
+        assert_eq!(store.water_total_today().unwrap().milliliters, 400.0);
     }
 }

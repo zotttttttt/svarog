@@ -78,9 +78,9 @@ pub const CURRENT_ONBOARDING_STEPS: [&str; 12] = [
     STEP_ARM_AVAILABILITY,
     STEP_CAUTIOUS_BODY_PARTS,
     STEP_INJURIES,
-    STEP_ARCHETYPE,
-    STEP_EXERCISE_PREFERENCES,
     STEP_DESKTOP_NOTIFICATIONS,
+    STEP_EXERCISE_PREFERENCES,
+    STEP_ARCHETYPE,
 ];
 
 impl Onboarding {
@@ -1002,7 +1002,7 @@ mod tests {
         assert!(loaded.preferences.desktop_notifications);
         assert_eq!(
             loaded.onboarding.pending_steps(),
-            vec![STEP_ARCHETYPE, STEP_DESKTOP_NOTIFICATIONS]
+            vec![STEP_DESKTOP_NOTIFICATIONS, STEP_ARCHETYPE]
         );
         assert!(!loaded.onboarding.is_complete());
     }
@@ -1023,6 +1023,18 @@ mod tests {
 
         assert!(onboarding.is_complete());
         assert_eq!(onboarding.version, CURRENT_ONBOARDING_VERSION);
+    }
+
+    #[test]
+    fn onboarding_ends_with_notifications_preferences_then_archetype() {
+        assert_eq!(
+            &CURRENT_ONBOARDING_STEPS[CURRENT_ONBOARDING_STEPS.len() - 3..],
+            [
+                STEP_DESKTOP_NOTIFICATIONS,
+                STEP_EXERCISE_PREFERENCES,
+                STEP_ARCHETYPE,
+            ]
+        );
     }
 
     #[test]
