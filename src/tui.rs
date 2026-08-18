@@ -5656,7 +5656,6 @@ mod tests {
         assert!(rendered.contains("200 ml  [+/-] 200 ml"));
         assert!(rendered.contains("Today’s fuel\n120 kcal · P 3.0g · C 14.0g · F 5.0g · S 8.0g"));
         assert!(rendered.contains("Recent fuel"));
-        assert!(!rendered.contains("Today’s fuel"));
         assert!(!rendered.contains("Parse with Luna"));
         assert!(!rendered.contains("Today’s recent fuel"));
         assert!(rendered.contains("No meals or drinks logged yet."));
