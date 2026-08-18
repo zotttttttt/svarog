@@ -1193,19 +1193,24 @@ async fn wait_for_cancellation(cancel: Arc<AtomicBool>) {
 }
 
 fn openai_api_error_message(status: reqwest::StatusCode, body: &str) -> String {
-    const MAX_ERROR_CHARS: usize = 500;
-
-    let detail = serde_json::from_str::<serde_json::Value>(body)
-        .ok()
-        .and_then(|value| {
-            value
-                .pointer("/error/message")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned)
-        })
+    let error = serde_json::from_str::<serde_json::Value>(body).ok();
+    let detail = error
+        .as_ref()
+        .and_then(|value| value.pointer("/error/message"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
         .unwrap_or_default();
     let detail = detail.split_whitespace().collect::<Vec<_>>().join(" ");
-    let detail = detail.chars().take(MAX_ERROR_CHARS).collect::<String>();
+    let code = error
+        .as_ref()
+        .and_then(|value| value.pointer("/error/code"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|code| !code.is_empty());
+    let status = match code {
+        Some(code) => format!("{status} ({code})"),
+        None => status.to_string(),
+    };
     if detail.is_empty() {
         format!("OpenAI Responses API returned {status}")
     } else {
@@ -1805,21 +1810,24 @@ mod tests {
     }
 
     #[test]
-    fn openai_api_errors_include_a_bounded_sanitized_message() {
+    fn openai_api_errors_include_the_complete_sanitized_message() {
+        let detail = format!("unsupported\n schema {}", "x".repeat(600));
         let message = openai_api_error_message(
             reqwest::StatusCode::BAD_REQUEST,
             &json!({
                 "error": {
-                    "message": format!("unsupported\n schema {}", "x".repeat(600))
+                    "message": detail,
+                    "code": "credit_balance_exhausted"
                 }
             })
             .to_string(),
         );
 
-        assert!(message
-            .starts_with("OpenAI Responses API returned 400 Bad Request: unsupported schema"));
+        assert!(message.starts_with(
+            "OpenAI Responses API returned 400 Bad Request (credit_balance_exhausted): unsupported schema"
+        ));
         assert!(!message.contains('\n'));
-        assert!(message.chars().count() <= 560);
+        assert!(message.ends_with(&"x".repeat(600)));
         assert_eq!(
             openai_api_error_message(reqwest::StatusCode::BAD_GATEWAY, "not json"),
             "OpenAI Responses API returned 502 Bad Gateway"

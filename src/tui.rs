@@ -1405,13 +1405,17 @@ fn add_fuel_lines(
             muted(),
         )));
     }
-    if let Some(feedback) = state.feedback.as_deref() {
-        lines.push(Line::from(Span::styled(feedback.to_string(), muted())));
-    }
+    let feedback_lines = state
+        .feedback
+        .as_deref()
+        .map(|feedback| wrapped_styled_lines(feedback, width, muted()))
+        .unwrap_or_default();
+    let feedback_len = feedback_lines.len();
+    lines.extend(feedback_lines);
     let footer_len = if state.parsing.is_some() || state.confirming_delete {
-        2 + usize::from(state.feedback.is_some())
+        2 + feedback_len
     } else {
-        1 + usize::from(state.feedback.is_some())
+        1 + feedback_len
     };
     let footer = lines.split_off(lines.len().saturating_sub(footer_len));
     fuel_viewport(lines, footer, usize::from(area_height), state.scroll)
@@ -1537,10 +1541,12 @@ fn fuel_review_lines(
     );
     let controls_len = controls.len();
     lines.extend(controls);
-    if let Some(feedback) = feedback {
-        lines.push(Line::from(Span::styled(feedback.to_string(), accent())));
-    }
-    let footer_len = controls_len + usize::from(feedback.is_some());
+    let feedback_lines = feedback
+        .map(|feedback| wrapped_styled_lines(feedback, width, accent()))
+        .unwrap_or_default();
+    let feedback_len = feedback_lines.len();
+    lines.extend(feedback_lines);
+    let footer_len = controls_len + feedback_len;
     let footer = lines.split_off(lines.len().saturating_sub(footer_len));
     fuel_viewport(lines, footer, usize::from(area_height), scroll)
 }
@@ -5671,6 +5677,24 @@ mod tests {
             format_water_total(state.water, UnitSystem::Imperial),
             "6.8 US fl oz"
         );
+    }
+
+    #[test]
+    fn add_fuel_wraps_and_preserves_complete_error_feedback() {
+        let mut state = add_fuel_state_for_test();
+        let feedback = "Could not parse fuel: parsing meal or drink with OpenAI: OpenAI Responses API returned 429 Too Many Requests: You exceeded your current quota; check your plan and billing details.";
+        state.feedback = Some(feedback.into());
+
+        let lines = add_fuel_lines(&state, false, 40, 40);
+        assert!(lines
+            .iter()
+            .any(|line| { line.to_string() == feedback.chars().take(40).collect::<String>() }));
+        let rendered_without_line_breaks = lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(rendered_without_line_breaks.contains(feedback));
     }
 
     #[test]
