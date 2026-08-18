@@ -2,6 +2,13 @@
 
 Notable changes to Svarog are recorded here by the automated release process.
 
+## [0.5.1](https://github.com/zotttttttt/svarog/compare/v0.5.0...v0.5.1) (2026-08-18)
+
+
+### Fixes
+
+* Fix/food parsing error ([6c37d3b](https://github.com/zotttttttt/svarog/commit/6c37d3b0672931eef3392a6a3fce69d20341a933))
+
 ## [0.5.0](https://github.com/zotttttttt/svarog/compare/v0.4.0...v0.5.0) (2026-08-18)
 
 
