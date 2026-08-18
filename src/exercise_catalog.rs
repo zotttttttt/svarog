@@ -161,7 +161,7 @@ pub fn equipment_text_matches_entry(text: &str, entry: &ExerciseCatalogEntry) ->
     })
 }
 
-fn equipment_counts<'a>(available: &'a [String]) -> HashMap<&'a str, usize> {
+fn equipment_counts(available: &[String]) -> HashMap<&str, usize> {
     available.iter().fold(HashMap::new(), |mut counts, kind| {
         *counts.entry(kind.as_str()).or_insert(0usize) += 1;
         counts
