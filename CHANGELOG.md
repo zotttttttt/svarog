@@ -2,6 +2,24 @@
 
 Notable changes to Svarog are recorded here by the automated release process.
 
+## [0.5.0](https://github.com/zotttttttt/svarog/compare/v0.4.0...v0.5.0) (2026-08-18)
+
+
+### Features
+
+* add fuel and water logging ([f5a8420](https://github.com/zotttttttt/svarog/commit/f5a8420db8aaf7ba877236b91fb10d530d3d6854))
+* log whole-day fuel timelines ([0a1e9a8](https://github.com/zotttttttt/svarog/commit/0a1e9a82201717ee22e0c91ffab4acd0180a1ef1))
+* show daily nutrition summaries ([3c91a7f](https://github.com/zotttttttt/svarog/commit/3c91a7f9f7fa119f1fb5678fe606eadd2cab9dab))
+* support multiline fuel logging ([bb1adc5](https://github.com/zotttttttt/svarog/commit/bb1adc59dceb12cea17c71992cf40acd83a00094))
+
+
+### Fixes
+
+* Add fuel tracking and safer recommendations ([db09183](https://github.com/zotttttttt/svarog/commit/db091835c4114c1a5afb749b74134bc7dec26a27))
+* finish onboarding with archetype selection ([6c17549](https://github.com/zotttttttt/svarog/commit/6c1754909869613ba6fdf7f919a1f5f5ba3ea31b))
+* harden fuel logging workflow ([4f712a3](https://github.com/zotttttttt/svarog/commit/4f712a39e31768422e00578f53a34f529d1ab749))
+* show recent fuel across days ([3d29f5f](https://github.com/zotttttttt/svarog/commit/3d29f5f3810926cc09698808d82c2896ba956207))
+
 ## [0.4.0](https://github.com/zotttttttt/svarog/compare/v0.3.8...v0.4.0) (2026-08-15)
 
 
