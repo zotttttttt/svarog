@@ -207,7 +207,7 @@ fn resolve_timeline_at(
             parsed: FuelParseResult { items: event.items },
         });
     }
-    events.sort_by(|left, right| left.consumed_at.cmp(&right.consumed_at));
+    events.sort_by_key(|event| event.consumed_at);
     validate_timed_events(&events)?;
     Ok((events, inferred_yesterday))
 }
