@@ -7,7 +7,6 @@ use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Days, Local, NaiveDate, NaiveTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
@@ -177,7 +176,7 @@ fn resolve_timeline_at(
     };
 
     let mut previous_time = None;
-    let mut grouped = BTreeMap::<NaiveTime, (Vec<String>, Vec<FuelItem>)>::new();
+    let mut events = Vec::with_capacity(timeline.events.len());
     for (index, event) in timeline.events.into_iter().enumerate() {
         let explicit_time = event.time.as_deref().map(parse_meal_time).transpose()?;
         match (explicit_time, event.inherit_previous_time, index) {
@@ -198,29 +197,17 @@ fn resolve_timeline_at(
         if source_text.is_empty() || source_text.chars().count() > MAX_EVENT_SOURCE_CHARS {
             bail!("nutrition parser returned an invalid meal description");
         }
-        let (descriptions, items) = grouped.entry(time).or_default();
-        if !descriptions
-            .iter()
-            .any(|description| description == source_text)
-        {
-            descriptions.push(source_text.to_string());
-        }
-        items.extend(event.items);
-    }
-
-    let mut events = Vec::with_capacity(grouped.len());
-    for (time, (descriptions, items)) in grouped {
-        let parsed = FuelParseResult { items };
         let local = Local
             .from_local_datetime(&date.and_time(time))
             .earliest()
             .context("the requested local meal time does not exist")?;
         events.push(TimedFuelEvent {
             consumed_at: local.with_timezone(&Utc),
-            source_text: descriptions.join("; "),
-            parsed,
+            source_text: source_text.to_string(),
+            parsed: FuelParseResult { items: event.items },
         });
     }
+    events.sort_by(|left, right| left.consumed_at.cmp(&right.consumed_at));
     validate_timed_events(&events)?;
     Ok((events, inferred_yesterday))
 }
@@ -257,7 +244,6 @@ pub(crate) fn validate_parsed(parsed: &FuelParseResult) -> Result<()> {
     if parsed.items.len() > MAX_FUEL_ITEMS {
         bail!("nutrition parser returned too many items");
     }
-    let mut names = HashSet::new();
     for item in &parsed.items {
         if item.name.trim().is_empty() || item.name.chars().count() > 120 {
             bail!("nutrition parser returned an invalid item name");
@@ -298,15 +284,6 @@ pub(crate) fn validate_parsed(parsed: &FuelParseResult) -> Result<()> {
             || item.nutrition.sugar_g > item.nutrition.carbohydrates_g
         {
             bail!("nutrition parser returned implausible nutrition values");
-        }
-        let normalized_name = item
-            .name
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-            .to_lowercase();
-        if !names.insert(normalized_name) {
-            bail!("nutrition parser returned a duplicate item");
         }
         if item.assumptions.len() > 8
             || item
@@ -477,6 +454,8 @@ mod tests {
         assert!(!serialized.contains("minLength"));
         assert!(!serialized.contains("maxLength"));
         assert!(include_str!("../prompts/fuel_entry.j2").contains("no more than 40"));
+        assert!(include_str!("../prompts/fuel_entry.j2")
+            .contains("separate events even when they have the same time"));
         assert_eq!(
             schema["properties"]["events"]["items"]["properties"]["items"]["items"]
                 ["additionalProperties"],
@@ -606,23 +585,50 @@ mod tests {
     }
 
     #[test]
-    fn untimed_events_inherit_and_equal_times_merge() {
+    fn untimed_and_equal_time_events_remain_separate_in_input_order() {
         let (events, _) = resolve_timeline_at(
             timeline(None, &[Some("10:00"), None, Some("10:00")]),
             local_now(12),
         )
         .unwrap();
 
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].parsed.items.len(), 3);
-        assert_eq!(events[0].source_text, "meal 1; meal 2; meal 3");
+        assert_eq!(events.len(), 3);
         assert_eq!(
-            events[0]
+            events
+                .iter()
+                .map(|event| event.source_text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["meal 1", "meal 2", "meal 3"]
+        );
+        assert!(events.iter().all(|event| {
+            event
                 .consumed_at
                 .with_timezone(&Local)
                 .format("%H:%M")
-                .to_string(),
-            "10:00"
+                .to_string()
+                == "10:00"
+        }));
+    }
+
+    #[test]
+    fn equal_time_repeated_foods_are_separate_and_all_counted() {
+        let mut parsed = timeline(None, &[Some("11:00"), Some("11:00")]);
+        parsed.events[0].source_text = "espresso with 90 ml milk".into();
+        parsed.events[0].items[0].name = "milk".into();
+        parsed.events[1].source_text = "protein shake with 500 ml milk".into();
+        parsed.events[1].items[0].name = "milk".into();
+
+        let (events, _) = resolve_timeline_at(parsed, local_now(12)).unwrap();
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].source_text, "espresso with 90 ml milk");
+        assert_eq!(events[1].source_text, "protein shake with 500 ml milk");
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.parsed.totals().calories)
+                .sum::<f64>(),
+            800.0
         );
     }
 
@@ -652,15 +658,13 @@ mod tests {
     }
 
     #[test]
-    fn validation_rejects_duplicates_blank_units_and_cross_field_errors() {
+    fn validation_allows_repeated_items_and_rejects_other_invalid_fields() {
         let mut duplicate = parsed_item("Greek yogurt");
         let mut second = duplicate.items[0].clone();
         second.name = "  greek   YOGURT ".into();
         duplicate.items.push(second);
-        assert!(validate_parsed(&duplicate)
-            .unwrap_err()
-            .to_string()
-            .contains("duplicate"));
+        validate_parsed(&duplicate).unwrap();
+        assert_eq!(duplicate.totals().calories, 800.0);
 
         let mut blank_unit = parsed_item("tea");
         blank_unit.items[0].unit = Some("  ".into());

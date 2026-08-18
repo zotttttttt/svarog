@@ -19,8 +19,9 @@ Rules:
 - Calories, protein, carbohydrates, fat, fiber, sugar, sodium, and potassium must be finite and nonnegative.
 - Do not provide health advice, targets, diagnoses, or recommendations.
 - Include every food and drink mentioned by the user; do not omit products or time blocks.
+- Preserve separately stated meals or drinks as separate events even when they have the same time. Every consumed portion must contribute to nutrition totals.
 - Return no more than 40 food and drink items in total across all events. Combine repeated quantities of the same product within one event when appropriate.
-- Return each distinct product exactly once within a single event. The same product may appear again in another event.
+- Prefer each distinct product once within a single event, but never omit a separately consumed portion merely because its product name repeats.
 
 Context JSON:
 {{ context | tojson }}
