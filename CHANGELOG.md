@@ -2,6 +2,13 @@
 
 Notable changes to Svarog are recorded here by the automated release process.
 
+## [0.5.2](https://github.com/zotttttttt/svarog/compare/v0.5.1...v0.5.2) (2026-08-19)
+
+
+### Fixes
+
+* Feat/notifications improv ([a00e5c4](https://github.com/zotttttttt/svarog/commit/a00e5c4b6605c9e00764f1f27b65f9a11ecbfefe))
+
 ## [0.5.1](https://github.com/zotttttttt/svarog/compare/v0.5.0...v0.5.1) (2026-08-18)
 
 
