@@ -122,12 +122,8 @@ movement stays available until you finish, skip, or report pain—even if the
 agent turn that triggered it has ended.
 
 <p align="center">
-  <a href="./assets/1-idle-recommender-is-working.png">
-    <img width="42%" src="./assets/1-idle-recommender-is-working.png" alt="Svarog waiting dashboard while the OpenAI environment recommender prepares the next movement">
-  </a>
-  &nbsp;
   <a href="./assets/2-idle.png">
-    <img width="49%" src="./assets/2-idle.png" alt="Svarog idle dashboard showing the selected recommender, completed forges, repetitions, and OpenAI token usage">
+    <img width="49%" src="./assets/2-idle.png" alt="Svarog compact idle dashboard with Forge, Fuel, and API summaries">
   </a>
 </p>
 <p align="center"><sub>Svarog prepares the next movement while you work, then waits without interrupting your flow.</sub></p>
@@ -136,11 +132,28 @@ While waiting:
 
 | Key | Action |
 | --- | --- |
+| `↑` / `↓` | Select Forge, Fuel, or API |
+| `Enter` / `Esc` | Open the selected detail view / go back |
 | `f` | Start the next safe movement now |
 | `a` | Open Add fuel to log one meal, a whole day of meals, or today's plain-water intake |
-| `l` / `n` | View recent / upcoming movements |
+| `l` / `n` | From Forge details, view recent / upcoming movements |
 | `r` | Regenerate from the upcoming-movements view |
 | `s` | Open focus-driven Settings; use ↑/↓ to focus and ←/→ to change a field |
+
+<p align="center">
+  <a href="./assets/8-stats-forges.png">
+    <img width="30%" src="./assets/8-stats-forges.png" alt="Svarog Forge statistics showing today's and this week's completed movements and reps">
+  </a>
+  &nbsp;
+  <a href="./assets/9-stats-fuel.png">
+    <img width="30%" src="./assets/9-stats-fuel.png" alt="Svarog Fuel statistics showing calories, macros, and weight trend">
+  </a>
+  &nbsp;
+  <a href="./assets/10-stats-api.png">
+    <img width="30%" src="./assets/10-stats-api.png" alt="Svarog API usage statistics showing OpenAI token counts and cost">
+  </a>
+</p>
+<p align="center"><sub>Open Forge, Fuel, or API from the dashboard for a focused view of your recent activity.</sub></p>
 
 Add fuel uses `gpt-5.6-luna` through the selected Codex or OpenAI recommender
 to estimate calories, macros, fiber, sugar, sodium, and potassium. A description
