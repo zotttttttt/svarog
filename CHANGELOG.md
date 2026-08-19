@@ -2,6 +2,13 @@
 
 Notable changes to Svarog are recorded here by the automated release process.
 
+## [0.5.3](https://github.com/zotttttttt/svarog/compare/v0.5.2...v0.5.3) (2026-08-19)
+
+
+### Fixes
+
+* simplify idle dashboard and detail views ([54d9387](https://github.com/zotttttttt/svarog/commit/54d93876b68e7b926d148ea991d9828c41ec3fd8))
+
 ## [0.5.2](https://github.com/zotttttttt/svarog/compare/v0.5.1...v0.5.2) (2026-08-19)
 
 
