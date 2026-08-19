@@ -8,7 +8,8 @@ use crate::exercise_media::{self, PreparedGallery};
 use crate::fuel::{self, FuelParseOutcome};
 use crate::models::{
     AppStateKind, ForgeActivitySummary, FuelEntry, NutritionTotals, Recommendation,
-    RecommenderTokenProvider, RecommenderTokenUsageByProvider, SetStatus, WaterTotal,
+    RecommenderTokenProvider, RecommenderTokenUsageByProvider, SetStatus, TokenUsageTotals,
+    WaterTotal,
 };
 use crate::secrets;
 use crate::storage::{ForgeHistoryEntry, LoggedDayNutritionAverage, Store, WeightProgress};
@@ -3087,31 +3088,12 @@ fn recommender_usage_lines(
     } else {
         return Vec::new();
     };
+    let show_cost = !show_api_hint;
     let mut lines = vec![
         Line::from(""),
         Line::from(Span::styled(title, muted())),
-        Line::from(vec![
-            Span::styled("Today  ", muted()),
-            Span::styled(
-                format!(
-                    "{} / {}",
-                    compact_token_count(usage.today.input_tokens),
-                    compact_token_count(usage.today.output_tokens)
-                ),
-                text(),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("Week   ", muted()),
-            Span::styled(
-                format!(
-                    "{} / {}",
-                    compact_token_count(usage.week.input_tokens),
-                    compact_token_count(usage.week.output_tokens)
-                ),
-                text(),
-            ),
-        ]),
+        token_usage_line("Today  ", &usage.today, show_cost),
+        token_usage_line("Week   ", &usage.week, show_cost),
     ];
     if show_api_hint {
         lines.extend([
@@ -3128,6 +3110,37 @@ fn recommender_usage_lines(
         ]);
     }
     lines
+}
+
+fn token_usage_line(label: &str, totals: &TokenUsageTotals, show_cost: bool) -> Line<'static> {
+    let mut spans = vec![
+        Span::styled(label.to_string(), muted()),
+        Span::styled(compact_token_count(totals.input_tokens), muted()),
+    ];
+    if show_cost {
+        spans.push(Span::styled(
+            format!(" [{}]", luna_cost(totals.input_tokens, false)),
+            text(),
+        ));
+    }
+    spans.push(Span::styled(" / ", muted()));
+    spans.push(Span::styled(
+        compact_token_count(totals.output_tokens),
+        muted(),
+    ));
+    if show_cost {
+        spans.push(Span::styled(
+            format!(" [{}]", luna_cost(totals.output_tokens, true)),
+            text(),
+        ));
+    }
+    Line::from(spans)
+}
+
+fn luna_cost(tokens: u64, is_output: bool) -> String {
+    let rate_per_million = if is_output { 1.20_f64 } else { 0.20_f64 };
+    let cost = tokens as f64 * rate_per_million / 1_000_000.0;
+    format!("${cost:.2}")
 }
 
 fn compact_token_count(tokens: u64) -> String {
@@ -5003,6 +5016,50 @@ mod tests {
     }
 
     #[test]
+    fn luna_cost_uses_official_rates_rounded_to_cent() {
+        // Input: $0.20 per 1M tokens
+        assert_eq!(luna_cost(0, false), "$0.00");
+        assert_eq!(luna_cost(1_000, false), "$0.00");
+        assert_eq!(luna_cost(56_200, false), "$0.01");
+        assert_eq!(luna_cost(1_000_000, false), "$0.20");
+        assert_eq!(luna_cost(5_000_000, false), "$1.00");
+
+        // Output: $1.20 per 1M tokens
+        assert_eq!(luna_cost(0, true), "$0.00");
+        assert_eq!(luna_cost(21_700, true), "$0.03");
+        assert_eq!(luna_cost(1_000_000, true), "$1.20");
+        assert_eq!(luna_cost(2_500_000, true), "$3.00");
+    }
+
+    #[test]
+    fn token_usage_line_dims_counts_and_shows_cost_only_for_openai() {
+        let totals = TokenUsageTotals {
+            input_tokens: 56_200,
+            output_tokens: 21_700,
+        };
+
+        // Without cost (Codex): dimmed tokens, no brackets
+        let line = token_usage_line("Today  ", &totals, false);
+        assert_eq!(line.to_string(), "Today  56.2k / 21.7k");
+        for span in &line.spans {
+            assert_eq!(span.style, muted());
+        }
+
+        // With cost (OpenAI): dimmed tokens + white cost in brackets
+        let line = token_usage_line("Today  ", &totals, true);
+        assert_eq!(line.to_string(), "Today  56.2k [$0.01] / 21.7k [$0.03]");
+        let cost_spans: Vec<_> = line
+            .spans
+            .iter()
+            .filter(|s| s.content.starts_with(" [$"))
+            .collect();
+        assert_eq!(cost_spans.len(), 2);
+        for span in cost_spans {
+            assert_eq!(span.style, text());
+        }
+    }
+
+    #[test]
     fn demo_marker_is_appended_without_adding_a_line() {
         let marked = with_demo(Line::from("Settings"), true);
         let unmarked = with_demo(Line::from("Settings"), false);
@@ -5267,7 +5324,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(text.contains("Svarog OpenAI API tokens (in/out)"));
-        assert!(text.contains("Today  111.5k / 2.9k"));
+        assert!(text.contains("Today  111.5k [$0.02] / 2.9k [$0.00]"));
         assert!(!text.contains("12.4k / 320"));
         assert!(!text.contains("Use fewer Codex tokens"));
 

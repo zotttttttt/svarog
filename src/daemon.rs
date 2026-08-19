@@ -243,6 +243,14 @@ pub fn process_codex_hook(env: &RuntimeEnv, payload: CodexHookEvent) -> Result<(
 }
 
 pub fn process_event(env: &RuntimeEnv, payload: IncomingEvent) -> Result<EventResponse> {
+    process_event_with_notifier(env, payload, &notifications::notify)
+}
+
+fn process_event_with_notifier(
+    env: &RuntimeEnv,
+    payload: IncomingEvent,
+    notifier: &dyn Fn(bool, &str, &str) -> bool,
+) -> Result<EventResponse> {
     let paths = &env.paths;
     let config = load_or_default(paths)?;
     let store = Store::open(&paths.database_file)?;
@@ -258,11 +266,17 @@ pub fn process_event(env: &RuntimeEnv, payload: IncomingEvent) -> Result<EventRe
     }
 
     let state = store.state()?;
+    let open_recommendation = store.latest_open_recommendation()?;
     if matches!(
         state.kind,
         AppStateKind::Recommendation | AppStateKind::Active
-    ) || store.latest_open_recommendation()?.is_some()
+    ) || open_recommendation.is_some()
     {
+        if event.agent == Agent::Codex && event.event == "user_prompt_submit" {
+            if let Some(rec) = open_recommendation.as_ref() {
+                notify_recommendation(notifier, config.preferences.desktop_notifications, rec);
+            }
+        }
         return Ok(EventResponse {
             recommended: false,
             recommendation: None,
@@ -292,11 +306,7 @@ pub fn process_event(env: &RuntimeEnv, payload: IncomingEvent) -> Result<EventRe
         };
 
     if let Some(rec) = recommendation.as_ref() {
-        notifications::notify(
-            config.preferences.desktop_notifications,
-            "Svarog",
-            &format!("{} {}", rec.reps, rec.display_name()),
-        );
+        notify_recommendation(notifier, config.preferences.desktop_notifications, rec);
     }
     if store.queued_recommendation_count()? == 0 {
         refill_queue_best_effort(env);
@@ -306,6 +316,18 @@ pub fn process_event(env: &RuntimeEnv, payload: IncomingEvent) -> Result<EventRe
         recommendation,
         notice,
     })
+}
+
+fn notify_recommendation(
+    notifier: &dyn Fn(bool, &str, &str) -> bool,
+    enabled: bool,
+    recommendation: &Recommendation,
+) {
+    notifier(
+        enabled,
+        "Svarog",
+        &format!("{} {}", recommendation.reps, recommendation.display_name()),
+    );
 }
 
 pub fn refill_queue_best_effort(env: &RuntimeEnv) {
@@ -441,6 +463,7 @@ mod tests {
     use super::*;
     use crate::config::{Config, Paths, Recommender, RecommenderBackend, RuntimeMode};
     use crate::models::{Agent, Movement, MovementSidedness, MovementStatus, SetStatus};
+    use std::cell::RefCell;
     use tempfile::tempdir;
 
     fn test_env() -> RuntimeEnv {
@@ -461,6 +484,13 @@ mod tests {
             expected_duration_sec: Some(120),
             duration_sec: None,
             project: Some("svarog".into()),
+        }
+    }
+
+    fn codex_prompt_event() -> IncomingEvent {
+        IncomingEvent {
+            event: "user_prompt_submit".into(),
+            ..event()
         }
     }
 
@@ -774,29 +804,66 @@ mod tests {
     }
 
     #[test]
-    fn process_event_does_not_stack_when_forge_is_open() {
+    fn codex_prompts_repeat_notification_without_stacking_an_open_forge() {
         let env = test_env();
         let store = Store::open(&env.paths.database_file).unwrap();
         store.seed_movements().unwrap();
-        let config = Config {
+        let mut config = Config {
             recommender: Recommender {
                 backend: RecommenderBackend::Local,
                 ..Recommender::default()
             },
             ..Config::default()
         };
+        config.preferences.desktop_notifications = true;
         crate::config::save(&env.paths, &config).unwrap();
         recommender::fill_recommendation_queue(&store, &config, &env.paths).unwrap();
+        let delivered = RefCell::new(Vec::new());
+        let notifier = |enabled: bool, title: &str, message: &str| {
+            delivered
+                .borrow_mut()
+                .push((enabled, title.to_string(), message.to_string()));
+            true
+        };
 
-        assert!(!process_event(&env, event()).unwrap().recommended);
-        let first = process_event(&env, event()).unwrap();
-        let second = process_event(&env, event()).unwrap();
+        assert!(
+            !process_event_with_notifier(&env, codex_prompt_event(), &notifier)
+                .unwrap()
+                .recommended
+        );
+        let first = process_event_with_notifier(&env, codex_prompt_event(), &notifier).unwrap();
+        let offered_reminder =
+            process_event_with_notifier(&env, codex_prompt_event(), &notifier).unwrap();
 
         assert!(first.recommended);
-        assert!(!second.recommended);
+        assert!(!offered_reminder.recommended);
+        let recommendation = first.recommendation.unwrap();
         assert_eq!(
             store.latest_open_recommendation().unwrap().unwrap().id,
-            first.recommendation.unwrap().id
+            recommendation.id
+        );
+
+        let id = recommendation.id.unwrap();
+        store.mark_recommendation(id, "active").unwrap();
+        store
+            .set_state(AppStateKind::Active, Some(id), None, None)
+            .unwrap();
+        let active_reminder =
+            process_event_with_notifier(&env, codex_prompt_event(), &notifier).unwrap();
+
+        assert!(!active_reminder.recommended);
+        assert_eq!(
+            store.latest_open_recommendation().unwrap().unwrap().id,
+            Some(id)
+        );
+        let expected = (
+            true,
+            "Svarog".to_string(),
+            format!("{} {}", recommendation.reps, recommendation.display_name()),
+        );
+        assert_eq!(
+            delivered.into_inner(),
+            vec![expected.clone(), expected.clone(), expected]
         );
     }
 

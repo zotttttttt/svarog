@@ -1,4 +1,5 @@
 /target/
+/.factory/
 /.svarog-dev/
 .env
 .env.*
