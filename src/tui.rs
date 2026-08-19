@@ -36,7 +36,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use zeroize::Zeroizing;
 
 type Spark = (usize, usize, char, bool);
@@ -179,8 +179,8 @@ struct TuiState {
     exercise_media: Option<Receiver<Result<PreparedGallery, String>>>,
     exercise_media_id: Option<String>,
     exercise_media_feedback: Option<String>,
-    show_history: bool,
-    show_next: bool,
+    waiting_section: WaitingSection,
+    waiting_page: WaitingPage,
     queue_regeneration: Option<Receiver<QueueRegenerationResult>>,
     queue_regeneration_started_at: Option<Instant>,
     queue_regeneration_feedback: Option<QueueRegenerationFeedback>,
@@ -191,6 +191,43 @@ struct TuiState {
     saved_openai_key_available: Option<bool>,
     settings: Option<SettingsState>,
     add_fuel: Option<AddFuelState>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum WaitingSection {
+    #[default]
+    Forge,
+    Fuel,
+    Api,
+}
+
+impl WaitingSection {
+    fn previous(self) -> Self {
+        match self {
+            Self::Forge => Self::Api,
+            Self::Fuel => Self::Forge,
+            Self::Api => Self::Fuel,
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::Forge => Self::Fuel,
+            Self::Fuel => Self::Api,
+            Self::Api => Self::Forge,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum WaitingPage {
+    #[default]
+    Dashboard,
+    Forge,
+    Fuel,
+    Api,
+    History,
+    Next,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -361,7 +398,32 @@ struct ViewModel {
 struct BackendView {
     label: String,
     unavailable: bool,
+    #[allow(dead_code)]
     config_file: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackendProvider {
+    Local,
+    Codex,
+    OpenAi,
+    Unknown,
+}
+
+impl BackendView {
+    fn provider(&self) -> BackendProvider {
+        if self.label == RecommenderBackend::Local.label() {
+            BackendProvider::Local
+        } else if self.label == RecommenderBackend::Codex.label() {
+            BackendProvider::Codex
+        } else if self.label == RecommenderBackend::OpenaiEnv.label()
+            || self.label == RecommenderBackend::OpenaiKeyring.label()
+        {
+            BackendProvider::OpenAi
+        } else {
+            BackendProvider::Unknown
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -430,8 +492,7 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
             force_view_refresh = false;
         }
         if view.kind == ViewKind::Forge {
-            ui.show_history = false;
-            ui.show_next = false;
+            ui.waiting_page = WaitingPage::Dashboard;
         }
         reconcile_add_fuel_view(&mut ui, view.kind);
         sync_reps(&mut ui, view.recommendation.as_ref());
@@ -442,7 +503,7 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
             } else if let Some(add_fuel) = ui.add_fuel.as_ref() {
                 add_fuel_lines(add_fuel, ui.demo, frame.area().width, frame.area().height)
             } else {
-                screen_lines(&view, &ui, in_tmux)
+                screen_lines(&view, &ui, in_tmux, frame.area().width)
             };
             let mut paragraph = Paragraph::new(lines)
                 .style(Style::default().bg(colors::BG).fg(colors::TEXT))
@@ -495,6 +556,7 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
                     continue;
                 }
                 if matches!(view.kind, ViewKind::Idle | ViewKind::Cooldown)
+                    && ui.waiting_page == WaitingPage::Dashboard
                     && key.code == KeyCode::Char('s')
                 {
                     if let Ok(draft) = config::load_or_default(&env.paths) {
@@ -529,7 +591,7 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
                 if quit_requested(key) {
                     break Ok(());
                 }
-                if add_fuel_requested(key.code, view.kind, ui.show_history, ui.show_next) {
+                if add_fuel_requested(key.code, view.kind, ui.waiting_page) {
                     match open_add_fuel(env, &store) {
                         Ok(state) => ui.add_fuel = Some(state),
                         Err(error) => {
@@ -589,13 +651,13 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
                     ui.exercise_media_feedback = None;
                     continue;
                 }
-                if regenerate_queue_requested(key.code, view.kind, ui.show_next) {
+                if regenerate_queue_requested(key.code, view.kind, ui.waiting_page) {
                     if ui.queue_regeneration.is_none() {
                         apply_queue_regeneration_start(&mut ui, daemon::regenerate_queue(env));
                     }
                     continue;
                 }
-                if forge_now_requested(key.code, view.kind, ui.show_history) {
+                if forge_now_requested(key.code, view.kind, ui.waiting_page) {
                     ui.forge_now_feedback = None;
                     if ui.queue_regeneration.is_none() {
                         match daemon::forge_now(env) {
@@ -627,11 +689,7 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
                     }
                     continue;
                 }
-                if let Some(panel) =
-                    waiting_panel_for_key(key.code, view.kind, ui.show_history, ui.show_next)
-                {
-                    ui.show_history = panel == WaitingPanel::History;
-                    ui.show_next = panel == WaitingPanel::Next;
+                if handle_waiting_navigation(&mut ui, key.code, view.kind) {
                     continue;
                 }
                 match (key.code, view.kind, ui.skip_check) {
@@ -1647,18 +1705,43 @@ fn queue_regeneration_loader_frame(elapsed_ms: u128) -> usize {
     (elapsed_ms / 200) as usize % 6
 }
 
-fn view_lines(view: &ViewModel, ui: &TuiState) -> Vec<Line<'static>> {
-    if ui.show_history && matches!(view.kind, ViewKind::Idle | ViewKind::Cooldown) {
-        return history_lines(&view.history, ui.demo);
-    }
-    if ui.show_next && matches!(view.kind, ViewKind::Idle | ViewKind::Cooldown) {
-        return next_forge_lines(
-            &view.next_forges,
-            ui.demo,
-            queue_regeneration_loader(ui),
-            ui.queue_regeneration_feedback.as_ref(),
-            ui.forge_now_feedback.as_deref(),
-        );
+fn view_lines(view: &ViewModel, ui: &TuiState, area_width: u16) -> Vec<Line<'static>> {
+    if matches!(view.kind, ViewKind::Idle | ViewKind::Cooldown) {
+        match ui.waiting_page {
+            WaitingPage::History => return history_lines(&view.history, ui.demo),
+            WaitingPage::Next => {
+                return next_forge_lines(
+                    &view.next_forges,
+                    ui.demo,
+                    queue_regeneration_loader(ui),
+                    ui.queue_regeneration_feedback.as_ref(),
+                    ui.forge_now_feedback.as_deref(),
+                );
+            }
+            WaitingPage::Forge => {
+                return forge_detail_lines(
+                    &view.activity,
+                    ui.status_message.as_deref(),
+                    queue_regeneration_loader(ui),
+                    ui.queue_regeneration_feedback.as_ref(),
+                    ui.forge_now_feedback.as_deref(),
+                    ui.demo,
+                );
+            }
+            WaitingPage::Fuel => {
+                return fuel_detail_lines(
+                    &view.nutrition,
+                    view.nutrition_average.as_ref(),
+                    view.weight_progress,
+                    view.unit_system,
+                    ui.demo,
+                );
+            }
+            WaitingPage::Api => {
+                return api_detail_lines(&view.backend, &view.token_usage, ui.demo);
+            }
+            WaitingPage::Dashboard => {}
+        }
     }
     if ui.show_help && view.kind == ViewKind::Forge {
         return view
@@ -1676,53 +1759,15 @@ fn view_lines(view: &ViewModel, ui: &TuiState) -> Vec<Line<'static>> {
             })
             .unwrap_or_default();
     }
-    let mut lines = match view.kind {
+    let lines = match view.kind {
         ViewKind::Forge => view
             .recommendation
             .as_ref()
             .map(|rec| forge_lines(rec, ui))
-            .unwrap_or_else(|| {
-                idle_lines(
-                    &view.backend,
-                    &view.activity,
-                    &view.nutrition,
-                    view.nutrition_average.as_ref(),
-                    &view.token_usage,
-                    ui.status_message.as_deref(),
-                    queue_regeneration_loader(ui),
-                    ui.queue_regeneration_feedback.as_ref(),
-                    ui.forge_now_feedback.as_deref(),
-                    ui.demo,
-                )
-            }),
-        ViewKind::Cooldown => cooldown_lines(
-            &view.backend,
-            &view.activity,
-            &view.nutrition,
-            view.nutrition_average.as_ref(),
-            &view.token_usage,
-            ui.status_message.as_deref(),
-            queue_regeneration_loader(ui),
-            ui.queue_regeneration_feedback.as_ref(),
-            ui.forge_now_feedback.as_deref(),
-            ui.demo,
-        ),
-        ViewKind::Idle => idle_lines(
-            &view.backend,
-            &view.activity,
-            &view.nutrition,
-            view.nutrition_average.as_ref(),
-            &view.token_usage,
-            ui.status_message.as_deref(),
-            queue_regeneration_loader(ui),
-            ui.queue_regeneration_feedback.as_ref(),
-            ui.forge_now_feedback.as_deref(),
-            ui.demo,
-        ),
+            .unwrap_or_else(|| idle_lines(waiting_dashboard(view, ui, area_width), ui.demo)),
+        ViewKind::Cooldown => cooldown_lines(waiting_dashboard(view, ui, area_width), ui.demo),
+        ViewKind::Idle => idle_lines(waiting_dashboard(view, ui, area_width), ui.demo),
     };
-    if view.kind != ViewKind::Forge || view.recommendation.is_none() {
-        insert_weight_progress_line(&mut lines, view.weight_progress, view.unit_system);
-    }
     lines
 }
 
@@ -2783,12 +2828,19 @@ pub fn select_archetype(current: &Forge) -> Result<Forge> {
     result
 }
 
-fn screen_lines(view: &ViewModel, ui: &TuiState, in_tmux: bool) -> Vec<Line<'static>> {
-    let mut lines = view_lines(view, ui);
+fn screen_lines(
+    view: &ViewModel,
+    ui: &TuiState,
+    in_tmux: bool,
+    area_width: u16,
+) -> Vec<Line<'static>> {
+    let mut lines = view_lines(view, ui, area_width);
     if in_tmux {
         lines.extend(tmux_control_lines());
     }
-    lines.extend(quit_control_lines());
+    if view.kind == ViewKind::Forge {
+        lines.extend(quit_control_lines());
+    }
     lines
 }
 
@@ -2800,7 +2852,7 @@ fn help_scroll_limit(
     area_height: u16,
 ) -> u16 {
     let width = usize::from(area_width.max(1));
-    let rendered_height = screen_lines(view, ui, in_tmux)
+    let rendered_height = screen_lines(view, ui, in_tmux, area_width)
         .iter()
         .map(|line| line.width().max(1).div_ceil(width))
         .sum::<usize>();
@@ -2857,71 +2909,56 @@ fn exercise_help_lines(
     lines
 }
 
-#[allow(clippy::too_many_arguments)]
-fn idle_lines(
-    backend: &BackendView,
-    activity: &ForgeActivitySummary,
-    nutrition: &NutritionTotals,
-    nutrition_average: Option<&LoggedDayNutritionAverage>,
-    token_usage: &RecommenderTokenUsageByProvider,
-    status_message: Option<&str>,
+struct WaitingDashboard<'a> {
+    backend: &'a BackendView,
+    activity: &'a ForgeActivitySummary,
+    nutrition: &'a NutritionTotals,
+    nutrition_average: Option<&'a LoggedDayNutritionAverage>,
+    weight_progress: Option<WeightProgress>,
+    unit_system: UnitSystem,
+    token_usage: &'a RecommenderTokenUsageByProvider,
+    focused: WaitingSection,
+    status_message: Option<&'a str>,
     queue_loader_frame: Option<usize>,
-    queue_feedback: Option<&QueueRegenerationFeedback>,
-    forge_now_feedback: Option<&str>,
-    demo: bool,
-) -> Vec<Line<'static>> {
-    let mut lines = vec![
+    queue_feedback: Option<&'a QueueRegenerationFeedback>,
+    forge_now_feedback: Option<&'a str>,
+    area_width: u16,
+}
+
+fn waiting_dashboard<'a>(
+    view: &'a ViewModel,
+    ui: &'a TuiState,
+    area_width: u16,
+) -> WaitingDashboard<'a> {
+    WaitingDashboard {
+        backend: &view.backend,
+        activity: &view.activity,
+        nutrition: &view.nutrition,
+        nutrition_average: view.nutrition_average.as_ref(),
+        weight_progress: view.weight_progress,
+        unit_system: view.unit_system,
+        token_usage: &view.token_usage,
+        focused: ui.waiting_section,
+        status_message: ui.status_message.as_deref(),
+        queue_loader_frame: queue_regeneration_loader(ui),
+        queue_feedback: ui.queue_regeneration_feedback.as_ref(),
+        forge_now_feedback: ui.forge_now_feedback.as_deref(),
+        area_width,
+    }
+}
+
+fn idle_lines(data: WaitingDashboard<'_>, demo: bool) -> Vec<Line<'static>> {
+    waiting_dashboard_lines(
         with_demo(
             Line::from(Span::styled("Waiting for the next forge.", muted())),
             demo,
         ),
-        Line::from(""),
-        forge_now_control_line(),
-        forge_list_controls_line(),
-    ];
-    lines.extend(waiting_forge_now_lines(
-        queue_loader_frame,
-        queue_feedback,
-        forge_now_feedback,
-    ));
-    lines.push(Line::from(""));
-    lines.push(recommender_line(backend));
-    lines.push(settings_control_line());
-    if backend.label == RecommenderBackend::Local.label() {
-        lines.push(Line::from(Span::styled(
-            "Tip: Use Codex/OpenAI key recommender in Settings.",
-            muted(),
-        )));
-    }
-    lines.extend(activity_lines(activity));
-    lines.extend(nutrition_lines(nutrition, nutrition_average));
-    lines.extend(recommender_usage_lines(backend, token_usage));
-    if backend.unavailable {
-        lines.push(Line::from(Span::styled(
-            unavailable_backend_message(backend),
-            muted(),
-        )));
-    }
-    if let Some(message) = status_message {
-        lines.push(Line::from(Span::styled(message.to_string(), muted())));
-    }
-    lines
+        data,
+    )
 }
 
-#[allow(clippy::too_many_arguments)]
-fn cooldown_lines(
-    backend: &BackendView,
-    activity: &ForgeActivitySummary,
-    nutrition: &NutritionTotals,
-    nutrition_average: Option<&LoggedDayNutritionAverage>,
-    token_usage: &RecommenderTokenUsageByProvider,
-    status_message: Option<&str>,
-    queue_loader_frame: Option<usize>,
-    queue_feedback: Option<&QueueRegenerationFeedback>,
-    forge_now_feedback: Option<&str>,
-    demo: bool,
-) -> Vec<Line<'static>> {
-    let mut lines = vec![
+fn cooldown_lines(data: WaitingDashboard<'_>, demo: bool) -> Vec<Line<'static>> {
+    waiting_dashboard_lines(
         with_demo(
             Line::from(vec![
                 Span::styled("Forged. ", accent_bold()),
@@ -2929,128 +2966,161 @@ fn cooldown_lines(
             ]),
             demo,
         ),
-        Line::from(""),
-        forge_now_control_line(),
-        forge_list_controls_line(),
-    ];
+        data,
+    )
+}
+
+fn waiting_dashboard_lines(state: Line<'static>, data: WaitingDashboard<'_>) -> Vec<Line<'static>> {
+    let mut lines = vec![state, Line::from(""), forge_now_control_line()];
     lines.extend(waiting_forge_now_lines(
-        queue_loader_frame,
-        queue_feedback,
-        forge_now_feedback,
+        data.queue_loader_frame,
+        data.queue_feedback,
+        data.forge_now_feedback,
     ));
     lines.push(Line::from(""));
-    lines.push(recommender_line(backend));
-    lines.push(settings_control_line());
-    lines.extend(activity_lines(activity));
-    lines.extend(nutrition_lines(nutrition, nutrition_average));
-    lines.extend(recommender_usage_lines(backend, token_usage));
-    if backend.unavailable {
-        lines.push(Line::from(Span::styled(
-            unavailable_backend_message(backend),
-            muted(),
-        )));
-    }
-    if let Some(message) = status_message {
+    lines.push(waiting_summary_line(
+        WaitingSection::Forge,
+        data.focused,
+        forge_summary_text(data.activity, data.area_width),
+    ));
+    lines.push(waiting_summary_line(
+        WaitingSection::Fuel,
+        data.focused,
+        fuel_summary_text(
+            data.nutrition,
+            data.nutrition_average,
+            data.weight_progress,
+            data.unit_system,
+            data.area_width,
+        ),
+    ));
+    lines.push(waiting_summary_line(
+        WaitingSection::Api,
+        data.focused,
+        api_summary_text(data.backend, data.token_usage, data.area_width),
+    ));
+    lines.extend([
+        Line::from(""),
+        recommender_status_line(data.backend),
+        Line::from(""),
+        Line::from(Span::styled("↑↓ Select   Enter Open", muted())),
+        Line::from(Span::styled("[s] Settings   [q] Quit", muted())),
+    ]);
+    if let Some(message) = data.status_message {
         lines.push(Line::from(Span::styled(message.to_string(), muted())));
     }
     lines
 }
 
-fn activity_lines(activity: &ForgeActivitySummary) -> Vec<Line<'static>> {
-    vec![
-        Line::from(""),
-        Line::from(Span::styled("Completed:", muted())),
-        Line::from(vec![
-            Span::styled("Today ", muted()),
-            Span::styled(
-                format!(
-                    "{} forges / {} reps",
-                    activity.today.forges, activity.today.reps
-                ),
-                text(),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("Week ", muted()),
-            Span::styled(
-                format!(
-                    "{} forges / {} reps",
-                    activity.week.forges, activity.week.reps
-                ),
-                text(),
-            ),
-        ]),
-    ]
+fn waiting_summary_line(
+    section: WaitingSection,
+    focused: WaitingSection,
+    summary: String,
+) -> Line<'static> {
+    let marker = if section == focused { "> " } else { "  " };
+    let label = match section {
+        WaitingSection::Forge => "Forge",
+        WaitingSection::Fuel => "Fuel",
+        WaitingSection::Api => "API",
+    };
+    let label_style = if section == focused {
+        accent_bold()
+    } else {
+        text()
+    };
+    Line::from(vec![
+        Span::styled(
+            marker,
+            if section == focused {
+                accent()
+            } else {
+                muted()
+            },
+        ),
+        Span::styled(format!("{label:<8}"), label_style),
+        Span::styled(summary, text()),
+    ])
 }
 
-fn nutrition_lines(
-    nutrition: &NutritionTotals,
+fn forge_summary_text(activity: &ForgeActivitySummary, area_width: u16) -> String {
+    let full = format!(
+        "{} today · {} reps · {} this week",
+        activity.today.forges, activity.today.reps, activity.week.forges
+    );
+    fit_summary(full, area_width, || {
+        format!(
+            "{} today · {} week",
+            activity.today.forges, activity.week.forges
+        )
+    })
+}
+
+fn fuel_summary_text(
+    today: &NutritionTotals,
     average: Option<&LoggedDayNutritionAverage>,
-) -> Vec<Line<'static>> {
-    let mut lines = vec![
-        Line::from(""),
-        Line::from(Span::styled("Today’s fuel:", muted())),
-        nutrition_summary_line(nutrition),
-    ];
-    if let Some(average) = average {
-        let day_label = if average.logged_days == 1 {
-            "day"
-        } else {
-            "days"
-        };
-        lines.push(Line::from(Span::styled(
-            format!("Daily average fuel ({} {day_label}):", average.logged_days),
-            muted(),
-        )));
-        lines.push(nutrition_summary_line(&average.totals));
-    }
-    lines
-}
-
-fn insert_weight_progress_line(
-    lines: &mut Vec<Line<'static>>,
     progress: Option<WeightProgress>,
     unit_system: UnitSystem,
-) {
-    let Some(line) = weight_progress_line(progress, unit_system) else {
-        return;
+    area_width: u16,
+) -> String {
+    let nutrition = if has_nutrition(today) {
+        Some(today)
+    } else {
+        average.map(|value| &value.totals)
     };
-    if let Some(index) = lines.iter().rposition(|existing| {
-        let text = existing.to_string();
-        text == "Today’s fuel:" || text.starts_with("Daily average fuel (")
-    }) {
-        lines.insert(index + 2, line);
+    let Some(nutrition) = nutrition else {
+        return "No recent data".into();
+    };
+    let compact = format!(
+        "{:.0} kcal · {:.0}P",
+        nutrition.calories, nutrition.protein_g
+    );
+    let full = weight_trend_text(progress, unit_system)
+        .map(|weight| format!("{compact} · {weight}"))
+        .unwrap_or_else(|| compact.clone());
+    fit_summary(full, area_width, || compact)
+}
+
+fn api_summary_text(
+    backend: &BackendView,
+    usage: &RecommenderTokenUsageByProvider,
+    area_width: u16,
+) -> String {
+    if backend.provider() == BackendProvider::OpenAi {
+        let today_cost = api_cost(usage.openai.today);
+        let week_cost = api_cost(usage.openai.week);
+        let full = format!("{} today · {} week", today_cost, week_cost);
+        fit_summary(full, area_width, || {
+            format!("{today_cost} · {week_cost} week")
+        })
+    } else if backend.provider() == BackendProvider::Codex {
+        let full = format!(
+            "{} in · {} out today",
+            compact_token_count(usage.codex.today.input_tokens),
+            compact_token_count(usage.codex.today.output_tokens)
+        );
+        fit_summary(full, area_width, || {
+            format!(
+                "{}/{} today",
+                compact_token_count(usage.codex.today.input_tokens),
+                compact_token_count(usage.codex.today.output_tokens)
+            )
+        })
+    } else {
+        "No remote usage".into()
     }
 }
 
-fn weight_progress_line(
-    progress: Option<WeightProgress>,
-    unit_system: UnitSystem,
-) -> Option<Line<'static>> {
-    let progress = progress?;
-    let factor = if unit_system == UnitSystem::Metric {
-        1.0
+fn fit_summary(full: String, area_width: u16, compact: impl FnOnce() -> String) -> String {
+    const PREFIX_WIDTH: usize = 10;
+    if PREFIX_WIDTH + full.width() <= usize::from(area_width) {
+        full
     } else {
-        2.204_622_6
-    };
-    let delta = (progress.current_kg - progress.starting_kg) * factor;
-    if delta.abs() < 0.05 * factor {
-        return None;
+        compact()
     }
-    let (change, direction) = if delta < 0.0 {
-        (-delta, "lost")
-    } else {
-        (delta, "gained")
-    };
-    let unit = if unit_system == UnitSystem::Metric {
-        "kg"
-    } else {
-        "lb"
-    };
-    Some(Line::from(vec![
-        Span::styled("Weight: ", muted()),
-        Span::styled(format!("{change:.1} {unit} {direction}"), text()),
-    ]))
+}
+
+fn has_nutrition(nutrition: &NutritionTotals) -> bool {
+    nutrition.values().iter().any(|value| *value > 0.0)
 }
 
 fn nutrition_summary_line(nutrition: &NutritionTotals) -> Line<'static> {
@@ -3067,80 +3137,233 @@ fn nutrition_summary_line(nutrition: &NutritionTotals) -> Line<'static> {
     ))
 }
 
-fn unavailable_backend_message(backend: &BackendView) -> String {
-    if backend.label == RecommenderBackend::OpenaiKeyring.label() {
-        "Unavailable. Open Settings to save an OpenAI API key.".into()
-    } else {
-        format!("Unavailable. Edit: {}", backend.config_file)
-    }
-}
-
-fn recommender_usage_lines(
-    backend: &BackendView,
-    usage: &RecommenderTokenUsageByProvider,
+fn forge_detail_lines(
+    activity: &ForgeActivitySummary,
+    status_message: Option<&str>,
+    queue_loader_frame: Option<usize>,
+    queue_feedback: Option<&QueueRegenerationFeedback>,
+    forge_now_feedback: Option<&str>,
+    demo: bool,
 ) -> Vec<Line<'static>> {
-    let (title, usage, show_api_hint) = if backend.label == RecommenderBackend::Codex.label() {
-        ("Svarog Codex tokens (in/out)", &usage.codex, true)
-    } else if backend.label == RecommenderBackend::OpenaiEnv.label()
-        || backend.label == RecommenderBackend::OpenaiKeyring.label()
-    {
-        ("Svarog OpenAI API tokens (in/out)", &usage.openai, false)
-    } else {
-        return Vec::new();
-    };
-    let show_cost = !show_api_hint;
     let mut lines = vec![
+        with_demo(Line::from(Span::styled("Forge", text_bold())), demo),
         Line::from(""),
-        Line::from(Span::styled(title, muted())),
-        token_usage_line("Today  ", &usage.today, show_cost),
-        token_usage_line("Week   ", &usage.week, show_cost),
     ];
-    if show_api_hint {
-        lines.extend([
-            Line::from(""),
-            Line::from(Span::styled(
-                "Use fewer Codex tokens with an OpenAI API key (separate billing):",
-                muted(),
-            )),
-            Line::from(Span::styled("export OPENAI_API_KEY=\"...\"", muted())),
-            Line::from(Span::styled(
-                "Restart Svarog, then select [OpenAI (environment)] in Settings.",
-                muted(),
-            )),
-        ]);
+    lines.extend(forge_period_lines("Today", activity.today));
+    lines.push(Line::from(""));
+    lines.extend(forge_period_lines("This week", activity.week));
+    lines.extend([
+        Line::from(""),
+        forge_list_controls_line(),
+        Line::from(Span::styled("[f] Forge now", muted())),
+    ]);
+    lines.extend(waiting_forge_now_lines(
+        queue_loader_frame,
+        queue_feedback,
+        forge_now_feedback,
+    ));
+    if let Some(message) = status_message {
+        lines.push(Line::from(Span::styled(message.to_string(), muted())));
     }
+    lines.push(detail_footer_line());
     lines
 }
 
-fn token_usage_line(label: &str, totals: &TokenUsageTotals, show_cost: bool) -> Line<'static> {
-    let mut spans = vec![
-        Span::styled(label.to_string(), muted()),
-        Span::styled(compact_token_count(totals.input_tokens), muted()),
-    ];
-    if show_cost {
-        spans.push(Span::styled(
-            format!(" [{}]", luna_cost(totals.input_tokens, false)),
-            text(),
-        ));
-    }
-    spans.push(Span::styled(" / ", muted()));
-    spans.push(Span::styled(
-        compact_token_count(totals.output_tokens),
-        muted(),
-    ));
-    if show_cost {
-        spans.push(Span::styled(
-            format!(" [{}]", luna_cost(totals.output_tokens, true)),
-            text(),
-        ));
-    }
-    Line::from(spans)
+fn forge_period_lines(
+    label: &str,
+    totals: crate::models::ForgeActivityTotals,
+) -> Vec<Line<'static>> {
+    vec![
+        Line::from(Span::styled(label.to_string(), muted())),
+        Line::from(Span::styled(format!("  {} forges", totals.forges), text())),
+        Line::from(Span::styled(format!("  {} reps", totals.reps), text())),
+    ]
 }
 
-fn luna_cost(tokens: u64, is_output: bool) -> String {
-    let rate_per_million = if is_output { 1.20_f64 } else { 0.20_f64 };
-    let cost = tokens as f64 * rate_per_million / 1_000_000.0;
+fn fuel_detail_lines(
+    today: &NutritionTotals,
+    average: Option<&LoggedDayNutritionAverage>,
+    progress: Option<WeightProgress>,
+    unit_system: UnitSystem,
+    demo: bool,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        with_demo(Line::from(Span::styled("Fuel", text_bold())), demo),
+        Line::from(""),
+        Line::from(Span::styled("Today", muted())),
+    ];
+    lines.extend(nutrition_detail_lines(today));
+    if let Some(average) = average {
+        lines.extend([
+            Line::from(""),
+            Line::from(Span::styled(
+                format!("{}-day average", average.logged_days),
+                muted(),
+            )),
+        ]);
+        lines.extend(nutrition_detail_lines(&average.totals));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled("Weight", muted())));
+    lines.push(Line::from(Span::styled(
+        weight_trend_text(progress, unit_system).unwrap_or_else(|| "  No trend yet".into()),
+        text(),
+    )));
+    lines.extend([
+        Line::from(""),
+        Line::from(Span::styled("[a] Add fuel", muted())),
+        detail_footer_line(),
+    ]);
+    lines
+}
+
+fn nutrition_detail_lines(nutrition: &NutritionTotals) -> Vec<Line<'static>> {
+    vec![
+        Line::from(Span::styled(
+            format!("  {:.0} kcal", nutrition.calories),
+            text(),
+        )),
+        Line::from(Span::styled(
+            format!("  Protein    {:.0} g", nutrition.protein_g),
+            text(),
+        )),
+        Line::from(Span::styled(
+            format!("  Carbs      {:.0} g", nutrition.carbohydrates_g),
+            text(),
+        )),
+        Line::from(Span::styled(
+            format!("  Fat        {:.0} g", nutrition.fat_g),
+            text(),
+        )),
+        Line::from(Span::styled(
+            format!("  Sugar      {:.0} g", nutrition.sugar_g),
+            text(),
+        )),
+    ]
+}
+
+fn api_detail_lines(
+    backend: &BackendView,
+    usage: &RecommenderTokenUsageByProvider,
+    demo: bool,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        with_demo(Line::from(Span::styled("API usage", text_bold())), demo),
+        Line::from(""),
+    ];
+    let remote_usage = match backend.provider() {
+        BackendProvider::OpenAi => Some(("OpenAI", &usage.openai, true)),
+        BackendProvider::Codex => Some(("Codex", &usage.codex, false)),
+        BackendProvider::Local | BackendProvider::Unknown => None,
+    };
+    if let Some((provider, usage, show_cost)) = remote_usage {
+        lines.push(Line::from(Span::styled(provider, muted())));
+        lines.push(Line::from(""));
+        lines.extend(api_period_lines("Today", usage.today, show_cost));
+        lines.push(Line::from(""));
+        lines.extend(api_period_lines("This week", usage.week, show_cost));
+    } else {
+        let message = if backend.provider() == BackendProvider::Local {
+            "No remote usage."
+        } else {
+            "Usage unavailable."
+        };
+        lines.push(Line::from(Span::styled(message, muted())));
+    }
+    lines.extend([Line::from(""), detail_footer_line()]);
+    lines
+}
+
+fn api_period_lines(label: &str, totals: TokenUsageTotals, show_cost: bool) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(Span::styled(label.to_string(), muted())),
+        Line::from(Span::styled(
+            format!("  Input      {}", compact_token_count(totals.input_tokens)),
+            text(),
+        )),
+        Line::from(Span::styled(
+            format!("  Output     {}", compact_token_count(totals.output_tokens)),
+            text(),
+        )),
+    ];
+    lines.push(Line::from(Span::styled(
+        if show_cost {
+            format!("  Cost       {}", api_cost(totals))
+        } else {
+            "  Cost       unavailable".into()
+        },
+        text(),
+    )));
+    lines
+}
+
+fn detail_footer_line() -> Line<'static> {
+    Line::from(Span::styled("[Esc] Back   [q] Quit", muted()))
+}
+
+fn api_cost(totals: TokenUsageTotals) -> String {
+    let cost = totals.input_tokens as f64 * 0.20_f64 / 1_000_000.0
+        + totals.output_tokens as f64 * 1.20_f64 / 1_000_000.0;
     format!("${cost:.2}")
+}
+
+fn recommender_status_line(backend: &BackendView) -> Line<'static> {
+    let provider = match backend.provider() {
+        BackendProvider::OpenAi => "OpenAI",
+        BackendProvider::Codex => "Codex",
+        BackendProvider::Local => "Local",
+        BackendProvider::Unknown => "Recommender",
+    };
+    if backend.unavailable {
+        Line::from(Span::styled(
+            format!("⚠ {provider} unavailable"),
+            accent_bold(),
+        ))
+    } else {
+        Line::from(Span::styled(format!("{provider} · ready"), muted()))
+    }
+}
+
+struct WeightTrend {
+    arrow: &'static str,
+    change: f32,
+    unit: &'static str,
+}
+
+fn weight_trend_text(progress: Option<WeightProgress>, unit_system: UnitSystem) -> Option<String> {
+    let progress = progress?;
+    let trend = weight_trend(progress, unit_system)?;
+    Some(format!(
+        "{} {:.1} {}",
+        trend.arrow, trend.change, trend.unit
+    ))
+}
+
+fn weight_trend(progress: WeightProgress, unit_system: UnitSystem) -> Option<WeightTrend> {
+    let factor = if unit_system == UnitSystem::Metric {
+        1.0
+    } else {
+        2.204_622_6
+    };
+    let delta = (progress.current_kg - progress.starting_kg) * factor;
+    if delta.abs() < 0.05 * factor {
+        return None;
+    }
+    let (change, arrow) = if delta < 0.0 {
+        (-delta, "↓")
+    } else {
+        (delta, "↑")
+    };
+    let unit = if unit_system == UnitSystem::Metric {
+        "kg"
+    } else {
+        "lb"
+    };
+    Some(WeightTrend {
+        arrow,
+        change,
+        unit,
+    })
 }
 
 fn compact_token_count(tokens: u64) -> String {
@@ -3153,17 +3376,6 @@ fn compact_token_count(tokens: u64) -> String {
     };
     let formatted = format!("{value:.1}");
     format!("{}{suffix}", formatted.trim_end_matches(".0"))
-}
-
-fn recommender_line(backend: &BackendView) -> Line<'static> {
-    Line::from(vec![
-        Span::styled("Recommender: ", muted()),
-        Span::styled(format!("[{}]", backend.label), text()),
-    ])
-}
-
-fn settings_control_line() -> Line<'static> {
-    Line::from(Span::styled("[s] Settings", muted()))
 }
 
 fn tmux_control_lines() -> Vec<Line<'static>> {
@@ -3194,51 +3406,56 @@ fn increase_reps_requested(code: KeyCode) -> bool {
     matches!(code, KeyCode::Char('+') | KeyCode::Char('='))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WaitingPanel {
-    Main,
-    History,
-    Next,
-}
-
-fn waiting_panel_for_key(
-    code: KeyCode,
-    kind: ViewKind,
-    history_visible: bool,
-    next_visible: bool,
-) -> Option<WaitingPanel> {
+fn handle_waiting_navigation(ui: &mut TuiState, code: KeyCode, kind: ViewKind) -> bool {
     if !matches!(kind, ViewKind::Idle | ViewKind::Cooldown) {
-        return None;
+        return false;
     }
-    match code {
-        KeyCode::Char('l') => Some(WaitingPanel::History),
-        KeyCode::Char('n') => Some(WaitingPanel::Next),
-        KeyCode::Esc if history_visible || next_visible => Some(WaitingPanel::Main),
-        _ => None,
+    match (ui.waiting_page, code) {
+        (WaitingPage::Dashboard, KeyCode::Up) => {
+            ui.waiting_section = ui.waiting_section.previous();
+        }
+        (WaitingPage::Dashboard, KeyCode::Down) => {
+            ui.waiting_section = ui.waiting_section.next();
+        }
+        (WaitingPage::Dashboard, KeyCode::Enter) => {
+            ui.waiting_page = match ui.waiting_section {
+                WaitingSection::Forge => WaitingPage::Forge,
+                WaitingSection::Fuel => WaitingPage::Fuel,
+                WaitingSection::Api => WaitingPage::Api,
+            };
+        }
+        (WaitingPage::Forge, KeyCode::Char('l')) => ui.waiting_page = WaitingPage::History,
+        (WaitingPage::Forge, KeyCode::Char('n')) => ui.waiting_page = WaitingPage::Next,
+        (WaitingPage::History | WaitingPage::Next, KeyCode::Esc) => {
+            ui.waiting_page = WaitingPage::Forge;
+            ui.waiting_section = WaitingSection::Forge;
+        }
+        (WaitingPage::Forge | WaitingPage::Fuel | WaitingPage::Api, KeyCode::Esc) => {
+            ui.waiting_page = WaitingPage::Dashboard
+        }
+        _ => return false,
     }
+    true
 }
 
-fn forge_now_requested(code: KeyCode, kind: ViewKind, history_visible: bool) -> bool {
+fn forge_now_requested(code: KeyCode, kind: ViewKind, page: WaitingPage) -> bool {
     code == KeyCode::Char('f')
-        && !history_visible
         && matches!(kind, ViewKind::Idle | ViewKind::Cooldown)
+        && matches!(
+            page,
+            WaitingPage::Dashboard | WaitingPage::Forge | WaitingPage::Next
+        )
 }
 
-fn add_fuel_requested(
-    code: KeyCode,
-    kind: ViewKind,
-    history_visible: bool,
-    next_visible: bool,
-) -> bool {
+fn add_fuel_requested(code: KeyCode, kind: ViewKind, page: WaitingPage) -> bool {
     code == KeyCode::Char('a')
-        && !history_visible
-        && !next_visible
         && matches!(kind, ViewKind::Idle | ViewKind::Cooldown)
+        && matches!(page, WaitingPage::Dashboard | WaitingPage::Fuel)
 }
 
-fn regenerate_queue_requested(code: KeyCode, kind: ViewKind, next_visible: bool) -> bool {
+fn regenerate_queue_requested(code: KeyCode, kind: ViewKind, page: WaitingPage) -> bool {
     code == KeyCode::Char('r')
-        && next_visible
+        && page == WaitingPage::Next
         && matches!(kind, ViewKind::Idle | ViewKind::Cooldown)
 }
 
@@ -3354,7 +3571,7 @@ fn next_forge_lines(
             muted(),
         )));
     }
-    lines.push(Line::from(Span::styled("[esc] Back", muted())));
+    lines.push(detail_footer_line());
     lines
 }
 
@@ -3391,10 +3608,7 @@ fn history_lines_for_date(
             lines.push(history_entry_line(entry));
         }
     }
-    lines.extend([
-        Line::from(""),
-        Line::from(Span::styled("[esc] Back", muted())),
-    ]);
+    lines.extend([Line::from(""), detail_footer_line()]);
     lines
 }
 
@@ -3493,7 +3707,6 @@ fn forge_lines(rec: &Recommendation, ui: &TuiState) -> Vec<Line<'static>> {
     }
     lines.extend([
         Line::from(""),
-        Line::from(Span::styled("Target", muted())),
         Line::from(Span::styled(format!("{} reps", rec.reps), text_bold())),
         Line::from(""),
     ]);
@@ -4322,271 +4535,159 @@ mod tests {
     }
 
     #[test]
-    fn idle_lines_are_minimal() {
+    fn idle_dashboard_is_compact_and_focuses_forge() {
         let backend = BackendView {
-            label: "Codex".to_string(),
-            unavailable: false,
-            config_file: "/tmp/config.toml".to_string(),
-        };
-        let text = idle_lines(
-            &backend,
-            &ForgeActivitySummary::default(),
-            &NutritionTotals::default(),
-            None,
-            &RecommenderTokenUsageByProvider::default(),
-            None,
-            None,
-            None,
-            None,
-            false,
-        )
-        .into_iter()
-        .map(|line| line.to_string())
-        .collect::<Vec<_>>()
-        .join("\n");
-
-        assert!(!text.contains("⚒ Svarog"));
-        assert!(text.contains("Waiting for the next forge."));
-        assert!(text.contains("[l] Latest forges"));
-        assert!(text.contains("[n] Next forges"));
-        assert!(text.contains(
-            "Waiting for the next forge.\n\n[f] Forge now  [a] Add fuel\n[l] Latest forges [n] Next forges\n\nRecommender: [Codex]\n[s] Settings"
-        ));
-        assert!(text.contains("Recommender: [Codex]\n[s] Settings"));
-        assert!(!text.contains("[r] Change recommender"));
-        assert!(text.contains("Completed:"));
-        assert!(text.contains("Svarog Codex tokens (in/out)"));
-        assert!(text.contains("Today 0 forges / 0 reps"));
-        assert!(text.contains("Week 0 forges / 0 reps"));
-        assert!(text.contains("Use fewer Codex tokens with an OpenAI API key"));
-        assert!(text.contains("export OPENAI_API_KEY=\"...\""));
-        assert!(text.contains("Restart Svarog, then select [OpenAI (environment)] in Settings."));
-        assert!(!text.contains("sets"));
-    }
-
-    #[test]
-    fn idle_and_cooldown_lines_show_compact_codex_usage() {
-        let backend = BackendView {
-            label: "Codex".to_string(),
-            unavailable: false,
-            config_file: "/tmp/config.toml".to_string(),
-        };
-        let usage = RecommenderTokenUsageByProvider {
-            codex: RecommenderTokenUsageSummary {
-                today: TokenUsageTotals {
-                    input_tokens: 12_400,
-                    output_tokens: 320,
-                },
-                week: TokenUsageTotals {
-                    input_tokens: 58_100,
-                    output_tokens: 1_400,
-                },
-            },
-            openai: RecommenderTokenUsageSummary::default(),
-        };
-        let activity = ForgeActivitySummary {
-            today: ForgeActivityTotals {
-                forges: 3,
-                reps: 42,
-            },
-            week: ForgeActivityTotals {
-                forges: 12,
-                reps: 180,
-            },
-        };
-        let nutrition = NutritionTotals {
-            calories: 1_840.0,
-            protein_g: 122.0,
-            carbohydrates_g: 190.0,
-            fat_g: 61.0,
-            sugar_g: 38.0,
-            ..NutritionTotals::default()
-        };
-        let nutrition_average = LoggedDayNutritionAverage {
-            totals: NutritionTotals {
-                calories: 1_720.0,
-                protein_g: 110.0,
-                carbohydrates_g: 180.0,
-                fat_g: 58.0,
-                sugar_g: 34.0,
-                ..NutritionTotals::default()
-            },
-            logged_days: 7,
-        };
-
-        for lines in [
-            idle_lines(
-                &backend,
-                &activity,
-                &nutrition,
-                Some(&nutrition_average),
-                &usage,
-                None,
-                None,
-                None,
-                None,
-                false,
-            ),
-            cooldown_lines(
-                &backend,
-                &activity,
-                &nutrition,
-                Some(&nutrition_average),
-                &usage,
-                None,
-                None,
-                None,
-                None,
-                false,
-            ),
-        ] {
-            let text = lines
-                .into_iter()
-                .map(|line| line.to_string())
-                .collect::<Vec<_>>()
-                .join("\n");
-            assert!(text.contains("Completed:"));
-            assert!(text.contains("[l] Latest forges"));
-            assert!(text.contains("[n] Next forges"));
-            assert!(text.contains("Today 3 forges / 42 reps"));
-            assert!(text.contains("Week 12 forges / 180 reps"));
-            assert!(text.contains("Today’s fuel:"));
-            assert!(text.contains("1840 kcal · P 122.0g · C 190.0g · F 61.0g · S 38.0g"));
-            assert!(text.contains("Daily average fuel (7 days):"));
-            assert!(text.contains("1720 kcal · P 110.0g · C 180.0g · F 58.0g · S 34.0g"));
-            assert!(text.contains("Svarog Codex tokens (in/out)"));
-            assert!(text.contains("Today  12.4k / 320"));
-            assert!(text.contains("Week   58.1k / 1.4k"));
-            assert!(text.contains("Use fewer Codex tokens with an OpenAI API key"));
-            assert!(text.find("Completed:").unwrap() < text.find("Today’s fuel:").unwrap());
-            assert!(
-                text.find("Today’s fuel:").unwrap()
-                    < text.find("Daily average fuel (7 days):").unwrap()
-            );
-            assert!(
-                text.find("Daily average fuel (7 days):").unwrap()
-                    < text.find("Svarog Codex tokens (in/out)").unwrap()
-            );
-        }
-    }
-
-    #[test]
-    fn nutrition_average_uses_available_day_label_and_precedes_weight() {
-        let average = LoggedDayNutritionAverage {
-            totals: NutritionTotals {
-                calories: 900.0,
-                ..NutritionTotals::default()
-            },
-            logged_days: 1,
-        };
-        let mut lines = nutrition_lines(&NutritionTotals::default(), Some(&average));
-        insert_weight_progress_line(
-            &mut lines,
-            Some(WeightProgress {
-                starting_kg: 80.0,
-                current_kg: 77.0,
-            }),
-            UnitSystem::Metric,
-        );
-        let text = lines
-            .iter()
-            .map(|line| line.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        assert!(text.contains("Daily average fuel (1 day):"));
-        assert!(
-            text.find("Today’s fuel:").unwrap() < text.find("Daily average fuel (1 day):").unwrap()
-        );
-        assert!(
-            text.find("Daily average fuel (1 day):").unwrap()
-                < text.find("Weight: 3.0 kg lost").unwrap()
-        );
-        assert!(!nutrition_lines(&NutritionTotals::default(), None)
-            .iter()
-            .any(|line| line.to_string().starts_with("Daily average fuel (")));
-    }
-
-    #[test]
-    fn local_backend_hint_appears_only_on_the_idle_screen() {
-        let backend = BackendView {
-            label: RecommenderBackend::Local.label().into(),
+            label: RecommenderBackend::OpenaiEnv.label().into(),
             unavailable: false,
             config_file: "/tmp/config.toml".into(),
         };
-        let activity = ForgeActivitySummary::default();
-        let usage = RecommenderTokenUsageByProvider::default();
-        let hint = "Tip: Use Codex/OpenAI key recommender in Settings.";
-        let idle = idle_lines(
-            &backend,
-            &activity,
-            &NutritionTotals::default(),
-            None,
-            &usage,
-            None,
-            None,
-            None,
-            None,
+        let activity = ForgeActivitySummary {
+            today: ForgeActivityTotals { forges: 2, reps: 9 },
+            week: ForgeActivityTotals {
+                forges: 35,
+                reps: 210,
+            },
+        };
+        let nutrition = NutritionTotals {
+            calories: 2021.0,
+            protein_g: 148.0,
+            ..NutritionTotals::default()
+        };
+        let usage = RecommenderTokenUsageByProvider {
+            openai: RecommenderTokenUsageSummary {
+                today: TokenUsageTotals {
+                    input_tokens: 10_000,
+                    output_tokens: 15_000,
+                },
+                week: TokenUsageTotals {
+                    input_tokens: 30_000,
+                    output_tokens: 45_000,
+                },
+            },
+            ..RecommenderTokenUsageByProvider::default()
+        };
+        let lines = idle_lines(
+            WaitingDashboard {
+                backend: &backend,
+                activity: &activity,
+                nutrition: &nutrition,
+                nutrition_average: None,
+                weight_progress: Some(WeightProgress {
+                    starting_kg: 80.0,
+                    current_kg: 78.0,
+                }),
+                unit_system: UnitSystem::Metric,
+                token_usage: &usage,
+                focused: WaitingSection::Forge,
+                status_message: None,
+                queue_loader_frame: None,
+                queue_feedback: None,
+                forge_now_feedback: None,
+                area_width: 80,
+            },
             false,
-        )
-        .into_iter()
-        .map(|line| line.to_string())
-        .collect::<Vec<_>>()
-        .join("\n");
-        let cooldown = cooldown_lines(
-            &backend,
-            &activity,
-            &NutritionTotals::default(),
-            None,
-            &usage,
-            None,
-            None,
-            None,
-            None,
-            false,
-        )
-        .into_iter()
-        .map(|line| line.to_string())
-        .collect::<Vec<_>>()
-        .join("\n");
+        );
+        let text = lines
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
 
-        assert!(idle.contains(&format!("Recommender: [Local]\n[s] Settings\n{hint}")));
-        assert!(!cooldown.contains(hint));
+        assert_eq!(lines.len(), 12);
+        assert!(text.contains("> Forge   2 today · 9 reps · 35 this week"));
+        assert!(text.contains("  Fuel    2021 kcal · 148P · ↓ 2.0 kg"));
+        assert!(text.contains("  API     $0.02 today · $0.06 week"));
+        assert!(text.contains("OpenAI · ready"));
+        assert!(text.contains("↑↓ Select   Enter Open"));
+        assert!(text.contains("[s] Settings   [q] Quit"));
+        assert!(!text.contains("Latest forges"));
+        assert!(!text.contains("Input"));
     }
 
     #[test]
-    fn cooldown_status_combines_amber_forged_and_muted_waiting_text() {
-        let backend = BackendView {
-            label: "Codex".to_string(),
-            unavailable: false,
-            config_file: "/tmp/config.toml".to_string(),
+    fn summaries_compact_before_wrapping_and_fuel_falls_back_to_average() {
+        let average = LoggedDayNutritionAverage {
+            totals: NutritionTotals {
+                calories: 1999.0,
+                protein_g: 147.6,
+                ..NutritionTotals::default()
+            },
+            logged_days: 3,
         };
-        let lines = cooldown_lines(
-            &backend,
-            &ForgeActivitySummary::default(),
-            &NutritionTotals::default(),
-            None,
-            &RecommenderTokenUsageByProvider::default(),
-            None,
-            None,
-            None,
-            None,
-            false,
+        assert_eq!(
+            forge_summary_text(
+                &ForgeActivitySummary {
+                    today: ForgeActivityTotals { forges: 2, reps: 9 },
+                    week: ForgeActivityTotals {
+                        forges: 35,
+                        reps: 210
+                    },
+                },
+                34,
+            ),
+            "2 today · 35 week"
         );
-        let status = lines
-            .iter()
-            .find(|line| line.to_string() == "Forged. Waiting for the next forge.")
-            .expect("combined cooldown status line");
+        assert_eq!(
+            fuel_summary_text(
+                &NutritionTotals::default(),
+                Some(&average),
+                Some(WeightProgress {
+                    starting_kg: 80.0,
+                    current_kg: 78.0
+                }),
+                UnitSystem::Metric,
+                30,
+            ),
+            "1999 kcal · 148P"
+        );
+    }
 
-        assert_eq!(status.spans[0].style.fg, Some(colors::EMBER));
-        assert_eq!(status.spans[1].style.fg, Some(colors::MUTED));
-        assert!(lines.windows(5).any(|window| {
-            window[0].to_string() == "Forged. Waiting for the next forge."
-                && window[1].to_string().is_empty()
-                && window[2].to_string() == "[f] Forge now  [a] Add fuel"
-                && window[3].to_string() == "[l] Latest forges [n] Next forges"
-                && window[4].to_string().is_empty()
-        }));
+    #[test]
+    fn detail_views_group_full_metrics_vertically() {
+        let activity = ForgeActivitySummary {
+            today: ForgeActivityTotals { forges: 2, reps: 9 },
+            week: ForgeActivityTotals {
+                forges: 35,
+                reps: 210,
+            },
+        };
+        let forge = forge_detail_lines(&activity, None, None, None, None, false)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(forge.contains("Today\n  2 forges\n  9 reps"));
+        assert!(forge.contains("[l] Latest forges [n] Next forges"));
+
+        let average = LoggedDayNutritionAverage {
+            totals: NutritionTotals {
+                calories: 2021.0,
+                protein_g: 148.0,
+                carbohydrates_g: 169.0,
+                fat_g: 85.0,
+                sugar_g: 46.0,
+                ..NutritionTotals::default()
+            },
+            logged_days: 3,
+        };
+        let fuel = fuel_detail_lines(
+            &NutritionTotals::default(),
+            Some(&average),
+            Some(WeightProgress {
+                starting_kg: 80.0,
+                current_kg: 78.0,
+            }),
+            UnitSystem::Metric,
+            false,
+        )
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        assert!(fuel.contains("Today\n  0 kcal\n  Protein    0 g"));
+        assert!(fuel.contains("3-day average\n  2021 kcal\n  Protein    148 g"));
+        assert!(fuel.contains("Weight\n↓ 2.0 kg"));
+        assert!(fuel.contains("[a] Add fuel"));
     }
 
     #[test]
@@ -4623,17 +4724,11 @@ mod tests {
             history: Vec::new(),
             next_forges: Vec::new(),
         };
-        let text = view_lines(
-            &view,
-            &TuiState {
-                show_history: true,
-                ..TuiState::default()
-            },
-        )
-        .into_iter()
-        .map(|line| line.to_string())
-        .collect::<Vec<_>>()
-        .join("\n");
+        let text = view_lines(&view, &TuiState::default(), 80)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
 
         assert!(!text.contains("Svarog Codex tokens"));
         assert!(!text.contains("Completed:"));
@@ -4680,7 +4775,7 @@ mod tests {
         assert!(text.contains("Yesterday\n– Skipped · left curls"));
         assert!(!text.contains("Skipped · left curls · 12 kg"));
         assert!(text.contains("Dec 30, 2025\n! Pain · desk posture reset"));
-        assert!(text.contains("[esc] Back"));
+        assert!(text.contains("[Esc] Back   [q] Quit"));
     }
 
     #[test]
@@ -4697,54 +4792,62 @@ mod tests {
 
         assert!(text.contains("Latest forges"));
         assert!(text.contains("No forges yet."));
-        assert!(text.contains("[esc] Back"));
+        assert!(text.contains("[Esc] Back   [q] Quit"));
     }
 
     #[test]
-    fn forge_list_navigation_is_only_available_while_waiting() {
-        assert_eq!(
-            waiting_panel_for_key(KeyCode::Char('l'), ViewKind::Idle, false, false),
-            Some(WaitingPanel::History)
-        );
-        assert_eq!(
-            waiting_panel_for_key(KeyCode::Char('n'), ViewKind::Cooldown, false, false),
-            Some(WaitingPanel::Next)
-        );
-        assert_eq!(
-            waiting_panel_for_key(KeyCode::Esc, ViewKind::Idle, true, false),
-            Some(WaitingPanel::Main)
-        );
-        assert_eq!(
-            waiting_panel_for_key(KeyCode::Esc, ViewKind::Idle, false, false),
-            None
-        );
-        assert_eq!(
-            waiting_panel_for_key(KeyCode::Char('n'), ViewKind::Forge, false, false),
-            None
-        );
-        assert_eq!(
-            waiting_panel_for_key(KeyCode::Char('f'), ViewKind::Idle, false, true),
-            None
-        );
+    fn waiting_navigation_wraps_and_preserves_section_focus() {
+        let mut ui = TuiState::default();
+        assert_eq!(ui.waiting_section, WaitingSection::Forge);
+
+        assert!(handle_waiting_navigation(
+            &mut ui,
+            KeyCode::Up,
+            ViewKind::Idle
+        ));
+        assert_eq!(ui.waiting_section, WaitingSection::Api);
+        assert!(handle_waiting_navigation(
+            &mut ui,
+            KeyCode::Down,
+            ViewKind::Idle
+        ));
+        assert_eq!(ui.waiting_section, WaitingSection::Forge);
+        assert!(handle_waiting_navigation(
+            &mut ui,
+            KeyCode::Down,
+            ViewKind::Idle
+        ));
+        assert_eq!(ui.waiting_section, WaitingSection::Fuel);
+        assert!(handle_waiting_navigation(
+            &mut ui,
+            KeyCode::Enter,
+            ViewKind::Idle
+        ));
+        assert_eq!(ui.waiting_page, WaitingPage::Fuel);
+        assert!(handle_waiting_navigation(
+            &mut ui,
+            KeyCode::Esc,
+            ViewKind::Idle
+        ));
+        assert_eq!(ui.waiting_page, WaitingPage::Dashboard);
+        assert_eq!(ui.waiting_section, WaitingSection::Fuel);
+
+        ui.waiting_section = WaitingSection::Forge;
+        handle_waiting_navigation(&mut ui, KeyCode::Enter, ViewKind::Cooldown);
+        handle_waiting_navigation(&mut ui, KeyCode::Char('l'), ViewKind::Cooldown);
+        assert_eq!(ui.waiting_page, WaitingPage::History);
+        handle_waiting_navigation(&mut ui, KeyCode::Esc, ViewKind::Cooldown);
+        assert_eq!(ui.waiting_page, WaitingPage::Forge);
+
         assert!(forge_now_requested(
             KeyCode::Char('f'),
             ViewKind::Idle,
-            false
-        ));
-        assert!(forge_now_requested(
-            KeyCode::Char('f'),
-            ViewKind::Cooldown,
-            false
+            WaitingPage::Forge
         ));
         assert!(!forge_now_requested(
             KeyCode::Char('f'),
             ViewKind::Idle,
-            true
-        ));
-        assert!(!forge_now_requested(
-            KeyCode::Char('f'),
-            ViewKind::Forge,
-            false
+            WaitingPage::History
         ));
     }
 
@@ -4769,7 +4872,7 @@ mod tests {
         assert!(text.contains("1. 8 scapular squeezes"));
         assert!(text.contains("2. 10 left curls · 12 kg"));
         assert!(text.contains("[f] Forge now  [r] Regenerate forges"));
-        assert!(text.contains("[esc] Back"));
+        assert!(text.contains("[Esc] Back   [q] Quit"));
     }
 
     #[test]
@@ -4992,17 +5095,17 @@ mod tests {
         assert!(regenerate_queue_requested(
             KeyCode::Char('r'),
             ViewKind::Idle,
-            true
+            WaitingPage::Next
         ));
         assert!(!regenerate_queue_requested(
             KeyCode::Char('r'),
             ViewKind::Idle,
-            false
+            WaitingPage::Forge
         ));
         assert!(!regenerate_queue_requested(
             KeyCode::Char('r'),
             ViewKind::Forge,
-            true
+            WaitingPage::Next
         ));
     }
 
@@ -5016,47 +5119,66 @@ mod tests {
     }
 
     #[test]
-    fn luna_cost_uses_official_rates_rounded_to_cent() {
-        // Input: $0.20 per 1M tokens
-        assert_eq!(luna_cost(0, false), "$0.00");
-        assert_eq!(luna_cost(1_000, false), "$0.00");
-        assert_eq!(luna_cost(56_200, false), "$0.01");
-        assert_eq!(luna_cost(1_000_000, false), "$0.20");
-        assert_eq!(luna_cost(5_000_000, false), "$1.00");
-
-        // Output: $1.20 per 1M tokens
-        assert_eq!(luna_cost(0, true), "$0.00");
-        assert_eq!(luna_cost(21_700, true), "$0.03");
-        assert_eq!(luna_cost(1_000_000, true), "$1.20");
-        assert_eq!(luna_cost(2_500_000, true), "$3.00");
+    fn api_cost_combines_input_and_output_before_rounding() {
+        assert_eq!(api_cost(TokenUsageTotals::default()), "$0.00");
+        assert_eq!(
+            api_cost(TokenUsageTotals {
+                input_tokens: 56_200,
+                output_tokens: 21_700,
+            }),
+            "$0.04"
+        );
+        assert_eq!(
+            api_cost(TokenUsageTotals {
+                input_tokens: 1_000_000,
+                output_tokens: 1_000_000,
+            }),
+            "$1.40"
+        );
     }
 
     #[test]
-    fn token_usage_line_dims_counts_and_shows_cost_only_for_openai() {
-        let totals = TokenUsageTotals {
-            input_tokens: 56_200,
-            output_tokens: 21_700,
+    fn api_detail_keeps_tokens_and_provider_specific_cost() {
+        let usage = RecommenderTokenUsageByProvider {
+            codex: RecommenderTokenUsageSummary {
+                today: TokenUsageTotals {
+                    input_tokens: 56_200,
+                    output_tokens: 21_700,
+                },
+                week: TokenUsageTotals::default(),
+            },
+            openai: RecommenderTokenUsageSummary {
+                today: TokenUsageTotals {
+                    input_tokens: 56_200,
+                    output_tokens: 21_700,
+                },
+                week: TokenUsageTotals::default(),
+            },
         };
+        let openai = BackendView {
+            label: RecommenderBackend::OpenaiEnv.label().into(),
+            unavailable: false,
+            config_file: String::new(),
+        };
+        let text = api_detail_lines(&openai, &usage, false)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Input      56.2k"));
+        assert!(text.contains("Output     21.7k"));
+        assert!(text.contains("Cost       $0.04"));
 
-        // Without cost (Codex): dimmed tokens, no brackets
-        let line = token_usage_line("Today  ", &totals, false);
-        assert_eq!(line.to_string(), "Today  56.2k / 21.7k");
-        for span in &line.spans {
-            assert_eq!(span.style, muted());
-        }
-
-        // With cost (OpenAI): dimmed tokens + white cost in brackets
-        let line = token_usage_line("Today  ", &totals, true);
-        assert_eq!(line.to_string(), "Today  56.2k [$0.01] / 21.7k [$0.03]");
-        let cost_spans: Vec<_> = line
-            .spans
-            .iter()
-            .filter(|s| s.content.starts_with(" [$"))
-            .collect();
-        assert_eq!(cost_spans.len(), 2);
-        for span in cost_spans {
-            assert_eq!(span.style, text());
-        }
+        let codex = BackendView {
+            label: "Codex".into(),
+            ..openai
+        };
+        let text = api_detail_lines(&codex, &usage, false)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Cost       unavailable"));
     }
 
     #[test]
@@ -5076,37 +5198,31 @@ mod tests {
             config_file: "/tmp/config.toml".into(),
         };
         let activity = ForgeActivitySummary::default();
+        let nutrition = NutritionTotals::default();
         let usage = RecommenderTokenUsageByProvider::default();
         let recommendation = rec();
         let ui = TuiState {
             demo: true,
             ..TuiState::default()
         };
+        let dashboard = || WaitingDashboard {
+            backend: &backend,
+            activity: &activity,
+            nutrition: &nutrition,
+            nutrition_average: None,
+            weight_progress: None,
+            unit_system: UnitSystem::Metric,
+            token_usage: &usage,
+            focused: WaitingSection::Forge,
+            status_message: None,
+            queue_loader_frame: None,
+            queue_feedback: None,
+            forge_now_feedback: None,
+            area_width: 80,
+        };
         let screens = vec![
-            idle_lines(
-                &backend,
-                &activity,
-                &NutritionTotals::default(),
-                None,
-                &usage,
-                None,
-                None,
-                None,
-                None,
-                true,
-            ),
-            cooldown_lines(
-                &backend,
-                &activity,
-                &NutritionTotals::default(),
-                None,
-                &usage,
-                None,
-                None,
-                None,
-                None,
-                true,
-            ),
+            idle_lines(dashboard(), true),
+            cooldown_lines(dashboard(), true),
             next_forge_lines(&[], true, None, None, None),
             history_lines_for_date(&[], true, Local::now().date_naive()),
             forge_lines(&recommendation, &ui),
@@ -5129,23 +5245,22 @@ mod tests {
     }
 
     #[test]
-    fn recommender_line_styles_backend_in_text_color() {
+    fn recommender_status_is_compact_and_emphasizes_failures() {
         let backend = BackendView {
             label: "Codex".to_string(),
             unavailable: false,
             config_file: "/tmp/config.toml".to_string(),
         };
-        let line = recommender_line(&backend);
-
-        assert_eq!(line.spans[0].content.as_ref(), "Recommender: ");
+        let line = recommender_status_line(&backend);
+        assert_eq!(line.to_string(), "Codex · ready");
         assert_eq!(line.spans[0].style, muted());
-        assert_eq!(line.spans[1].content.as_ref(), "[Codex]");
-        assert_eq!(line.spans[1].style, text());
-        assert_eq!(line.spans.len(), 2);
 
-        let settings = settings_control_line();
-        assert_eq!(settings.to_string(), "[s] Settings");
-        assert_eq!(settings.spans[0].style, muted());
+        let unavailable = recommender_status_line(&BackendView {
+            unavailable: true,
+            ..backend
+        });
+        assert_eq!(unavailable.to_string(), "⚠ Codex unavailable");
+        assert_eq!(unavailable.spans[0].style, accent_bold());
     }
 
     #[test]
@@ -5261,22 +5376,31 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_backend_lines_include_config_path() {
+    fn unavailable_backend_is_prominent_without_configuration_source() {
         let backend = BackendView {
             label: "OpenAI (environment)".to_string(),
             unavailable: true,
             config_file: "/tmp/svarog/config.toml".to_string(),
         };
+        let activity = ForgeActivitySummary::default();
+        let nutrition = NutritionTotals::default();
+        let usage = RecommenderTokenUsageByProvider::default();
         let text = idle_lines(
-            &backend,
-            &ForgeActivitySummary::default(),
-            &NutritionTotals::default(),
-            None,
-            &RecommenderTokenUsageByProvider::default(),
-            None,
-            None,
-            None,
-            None,
+            WaitingDashboard {
+                backend: &backend,
+                activity: &activity,
+                nutrition: &nutrition,
+                nutrition_average: None,
+                weight_progress: None,
+                unit_system: UnitSystem::Metric,
+                token_usage: &usage,
+                focused: WaitingSection::Forge,
+                status_message: None,
+                queue_loader_frame: None,
+                queue_feedback: None,
+                forge_now_feedback: None,
+                area_width: 80,
+            },
             false,
         )
         .into_iter()
@@ -5284,15 +5408,13 @@ mod tests {
         .collect::<Vec<_>>()
         .join("\n");
 
-        assert!(text.contains("Recommender: [OpenAI (environment)]"));
-        assert!(text.contains("Unavailable. Edit: /tmp/svarog/config.toml"));
-        assert!(text.contains("Svarog OpenAI API tokens"));
-        assert!(!text.contains("Svarog Codex tokens"));
-        assert!(!text.contains("Use fewer Codex tokens"));
+        assert!(text.contains("⚠ OpenAI unavailable"));
+        assert!(!text.contains("(environment)"));
+        assert!(!text.contains("/tmp/svarog/config.toml"));
     }
 
     #[test]
-    fn each_remote_backend_shows_only_its_own_usage() {
+    fn api_summaries_follow_the_active_backend() {
         let usage = RecommenderTokenUsageByProvider {
             codex: RecommenderTokenUsageSummary {
                 today: TokenUsageTotals {
@@ -5318,22 +5440,26 @@ mod tests {
             unavailable: false,
             config_file: "/tmp/svarog/config.toml".into(),
         };
-        let text = recommender_usage_lines(&openai, &usage)
-            .into_iter()
-            .map(|line| line.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(text.contains("Svarog OpenAI API tokens (in/out)"));
-        assert!(text.contains("Today  111.5k [$0.02] / 2.9k [$0.00]"));
-        assert!(!text.contains("12.4k / 320"));
-        assert!(!text.contains("Use fewer Codex tokens"));
+        assert_eq!(
+            api_summary_text(&openai, &usage, 80),
+            "$0.03 today · $0.03 week"
+        );
 
         let local = BackendView {
             label: "Local".into(),
             unavailable: false,
             config_file: "/tmp/svarog/config.toml".into(),
         };
-        assert!(recommender_usage_lines(&local, &usage).is_empty());
+        assert_eq!(api_summary_text(&local, &usage, 80), "No remote usage");
+
+        let codex = BackendView {
+            label: "Codex".into(),
+            ..local
+        };
+        assert_eq!(
+            api_summary_text(&codex, &usage, 80),
+            "12.4k in · 320 out today"
+        );
     }
 
     #[test]
@@ -5343,16 +5469,25 @@ mod tests {
             unavailable: false,
             config_file: "/tmp/svarog/config.toml".to_string(),
         };
+        let activity = ForgeActivitySummary::default();
+        let nutrition = NutritionTotals::default();
+        let usage = RecommenderTokenUsageByProvider::default();
         let text = idle_lines(
-            &backend,
-            &ForgeActivitySummary::default(),
-            &NutritionTotals::default(),
-            None,
-            &RecommenderTokenUsageByProvider::default(),
-            Some("Could not update recommender. Edit: /tmp/svarog/config.toml"),
-            None,
-            None,
-            None,
+            WaitingDashboard {
+                backend: &backend,
+                activity: &activity,
+                nutrition: &nutrition,
+                nutrition_average: None,
+                weight_progress: None,
+                unit_system: UnitSystem::Metric,
+                token_usage: &usage,
+                focused: WaitingSection::Forge,
+                status_message: Some("Could not update recommender. Edit: /tmp/svarog/config.toml"),
+                queue_loader_frame: None,
+                queue_feedback: None,
+                forge_now_feedback: None,
+                area_width: 80,
+            },
             false,
         )
         .into_iter()
@@ -5381,6 +5516,7 @@ mod tests {
         assert!(text.contains("LEFT CURL"));
         assert!(text.contains("12 kg"));
         assert!(text.contains("10 reps"));
+        assert!(!text.contains("Target"));
         assert!(text.contains("15"));
         assert!(text.contains("[i] How to"));
     }
@@ -5555,7 +5691,7 @@ mod tests {
     }
 
     #[test]
-    fn quit_hint_is_the_last_line_for_every_screen_layout() {
+    fn quit_hint_remains_visible_with_tmux_help() {
         let view = ViewModel {
             kind: ViewKind::Idle,
             recommendation: None,
@@ -5575,8 +5711,10 @@ mod tests {
         };
 
         for in_tmux in [false, true] {
-            let lines = screen_lines(&view, &TuiState::default(), in_tmux);
-            assert_eq!(lines.last().unwrap().to_string(), "[q] Quit");
+            let lines = screen_lines(&view, &TuiState::default(), in_tmux, 80);
+            assert!(lines
+                .iter()
+                .any(|line| line.to_string().contains("[q] Quit")));
         }
     }
 
@@ -5645,36 +5783,26 @@ mod tests {
     }
 
     #[test]
-    fn add_fuel_shortcut_is_limited_to_unobscured_waiting_screens() {
+    fn add_fuel_shortcut_is_available_on_dashboard_and_fuel_detail() {
         assert!(add_fuel_requested(
             KeyCode::Char('a'),
             ViewKind::Idle,
-            false,
-            false
+            WaitingPage::Dashboard
         ));
         assert!(add_fuel_requested(
             KeyCode::Char('a'),
             ViewKind::Cooldown,
-            false,
-            false
+            WaitingPage::Fuel
         ));
         assert!(!add_fuel_requested(
             KeyCode::Char('a'),
             ViewKind::Forge,
-            false,
-            false
+            WaitingPage::Dashboard
         ));
         assert!(!add_fuel_requested(
             KeyCode::Char('a'),
             ViewKind::Idle,
-            true,
-            false
-        ));
-        assert!(!add_fuel_requested(
-            KeyCode::Char('a'),
-            ViewKind::Idle,
-            false,
-            true
+            WaitingPage::History
         ));
     }
 
@@ -5766,8 +5894,8 @@ mod tests {
     }
 
     #[test]
-    fn weight_progress_renders_lost_and_gained_in_selected_units() {
-        let lost = weight_progress_line(
+    fn weight_trend_uses_arrows_and_selected_units() {
+        let lost = weight_trend_text(
             Some(WeightProgress {
                 starting_kg: 80.0,
                 current_kg: 77.0,
@@ -5775,9 +5903,9 @@ mod tests {
             UnitSystem::Metric,
         )
         .unwrap();
-        assert_eq!(lost.to_string(), "Weight: 3.0 kg lost");
+        assert_eq!(lost, "↓ 3.0 kg");
 
-        let gained = weight_progress_line(
+        let gained = weight_trend_text(
             Some(WeightProgress {
                 starting_kg: 70.0,
                 current_kg: 71.0,
@@ -5785,9 +5913,9 @@ mod tests {
             UnitSystem::Imperial,
         )
         .unwrap();
-        assert_eq!(gained.to_string(), "Weight: 2.2 lb gained");
+        assert_eq!(gained, "↑ 2.2 lb");
 
-        assert!(weight_progress_line(None, UnitSystem::Metric).is_none());
+        assert!(weight_trend_text(None, UnitSystem::Metric).is_none());
     }
 
     #[test]
