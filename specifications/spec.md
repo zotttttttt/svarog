@@ -291,8 +291,9 @@ Next likely: shoulders or walk.
   restored with a completion checkmark after success. Manual regeneration and
   automatic refill never run concurrently; `r` is a silent no-op while an
   automatic refresh is active.
-* When enabled, a desktop notification appears once when a forge becomes
-  actionable. Agent/TUI startup, completion, and queue prefill do not notify.
+* When enabled, a desktop notification appears when a forge becomes actionable.
+  Each later Codex prompt repeats the same notification while that forge remains
+  incomplete. Agent/TUI startup, completion, and queue prefill do not notify.
 * Single-key actions inside TUI:
 
   * `d` done
