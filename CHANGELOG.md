@@ -2,6 +2,16 @@
 
 Notable changes to Svarog are recorded here by the automated release process.
 
+## [0.6.1](https://github.com/zotttttttt/svarog/compare/v0.6.0...v0.6.1) (2026-08-20)
+
+
+### Fixes
+
+* Chore/security ([cc56903](https://github.com/zotttttttt/svarog/commit/cc569039a1f0cad9b8a746b15b2e7b6c1259682f))
+* enforce dependency security policy ([03ef3e3](https://github.com/zotttttttt/svarog/commit/03ef3e3b54204ecb5cacc3ddb3b8f931082716c1))
+* harden local API and release updates ([00363f2](https://github.com/zotttttttt/svarog/commit/00363f2bc19ed446fd380945e546192784aa48de))
+* make Rust bootstrap guidance-only ([8f4aecd](https://github.com/zotttttttt/svarog/commit/8f4aecd6a1a3b8b6c7189330575fe671fc524324))
+
 ## [0.6.0](https://github.com/zotttttttt/svarog/compare/v0.5.5...v0.6.0) (2026-08-20)
 
 
