@@ -2,6 +2,19 @@
 
 Notable changes to Svarog are recorded here by the automated release process.
 
+## [0.6.0](https://github.com/zotttttttt/svarog/compare/v0.5.5...v0.6.0) (2026-08-20)
+
+
+### Features
+
+* add crates.io and release installer distribution ([a781481](https://github.com/zotttttttt/svarog/commit/a781481da788664cace2d8497d3b2b7b02716ee9))
+* add crates.io and release installer distribution ([bebb01f](https://github.com/zotttttttt/svarog/commit/bebb01fd19120bd6cb0bcbc04a35365ace79abb1))
+
+
+### Fixes
+
+* include gzip in installer test environment ([c5e15b0](https://github.com/zotttttttt/svarog/commit/c5e15b09246b29b199eabd028a983ea5cc6b43b7))
+
 ## [0.5.5](https://github.com/zotttttttt/svarog/compare/v0.5.4...v0.5.5) (2026-08-20)
 
 
