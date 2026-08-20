@@ -12,6 +12,9 @@ cargo test --locked
 cargo run -- demo
 ```
 
+`scripts/bootstrap` checks these prerequisites but does not download or update
+the toolchain.
+
 The demo stores all state under `./.svarog-dev`; it does not use production
 Svarog data or hooks.
 
@@ -19,16 +22,15 @@ Svarog data or hooks.
 
 ## Update a development install
 
-Run the project launcher after changing the checkout. It detects source
-changes, offers to reinstall the binary, and then continues with the command
-you passed:
+Run the project launcher with `--update` after changing the checkout. It
+reinstalls the binary and then continues with the command you passed:
 
 ```bash
-scripts/svarog run
+scripts/svarog --update run
 ```
 
-Control that prompt with `SVAROG_UPDATE=always`, `ask`, or `never`. You can also
-install directly:
+Without `--update`, the launcher keeps using the currently installed binary and
+prints a reminder when the checkout changed. You can also install directly:
 
 ```bash
 cargo install --locked --path . --force

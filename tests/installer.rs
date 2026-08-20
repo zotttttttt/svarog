@@ -12,6 +12,7 @@ struct InstallerFixture {
     release_dir: PathBuf,
     install_dir: PathBuf,
     download_log: PathBuf,
+    installer: PathBuf,
     target: String,
 }
 
@@ -22,6 +23,7 @@ impl InstallerFixture {
         let release_dir = root.path().join("release files");
         let install_dir = root.path().join("installed bin");
         let download_log = root.path().join("downloads.log");
+        let installer = root.path().join("svarog-installer.sh");
         fs::create_dir_all(&fake_bin).unwrap();
         fs::create_dir_all(&release_dir).unwrap();
 
@@ -76,12 +78,21 @@ printf '%s  %s\n' "$SVAROG_TEST_ACTUAL_CHECKSUM" "$last"
         write_executable(&fake_bin.join("shasum"), checksum_script);
 
         let target = target_for(os, arch).unwrap().to_owned();
+        let generated =
+            fs::read_to_string(format!("{}/scripts/install", env!("CARGO_MANIFEST_DIR")))
+                .unwrap()
+                .replace("@SVAROG_VERSION@", VERSION)
+                .replace("@SVAROG_SHA256_AARCH64_APPLE_DARWIN@", CHECKSUM)
+                .replace("@SVAROG_SHA256_X86_64_APPLE_DARWIN@", CHECKSUM)
+                .replace("@SVAROG_SHA256_X86_64_UNKNOWN_LINUX_GNU@", CHECKSUM);
+        write_executable(&installer, &generated);
         let fixture = Self {
             _root: root,
             fake_bin,
             release_dir,
             install_dir,
             download_log,
+            installer,
             target,
         };
         fixture.write_release(VERSION);
@@ -105,11 +116,6 @@ printf '%s  %s\n' "$SVAROG_TEST_ACTUAL_CHECKSUM" "$last"
             .status()
             .unwrap();
         assert!(status.success());
-        fs::write(
-            self.release_dir.join("SHA256SUMS"),
-            format!("{CHECKSUM}  {archive}\n"),
-        )
-        .unwrap();
     }
 
     fn run(&self, os: &str, arch: &str) -> Output {
@@ -119,10 +125,9 @@ printf '%s  %s\n' "$SVAROG_TEST_ACTUAL_CHECKSUM" "$last"
     fn command(&self, os: &str, arch: &str) -> Command {
         let mut command = Command::new("/bin/bash");
         command
-            .arg(format!("{}/scripts/install", env!("CARGO_MANIFEST_DIR")))
+            .arg(&self.installer)
             .env("PATH", &self.fake_bin)
             .env("HOME", self._root.path().join("home"))
-            .env("SVAROG_INSTALLER_VERSION", VERSION)
             .env("SVAROG_INSTALL_DIR", &self.install_dir)
             .env("SVAROG_RELEASE_BASE_URL", "https://example.test/release")
             .env("SVAROG_TEST_OS", os)
@@ -182,7 +187,7 @@ fn installer_maps_every_supported_platform_to_its_release_archive() {
         );
         let downloads = fs::read_to_string(&fixture.download_log).unwrap();
         assert!(downloads.contains(&format!("svarog-{VERSION}-{}.tar.gz", fixture.target)));
-        assert!(downloads.contains("SHA256SUMS"));
+        assert!(!downloads.contains("SHA256SUMS"));
     }
 }
 
@@ -293,20 +298,19 @@ fn installer_stops_on_a_checksum_mismatch_without_replacing_the_binary() {
 }
 
 #[test]
-fn installer_stops_when_the_checksum_entry_is_missing() {
+fn installer_stops_when_the_embedded_checksum_is_missing() {
     let fixture = InstallerFixture::new("Linux", "x86_64");
-    fs::write(
-        fixture.release_dir.join("SHA256SUMS"),
-        format!("{CHECKSUM}  some-other-archive.tar.gz\n"),
-    )
-    .unwrap();
+    let template = fs::read_to_string(format!("{}/scripts/install", env!("CARGO_MANIFEST_DIR")))
+        .unwrap()
+        .replace("@SVAROG_VERSION@", VERSION);
+    write_executable(&fixture.installer, &template);
 
     let output = fixture.run("Linux", "x86_64");
 
     assert!(!output.status.success());
     assert!(String::from_utf8(output.stderr)
         .unwrap()
-        .contains("does not contain an entry"));
+        .contains("does not contain a valid embedded checksum"));
     assert!(!fixture.install_dir.join("svarog").exists());
 }
 

@@ -191,6 +191,7 @@ Example endpoint:
 
 ```http
 POST localhost:8787/events
+Authorization: Bearer <contents of collector.token>
 ```
 
 Event:

@@ -259,6 +259,7 @@ where
     config::save(&env.paths, &config)?;
     let store = Store::open(&env.paths.database_file)?;
     store.reset_all_data()?;
+    crate::collector_auth::rotate(&env.paths)?;
     Ok(cleanup())
 }
 
@@ -1554,6 +1555,7 @@ mod tests {
             config.onboarding.mark_completed(step);
         }
         config::save(&env.paths, &config).unwrap();
+        let original_token = crate::collector_auth::rotate(&env.paths).unwrap();
         let store = Store::open(&env.paths.database_file).unwrap();
         store
             .insert_event(&crate::models::AgentEvent {
@@ -1581,6 +1583,10 @@ mod tests {
         assert_eq!(store.event_count().unwrap(), 0);
         assert!(store.removed_exercise_ids().unwrap().is_empty());
         assert_eq!(store.state().unwrap().kind, AppStateKind::Idle);
+        assert_ne!(
+            crate::collector_auth::load(&env.paths).unwrap().as_str(),
+            original_token.as_str()
+        );
         assert_eq!(
             cleanup_warning.as_deref(),
             Some("credential store is locked")

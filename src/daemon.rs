@@ -1,3 +1,4 @@
+use crate::collector_auth;
 use crate::config::{load_or_default, Config, RuntimeEnv};
 use crate::engine;
 use crate::models::{Agent, AppStateKind, CodexHookEvent, IncomingEvent, Recommendation};
@@ -6,8 +7,10 @@ use crate::recommender;
 use crate::secrets;
 use crate::storage::Store;
 use anyhow::{bail, Context, Result};
-use axum::extract::State;
-use axum::http::StatusCode;
+use axum::extract::{DefaultBodyLimit, Request, State};
+use axum::http::{header::AUTHORIZATION, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Serialize;
@@ -18,10 +21,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 use tokio::sync::{oneshot, Mutex};
+use zeroize::Zeroizing;
 
 struct AppState {
     env: RuntimeEnv,
     accept_codex: bool,
+    collector_token: Zeroizing<String>,
     event_lock: Mutex<()>,
 }
 
@@ -85,12 +90,12 @@ pub async fn run() -> Result<()> {
     let _openai_key_cache_guard = secrets::openai_key_cache_guard(&env.paths);
     env.paths.ensure()?;
     let addr = env.daemon_addr;
-    refill_queue_best_effort(&env);
-    let app = router(env, false);
-
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("binding daemon to {addr}"))?;
+    let collector_token = collector_auth::rotate(&env.paths)?;
+    refill_queue_best_effort(&env);
+    let app = router(env, false, collector_token);
     axum::serve(listener, app).await.context("running daemon")
 }
 
@@ -106,9 +111,10 @@ impl Collector {
                     "starting Svarog collector on {addr}; if an older Svarog daemon is still running, stop it once and retry"
                 )
             })?;
+        let collector_token = collector_auth::rotate(&env.paths)?;
         #[cfg(test)]
         let bound_addr = listener.local_addr().context("reading collector address")?;
-        let app = router(env.clone(), true);
+        let app = router(env.clone(), true, collector_token);
         let (shutdown, shutdown_rx) = oneshot::channel();
         let task = tokio::spawn(async move {
             axum::serve(listener, app)
@@ -181,23 +187,49 @@ impl Drop for TuiLock {
     }
 }
 
-fn router(env: RuntimeEnv, accept_codex: bool) -> Router {
-    let state = AppState {
+fn router(env: RuntimeEnv, accept_codex: bool, collector_token: Zeroizing<String>) -> Router {
+    let state = Arc::new(AppState {
         env,
         accept_codex,
+        collector_token,
         event_lock: Mutex::new(()),
-    };
-    Router::new()
-        .route("/health", get(|| async { "ok" }))
+    });
+    let protected = Router::new()
         .route("/events", post(handle_event))
         .route("/hooks/codex", post(handle_codex_hook))
-        .with_state(Arc::new(state))
+        .layer(DefaultBodyLimit::max(64 * 1024))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_collector_auth,
+        ));
+    Router::new()
+        .route("/health", get(|| async { "ok" }))
+        .merge(protected)
+        .with_state(state)
+}
+
+async fn require_collector_auth(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let header = request
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok());
+    if !collector_auth::bearer_matches(header, &state.collector_token) {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    }
+    next.run(request).await
 }
 
 async fn handle_event(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<IncomingEvent>,
 ) -> Result<Json<EventResponse>, (StatusCode, String)> {
+    payload
+        .validate()
+        .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
     let _guard = state.event_lock.lock().await;
     process_event(&state.env, payload)
         .map(Json)
@@ -208,6 +240,9 @@ async fn handle_codex_hook(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<CodexHookEvent>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    payload
+        .validate()
+        .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
     if !state.accept_codex {
         return Ok(StatusCode::NO_CONTENT);
     }
@@ -218,6 +253,7 @@ async fn handle_codex_hook(
 }
 
 pub fn process_codex_hook(env: &RuntimeEnv, payload: CodexHookEvent) -> Result<()> {
+    payload.validate()?;
     let store = Store::open(&env.paths.database_file)?;
     match payload.hook_event_name.as_str() {
         "SessionStart" => {
@@ -243,6 +279,7 @@ pub fn process_codex_hook(env: &RuntimeEnv, payload: CodexHookEvent) -> Result<(
 }
 
 pub fn process_event(env: &RuntimeEnv, payload: IncomingEvent) -> Result<EventResponse> {
+    payload.validate()?;
     process_event_with_notifier(env, payload, &notifications::notify)
 }
 
@@ -1028,6 +1065,7 @@ mod tests {
         let state = Arc::new(AppState {
             env: env.clone(),
             accept_codex: true,
+            collector_token: Zeroizing::new("a".repeat(64)),
             event_lock: Mutex::new(()),
         });
         let mut second = codex_hook("UserPromptSubmit", Some("turn-2"));
@@ -1054,6 +1092,7 @@ mod tests {
         let state = Arc::new(AppState {
             env: env.clone(),
             accept_codex: false,
+            collector_token: Zeroizing::new("a".repeat(64)),
             event_lock: Mutex::new(()),
         });
 
@@ -1088,9 +1127,38 @@ mod tests {
         };
         let url = format!("http://{}/hooks/codex", collector.addr());
         let client = reqwest::Client::new();
+        let token = collector_auth::load(&env.paths).unwrap();
+
+        let unauthorized = client
+            .post(&url)
+            .json(&codex_hook("UserPromptSubmit", Some("turn-0")))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let oversized = client
+            .post(&url)
+            .bearer_auth(token.as_str())
+            .header("content-type", "application/json")
+            .body(format!(r#"{{"session_id":"{}"}}"#, "x".repeat(70_000)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let invalid = client
+            .post(&url)
+            .bearer_auth(token.as_str())
+            .json(&codex_hook("Unknown", Some("turn-invalid")))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
 
         let response = client
             .post(&url)
+            .bearer_auth(token.as_str())
             .json(&codex_hook("UserPromptSubmit", Some("turn-1")))
             .send()
             .await

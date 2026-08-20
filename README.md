@@ -67,33 +67,36 @@ collected or sent in recommendation requests. See
 
 ## Get started
 
-You need macOS or Linux. The release installer does not require Rust. `tmux` is
+You need macOS or Linux and the GitHub CLI (`gh`) to verify the release
+installer. The installer does not require Rust. `tmux` is
 optional and only needed for `svarog session codex`. Linux desktop notifications
 require a graphical session with a notification daemon and `notify-send`
 (provided by `libnotify-bin` on Debian and Ubuntu).
 
 ### Install with the release installer
 
-The installer selects the release for your computer, verifies its SHA-256
-checksum, and installs `svarog` to `$HOME/.local/bin`:
+Download a versioned installer, verify its GitHub build-provenance attestation,
+then run it. The installer selects the release for your computer, verifies its
+embedded SHA-256 checksum, and installs `svarog` to `$HOME/.local/bin`:
 
 ```bash
-curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/zotttttttt/svarog/releases/latest/download/svarog-installer.sh \
-  | bash
+release="$(gh release view --repo zotttttttt/svarog --json tagName --jq .tagName)"
+gh release download "$release" --repo zotttttttt/svarog --pattern svarog-installer.sh --clobber
+gh attestation verify svarog-installer.sh --repo zotttttttt/svarog
+bash svarog-installer.sh
 ```
 
 It does not use `sudo` or edit your shell configuration. If `$HOME/.local/bin`
-is not already on `PATH`, it prints the exact line to add. Rerun the same command
-to upgrade. Set `SVAROG_INSTALL_DIR` on `bash` to choose another absolute path:
+is not already on `PATH`, it prints the exact line to add. Repeat the verified
+download to upgrade. Set `SVAROG_INSTALL_DIR` on `bash` to choose another
+absolute path:
 
 ```bash
-curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/zotttttttt/svarog/releases/latest/download/svarog-installer.sh \
-  | SVAROG_INSTALL_DIR="$HOME/bin" bash
+SVAROG_INSTALL_DIR="$HOME/bin" bash svarog-installer.sh
 ```
 
-Release binaries are not currently code-signed or notarized.
+Release files carry GitHub build-provenance attestations. The macOS binaries are
+not currently Apple code-signed or notarized.
 
 ### Install with Cargo
 
@@ -125,10 +128,14 @@ Download the archive for your computer from the
 | Intel macOS | `x86_64-apple-darwin` |
 | 64-bit Intel/AMD Linux | `x86_64-unknown-linux-gnu` |
 
-Verify it against `SHA256SUMS`, extract it, and place `svarog` on your `PATH`:
+Verify the downloaded archive's attestation and checksum, extract it, and place
+`svarog` on your `PATH`:
 
 ```bash
 archive="svarog-VERSION-TARGET"
+gh attestation verify "$archive.tar.gz" --repo zotttttttt/svarog
+# Linux: grep "  $archive.tar.gz$" SHA256SUMS | sha256sum --check
+# macOS: grep "  $archive.tar.gz$" SHA256SUMS | shasum -a 256 --check
 tar -xzf "$archive.tar.gz"
 mkdir -p "$HOME/.local/bin"
 install -m 755 "$archive/svarog" "$HOME/.local/bin/svarog"
@@ -141,9 +148,15 @@ scripts/bootstrap
 scripts/svarog
 ```
 
-The bootstrap checks Rust; the launcher installs Svarog, guides you through
-setup, connects Codex, and opens the dashboard. Press Enter to accept the
-conservative defaults.
+The bootstrap checks for a Rust toolchain but never downloads or installs one.
+Rust is needed only to build from a checkout; the verified release installer
+above works without Rust. The launcher installs Svarog, guides you through setup,
+connects Codex, and opens the dashboard. Press Enter to accept the conservative
+defaults.
+
+After changing the checkout, run `scripts/svarog --update` to rebuild and
+install it explicitly. Without `--update`, the launcher keeps running the
+currently installed binary.
 
 After setup, run Svarog in its own terminal:
 

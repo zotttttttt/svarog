@@ -53,7 +53,6 @@ exit 2
             &new_binary,
             r#"#!/bin/sh
 printf 'new\n' > "$SVAROG_TEST_RESULT"
-printf 'skip=<%s>\n' "${SVAROG_SKIP_SELF_UPDATE:-}" >> "$SVAROG_TEST_RESULT"
 for argument in "$@"; do
   printf '<%s>\n' "$argument" >> "$SVAROG_TEST_RESULT"
 done
@@ -64,7 +63,6 @@ done
                 &fake_bin.join("svarog"),
                 r#"#!/bin/sh
 printf 'old\n' > "$SVAROG_TEST_RESULT"
-printf 'skip=<%s>\n' "${SVAROG_SKIP_SELF_UPDATE:-}" >> "$SVAROG_TEST_RESULT"
 for argument in "$@"; do
   printf '<%s>\n' "$argument" >> "$SVAROG_TEST_RESULT"
 done
@@ -82,7 +80,7 @@ done
         }
     }
 
-    fn run(&self, policy: &str, arguments: &[&str], install_fails: bool) -> Output {
+    fn run(&self, arguments: &[&str], install_fails: bool) -> Output {
         let path = self.fake_bin.display().to_string();
         Command::new("bash")
             .arg(format!("{}/scripts/svarog", env!("CARGO_MANIFEST_DIR")))
@@ -90,7 +88,6 @@ done
             .env("PATH", path)
             .env("HOME", self._root.path())
             .env("CARGO_HOME", &self.cargo_home)
-            .env("SVAROG_UPDATE", policy)
             .env("SVAROG_TEST_RESULT", &self.result)
             .env("SVAROG_TEST_INSTALL_LOG", &self.install_log)
             .env("SVAROG_TEST_NEW_BINARY", &self.new_binary)
@@ -100,6 +97,11 @@ done
             )
             .output()
             .unwrap()
+    }
+
+    fn remove_rust(&self) {
+        fs::remove_file(self.fake_bin.join("rustc")).unwrap();
+        fs::remove_file(self.fake_bin.join("cargo")).unwrap();
     }
 }
 
@@ -124,12 +126,12 @@ fn link_command(directory: &Path, command: &str) {
 fn launcher_updates_changed_checkout_and_forwards_exact_arguments() {
     let fixture = LauncherFixture::new(true);
 
-    let output = fixture.run("always", &["demo", "two words"], false);
+    let output = fixture.run(&["--update", "demo", "two words"], false);
 
     assert!(output.status.success(), "{:?}", output);
     assert_eq!(
         fs::read_to_string(&fixture.result).unwrap(),
-        "new\nskip=<1>\n<demo>\n<two words>\n"
+        "new\n<demo>\n<two words>\n"
     );
     assert_eq!(
         fs::read_to_string(&fixture.install_log).unwrap(),
@@ -141,9 +143,9 @@ fn launcher_updates_changed_checkout_and_forwards_exact_arguments() {
 #[test]
 fn launcher_skips_install_when_fingerprint_matches() {
     let fixture = LauncherFixture::new(true);
-    assert!(fixture.run("always", &["status"], false).status.success());
+    assert!(fixture.run(&["--update", "status"], false).status.success());
 
-    let output = fixture.run("always", &["demo"], false);
+    let output = fixture.run(&["demo"], false);
 
     assert!(output.status.success(), "{:?}", output);
     assert_eq!(
@@ -152,7 +154,7 @@ fn launcher_skips_install_when_fingerprint_matches() {
     );
     assert_eq!(
         fs::read_to_string(&fixture.result).unwrap(),
-        "new\nskip=<1>\n<demo>\n"
+        "new\n<demo>\n"
     );
 }
 
@@ -160,28 +162,43 @@ fn launcher_skips_install_when_fingerprint_matches() {
 fn launcher_can_run_existing_binary_without_updating() {
     let fixture = LauncherFixture::new(true);
 
-    let output = fixture.run("never", &["status"], false);
+    let output = fixture.run(&["status"], false);
 
     assert!(output.status.success(), "{:?}", output);
     assert_eq!(
         fs::read_to_string(&fixture.result).unwrap(),
-        "old\nskip=<1>\n<status>\n"
+        "old\n<status>\n"
     );
     assert!(!fixture.install_log.exists());
     assert!(!fixture.cargo_home.join(".svarog-install-state").exists());
+    assert!(String::from_utf8(output.stderr)
+        .unwrap()
+        .contains("scripts/svarog --update"));
 }
 
 #[test]
-fn launcher_installs_when_binary_is_missing_even_if_updates_are_disabled() {
-    let fixture = LauncherFixture::new(false);
+fn launcher_can_run_existing_binary_without_rust() {
+    let fixture = LauncherFixture::new(true);
+    fixture.remove_rust();
 
-    let output = fixture.run("never", &[], false);
+    let output = fixture.run(&["status"], false);
 
     assert!(output.status.success(), "{:?}", output);
     assert_eq!(
         fs::read_to_string(&fixture.result).unwrap(),
-        "new\nskip=<1>\n"
+        "old\n<status>\n"
     );
+    assert!(!fixture.install_log.exists());
+}
+
+#[test]
+fn launcher_installs_when_binary_is_missing() {
+    let fixture = LauncherFixture::new(false);
+
+    let output = fixture.run(&[], false);
+
+    assert!(output.status.success(), "{:?}", output);
+    assert_eq!(fs::read_to_string(&fixture.result).unwrap(), "new\n");
     assert_eq!(
         fs::read_to_string(&fixture.install_log).unwrap(),
         "install\n"
@@ -189,10 +206,40 @@ fn launcher_installs_when_binary_is_missing_even_if_updates_are_disabled() {
 }
 
 #[test]
+fn launcher_requires_rust_only_when_a_build_is_needed() {
+    let fixture = LauncherFixture::new(false);
+    fixture.remove_rust();
+
+    let output = fixture.run(&[], false);
+
+    assert!(!output.status.success());
+    assert!(!fixture.result.exists());
+    assert!(!fixture.install_log.exists());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("verified prebuilt release"));
+    assert!(stdout.contains("https://rustup.rs"));
+}
+
+#[test]
+fn explicit_update_does_not_fall_back_when_rust_is_missing() {
+    let fixture = LauncherFixture::new(true);
+    fixture.remove_rust();
+
+    let output = fixture.run(&["--update", "status"], false);
+
+    assert!(!output.status.success());
+    assert!(!fixture.result.exists());
+    assert!(!fixture.install_log.exists());
+    assert!(String::from_utf8(output.stdout)
+        .unwrap()
+        .contains("Rust is required only when building"));
+}
+
+#[test]
 fn failed_install_does_not_write_state_or_run_existing_binary() {
     let fixture = LauncherFixture::new(true);
 
-    let output = fixture.run("always", &["demo"], true);
+    let output = fixture.run(&["--update", "demo"], true);
 
     assert_eq!(output.status.code(), Some(42));
     assert!(!fixture.cargo_home.join(".svarog-install-state").exists());

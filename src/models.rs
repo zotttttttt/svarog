@@ -1,3 +1,4 @@
+use anyhow::{bail, Result};
 use chrono::{DateTime, Utc};
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
@@ -310,6 +311,21 @@ pub struct CodexHookEvent {
 }
 
 impl CodexHookEvent {
+    pub fn validate(&self) -> Result<()> {
+        validate_text("session_id", &self.session_id, 256)?;
+        validate_optional_text("turn_id", self.turn_id.as_deref(), 256)?;
+        validate_text("cwd", &self.cwd, 4096)?;
+        validate_optional_text("source", self.source.as_deref(), 256)?;
+        validate_optional_text("reason", self.reason.as_deref(), 1024)?;
+        if !matches!(
+            self.hook_event_name.as_str(),
+            "SessionStart" | "UserPromptSubmit" | "Stop" | "SessionEnd"
+        ) {
+            bail!("unsupported Codex lifecycle event");
+        }
+        Ok(())
+    }
+
     pub fn project(&self) -> Option<String> {
         std::path::Path::new(&self.cwd)
             .file_name()
@@ -320,6 +336,20 @@ impl CodexHookEvent {
 }
 
 impl IncomingEvent {
+    pub fn validate(&self) -> Result<()> {
+        validate_text("event", &self.event, 64)?;
+        validate_optional_text("project", self.project.as_deref(), 256)?;
+        for duration in [self.expected_duration_sec, self.duration_sec]
+            .into_iter()
+            .flatten()
+        {
+            if !(1..=86_400).contains(&duration) {
+                bail!("duration must be between 1 and 86400 seconds");
+            }
+        }
+        Ok(())
+    }
+
     pub fn into_event_with_default(self, default_duration_sec: u32) -> AgentEvent {
         AgentEvent {
             agent: self.agent,
@@ -332,6 +362,70 @@ impl IncomingEvent {
             created_at: Utc::now(),
         }
     }
+}
+
+#[cfg(test)]
+mod input_validation_tests {
+    use super::*;
+
+    fn incoming() -> IncomingEvent {
+        IncomingEvent {
+            agent: Agent::Custom,
+            event: "busy".into(),
+            expected_duration_sec: Some(120),
+            duration_sec: None,
+            project: Some("svarog".into()),
+        }
+    }
+
+    #[test]
+    fn incoming_event_bounds_persisted_text_and_duration() {
+        assert!(incoming().validate().is_ok());
+        let mut invalid = incoming();
+        invalid.event = "x".repeat(65);
+        assert!(invalid.validate().is_err());
+        invalid = incoming();
+        invalid.project = Some("bad\nproject".into());
+        assert!(invalid.validate().is_err());
+        invalid = incoming();
+        invalid.expected_duration_sec = Some(86_401);
+        assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn codex_hook_accepts_only_bounded_known_lifecycle_events() {
+        let mut hook = CodexHookEvent {
+            session_id: "session-1".into(),
+            turn_id: Some("turn-1".into()),
+            cwd: "/work/svarog".into(),
+            hook_event_name: "UserPromptSubmit".into(),
+            source: None,
+            reason: None,
+        };
+        assert!(hook.validate().is_ok());
+        hook.hook_event_name = "Unknown".into();
+        assert!(hook.validate().is_err());
+        hook.hook_event_name = "Stop".into();
+        hook.cwd = "x".repeat(4097);
+        assert!(hook.validate().is_err());
+    }
+}
+
+fn validate_optional_text(name: &str, value: Option<&str>, max_bytes: usize) -> Result<()> {
+    if let Some(value) = value {
+        validate_text(name, value, max_bytes)?;
+    }
+    Ok(())
+}
+
+fn validate_text(name: &str, value: &str, max_bytes: usize) -> Result<()> {
+    if value.is_empty() || value.len() > max_bytes {
+        bail!("{name} must contain between 1 and {max_bytes} bytes");
+    }
+    if value.chars().any(char::is_control) {
+        bail!("{name} must not contain control characters");
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
