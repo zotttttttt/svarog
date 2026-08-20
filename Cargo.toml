@@ -2,6 +2,7 @@
 name = "svarog-cli"
 version = "0.6.0"
 edition = "2021"
+rust-version = "1.88"
 license = "MIT"
 description = "A CLI sidecar that turns AI-agent waiting time into tiny, adaptive workouts."
 repository = "https://github.com/zotttttttt/svarog"
@@ -39,13 +40,13 @@ anyhow = "1"
 axum = { version = "0.7", default-features = false, features = ["http1", "json", "tokio"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
 clap = { version = "4", features = ["derive"] }
-crossterm = "0.28"
+crossterm = "0.29"
 directories = "5"
 getrandom = "0.4"
 libc = "0.2"
 minijinja = { version = "2", features = ["json"] }
 keyring = "4"
-ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
 rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
