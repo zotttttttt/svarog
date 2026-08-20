@@ -815,6 +815,7 @@ mod tests {
         };
         crate::config::save(&env.paths, &config).unwrap();
         let store = Store::open(&env.paths.database_file).unwrap();
+        ensure_exercise_pool(&store, &config).unwrap();
         let rec = Recommendation {
             id: None,
             movement_id: "desk_posture_reset".into(),
@@ -829,14 +830,15 @@ mod tests {
             side: None,
             created_at: chrono::Utc::now(),
         };
-        store.insert_queued_recommendation(&rec).unwrap();
+        let queued_id = store.insert_queued_recommendation(&rec).unwrap();
 
         assert!(!process_event(&env, event()).unwrap().recommended);
         let response = process_event(&env, event()).unwrap();
 
         assert!(response.recommended);
-        assert_eq!(response.recommendation.unwrap().agent, Agent::Codex);
-        assert_eq!(store.queued_recommendation_count().unwrap(), 0);
+        let promoted = response.recommendation.unwrap();
+        assert_eq!(promoted.id, Some(queued_id));
+        assert_eq!(promoted.agent, Agent::Codex);
         assert_eq!(store.state().unwrap().kind, AppStateKind::Recommendation);
     }
 
