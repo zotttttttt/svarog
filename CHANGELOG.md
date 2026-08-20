@@ -2,6 +2,13 @@
 
 Notable changes to Svarog are recorded here by the automated release process.
 
+## [0.5.4](https://github.com/zotttttttt/svarog/compare/v0.5.3...v0.5.4) (2026-08-20)
+
+
+### Fixes
+
+* Fix cooldown for alternating sides ([27b0add](https://github.com/zotttttttt/svarog/commit/27b0add7362f91d5bfe40283ddc4daa54b8aa732))
+
 ## [0.5.3](https://github.com/zotttttttt/svarog/compare/v0.5.2...v0.5.3) (2026-08-19)
 
 
