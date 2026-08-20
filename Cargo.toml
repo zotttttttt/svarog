@@ -1,5 +1,5 @@
 [package]
-name = "svarog"
+name = "svarog-cli"
 version = "0.5.5"
 edition = "2021"
 license = "MIT"
@@ -24,6 +24,16 @@ include = [
     "src/**",
     "tests/**",
 ]
+
+[[bin]]
+name = "svarog"
+path = "src/main.rs"
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/svarog-{ version }-{ target }.tar.gz"
+bin-dir = "svarog-{ version }-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+disabled-strategies = ["quick-install"]
 
 [dependencies]
 anyhow = "1"

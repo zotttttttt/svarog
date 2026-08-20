@@ -73,8 +73,29 @@ the matching conventional prefix to the pull request title. Pull requests must
 be squash-merged so that Release Please can use that title as the release
 commit. As changes reach `main`, Release Please maintains a release PR with the
 next version and changelog. Merging that PR creates the tag and GitHub Release;
-the release-assets workflow then attaches macOS and Linux archives and their
-checksums.
+the release-assets workflow then attaches macOS and Linux archives, their
+checksums, and a version-bound shell installer.
+
+## First crates.io publication
+
+The crates.io package is named `svarog-cli`; its binary remains `svarog`. The
+first version must be published manually so crates.io can establish ownership
+before trusted publishing is configured.
+
+After the corresponding GitHub Release has finished uploading all assets,
+check out the exact release tag in a clean worktree and run:
+
+```bash
+cargo package --list
+cargo publish --dry-run --locked
+cargo publish --locked
+```
+
+Confirm that both `cargo install svarog-cli --locked` and
+`cargo binstall svarog-cli` install a binary whose `svarog --version` matches
+the tag. Then configure a crates.io trusted publisher for this repository and a
+dedicated GitHub Actions environment. Add automated OIDC publication in a
+follow-up change so the first release cannot race unconfigured credentials.
 
 ## One-time release automation setup
 

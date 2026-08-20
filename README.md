@@ -67,12 +67,54 @@ collected or sent in recommendation requests. See
 
 ## Get started
 
-You need macOS or Linux. A Rust toolchain is only required when installing from
-source. `tmux` is optional and only needed for `svarog session codex`. Linux
-desktop notifications require a graphical session with a notification daemon
-and `notify-send` (provided by `libnotify-bin` on Debian and Ubuntu).
+You need macOS or Linux. The release installer does not require Rust. `tmux` is
+optional and only needed for `svarog session codex`. Linux desktop notifications
+require a graphical session with a notification daemon and `notify-send`
+(provided by `libnotify-bin` on Debian and Ubuntu).
 
-### Install a release
+### Install with the release installer
+
+The installer selects the release for your computer, verifies its SHA-256
+checksum, and installs `svarog` to `$HOME/.local/bin`:
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/zotttttttt/svarog/releases/latest/download/svarog-installer.sh \
+  | bash
+```
+
+It does not use `sudo` or edit your shell configuration. If `$HOME/.local/bin`
+is not already on `PATH`, it prints the exact line to add. Rerun the same command
+to upgrade. Set `SVAROG_INSTALL_DIR` on `bash` to choose another absolute path:
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/zotttttttt/svarog/releases/latest/download/svarog-installer.sh \
+  | SVAROG_INSTALL_DIR="$HOME/bin" bash
+```
+
+Release binaries are not currently code-signed or notarized.
+
+### Install with Cargo
+
+If you have Rust and
+[`cargo-binstall`](https://github.com/cargo-bins/cargo-binstall), install the
+prebuilt release binary:
+
+```bash
+cargo binstall svarog-cli
+```
+
+Or compile and install it from crates.io:
+
+```bash
+cargo install svarog-cli --locked
+```
+
+The crates.io package is named `svarog-cli`; both commands install the `svarog`
+executable.
+
+### Install a release manually
 
 Download the archive for your computer from the
 [latest release](https://github.com/zotttttttt/svarog/releases/latest):
@@ -91,8 +133,6 @@ tar -xzf "$archive.tar.gz"
 mkdir -p "$HOME/.local/bin"
 install -m 755 "$archive/svarog" "$HOME/.local/bin/svarog"
 ```
-
-Release binaries are not currently code-signed or notarized.
 
 ### Install from a checkout
 
