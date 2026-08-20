@@ -74,6 +74,10 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
       - name: Download build artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -83,6 +87,27 @@ jobs:
       - name: Create checksums
         working-directory: dist
         run: sha256sum -- *.tar.gz > SHA256SUMS
+
+      - name: Generate and verify installer
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          version="${RELEASE_TAG#v}"
+          sed "s/@SVAROG_VERSION@/${version}/g" scripts/install > dist/svarog-installer.sh
+          chmod 755 dist/svarog-installer.sh
+          bash -n dist/svarog-installer.sh
+          ! grep -F '@SVAROG_VERSION@' dist/svarog-installer.sh
+
+          expected_targets=(
+            aarch64-apple-darwin
+            x86_64-apple-darwin
+            x86_64-unknown-linux-gnu
+          )
+          for target in "${expected_targets[@]}"; do
+            archive="svarog-${version}-${target}.tar.gz"
+            test -s "dist/${archive}"
+            grep -F "  ${archive}" dist/SHA256SUMS >/dev/null
+          done
 
       - name: Create binary size badge metadata
         working-directory: dist
@@ -138,7 +163,7 @@ jobs:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: >-
           gh release upload "$RELEASE_TAG" dist/*.tar.gz dist/SHA256SUMS
-          dist/binary-size.json
+          dist/binary-size.json dist/svarog-installer.sh
           --clobber --repo "$GITHUB_REPOSITORY"
 
       - name: Update latest binary size badge
