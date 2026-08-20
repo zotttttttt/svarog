@@ -2,6 +2,13 @@
 
 Notable changes to Svarog are recorded here by the automated release process.
 
+## [0.5.5](https://github.com/zotttttttt/svarog/compare/v0.5.4...v0.5.5) (2026-08-20)
+
+
+### Fixes
+
+* Feat/linux notifications ([eb575db](https://github.com/zotttttttt/svarog/commit/eb575db20a3ce27fc0ee076594184736541bfd1c))
+
 ## [0.5.4](https://github.com/zotttttttt/svarog/compare/v0.5.3...v0.5.4) (2026-08-20)
 
 
