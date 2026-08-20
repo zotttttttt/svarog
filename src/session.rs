@@ -23,7 +23,7 @@ pub fn run(agent: Agent, env: &RuntimeEnv) -> Result<()> {
 
     let session_name = format!("svarog-{}", agent.as_str());
     let current_exe = std::env::current_exe().context("locating svarog executable")?;
-    let tui_command = format!("{} run", current_exe.display());
+    let tui_command = tui_command(&current_exe);
 
     let has_session = Command::new("tmux")
         .args(["has-session", "-t", &session_name])
@@ -53,6 +53,13 @@ pub fn run(agent: Agent, env: &RuntimeEnv) -> Result<()> {
     run_tmux(&["set-option", "-t", &session_name, "mouse", "on"])?;
 
     run_tmux(&["attach-session", "-t", &session_name])
+}
+
+fn tui_command(executable: &std::path::Path) -> String {
+    format!(
+        "{} run",
+        hooks::shell_quote(&executable.display().to_string())
+    )
 }
 
 fn ensure_tmux() -> Result<()> {
@@ -95,5 +102,14 @@ mod tests {
 
         assert!(message.contains("`svarog session` requires tmux"));
         assert!(message.contains("Homebrew or your system package manager"));
+    }
+
+    #[test]
+    fn tui_command_quotes_executable_metacharacters() {
+        let path = std::path::Path::new("/tmp/space ' $(touch nope); `nope`/svarog");
+        assert_eq!(
+            tui_command(path),
+            format!("{} run", hooks::shell_quote(&path.display().to_string()))
+        );
     }
 }

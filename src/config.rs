@@ -418,6 +418,10 @@ pub struct RuntimeEnv {
 }
 
 impl Paths {
+    pub fn collector_token_file(&self) -> PathBuf {
+        self.config_dir.join("collector.token")
+    }
+
     pub fn load() -> Result<Self> {
         let dirs = BaseDirs::new().context("could not determine user directories")?;
         let config_dir = dirs.home_dir().join(".config").join("svarog");
@@ -585,9 +589,7 @@ fn resolve_daemon_addr(mode: RuntimeMode) -> Result<SocketAddr> {
 
 fn validate_daemon_addr(addr: SocketAddr) -> Result<SocketAddr> {
     if !addr.ip().is_loopback() {
-        bail!(
-            "SVAROG_DAEMON_ADDR must use a loopback address because the local event API is unauthenticated"
-        );
+        bail!("SVAROG_DAEMON_ADDR must use a loopback address because the event API is local-only");
     }
     Ok(addr)
 }

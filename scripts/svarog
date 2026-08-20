@@ -4,6 +4,12 @@ set -euo pipefail
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
 
+explicit_update=false
+if [[ "${1:-}" == "--update" ]]; then
+  explicit_update=true
+  shift
+fi
+
 missing_prerequisite=false
 for command_name in rustc cargo; do
   if ! command -v "$command_name" >/dev/null 2>&1; then
@@ -72,30 +78,7 @@ if [[ ! -x "$installed_binary" && -z "$existing_binary" ]]; then
   echo "Svarog is not installed; installing the current checkout."
   install_current_checkout
 elif [[ "$installed_matches" != true ]]; then
-  update_policy="${SVAROG_UPDATE:-ask}"
-  case "$update_policy" in
-    always) update=true ;;
-    never) update=false ;;
-    ask)
-      if [[ -t 0 ]]; then
-        current_version="$("${existing_binary:-$installed_binary}" --version 2>/dev/null || echo "unknown version")"
-        echo "A newer local Svarog build is available ($current_version installed)."
-        read -r -p "Install it now? [Y/n] " answer
-        case "$answer" in
-          n|N|no|NO) update=false ;;
-          *) update=true ;;
-        esac
-      else
-        update=true
-      fi
-      ;;
-    *)
-      echo "SVAROG_UPDATE must be one of: ask, always, never" >&2
-      exit 2
-      ;;
-  esac
-
-  if [[ "$update" == true ]]; then
+  if [[ "$explicit_update" == true ]]; then
     install_current_checkout
   elif [[ -n "$existing_binary" ]]; then
     selected_binary="$existing_binary"
@@ -105,7 +88,9 @@ elif [[ "$installed_matches" != true ]]; then
     echo "No existing Svarog binary is available to run." >&2
     exit 1
   fi
+  if [[ "$explicit_update" != true ]]; then
+    echo "The local checkout has changed; run scripts/svarog --update to install it." >&2
+  fi
 fi
 
-export SVAROG_SKIP_SELF_UPDATE=1
 exec "$selected_binary" "$@"

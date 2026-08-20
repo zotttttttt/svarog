@@ -5,7 +5,7 @@ on:
     types: [published]
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
@@ -25,6 +25,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.event.release.tag_name }}
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           targets: ${{ matrix.target }}
@@ -73,10 +74,15 @@ jobs:
     name: Upload release assets
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      attestations: write
+      contents: write
+      id-token: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.event.release.tag_name }}
+          persist-credentials: false
 
       - name: Download build artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -93,10 +99,25 @@ jobs:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           version="${RELEASE_TAG#v}"
-          sed "s/@SVAROG_VERSION@/${version}/g" scripts/install > dist/svarog-installer.sh
+          checksum_for() {
+            awk -v archive="$1" '$2 == archive || $2 == "*" archive { print $1; exit }' dist/SHA256SUMS
+          }
+          arm_macos_checksum="$(checksum_for "svarog-${version}-aarch64-apple-darwin.tar.gz")"
+          intel_macos_checksum="$(checksum_for "svarog-${version}-x86_64-apple-darwin.tar.gz")"
+          linux_checksum="$(checksum_for "svarog-${version}-x86_64-unknown-linux-gnu.tar.gz")"
+          test "${#arm_macos_checksum}" -eq 64
+          test "${#intel_macos_checksum}" -eq 64
+          test "${#linux_checksum}" -eq 64
+
+          sed \
+            -e "s/@SVAROG_VERSION@/${version}/g" \
+            -e "s/@SVAROG_SHA256_AARCH64_APPLE_DARWIN@/${arm_macos_checksum}/g" \
+            -e "s/@SVAROG_SHA256_X86_64_APPLE_DARWIN@/${intel_macos_checksum}/g" \
+            -e "s/@SVAROG_SHA256_X86_64_UNKNOWN_LINUX_GNU@/${linux_checksum}/g" \
+            scripts/install > dist/svarog-installer.sh
           chmod 755 dist/svarog-installer.sh
           bash -n dist/svarog-installer.sh
-          ! grep -F '@SVAROG_VERSION@' dist/svarog-installer.sh
+          ! grep -F '@SVAROG_' dist/svarog-installer.sh
 
           expected_targets=(
             aarch64-apple-darwin
@@ -107,6 +128,24 @@ jobs:
             archive="svarog-${version}-${target}.tar.gz"
             test -s "dist/${archive}"
             grep -F "  ${archive}" dist/SHA256SUMS >/dev/null
+          done
+
+      - name: Attest release artifacts
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+            dist/svarog-installer.sh
+
+      - name: Verify release attestations
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh attestation verify dist/svarog-installer.sh --repo "$GITHUB_REPOSITORY"
+          gh attestation verify dist/SHA256SUMS --repo "$GITHUB_REPOSITORY"
+          for archive in dist/*.tar.gz; do
+            gh attestation verify "$archive" --repo "$GITHUB_REPOSITORY"
           done
 
       - name: Create binary size badge metadata

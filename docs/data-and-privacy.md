@@ -11,6 +11,7 @@ requests.
 | Data | Default location |
 | --- | --- |
 | Configuration and prompt overrides | `~/.config/svarog/` |
+| Collector authentication token | `~/.config/svarog/collector.token` |
 | Workout database | `~/.local/share/svarog/svarog.sqlite3` |
 | Codex hook configuration | `~/.codex/hooks.json` |
 
@@ -25,9 +26,11 @@ equipment, preferences, cautious body parts, and injuries.
 
 ## Local collector
 
-The dashboard owns a local event collector. It binds only to a loopback address;
-Svarog rejects non-loopback `SVAROG_DAEMON_ADDR` values because the event API is
-not authenticated. Closing the dashboard stops collection.
+The dashboard owns a local event collector. It binds only to a loopback address
+and requires an owner-only bearer token for event submissions. The token is
+stored in the Svarog config directory as `collector.token` with user-only
+permissions and rotates whenever the collector starts.
+Closing the dashboard stops collection.
 
 Codex lifecycle events tell Svarog when you submit a task for Codex to execute.
 They do not forward the text of your coding prompts.
@@ -69,8 +72,10 @@ under `preferences.desktop_notifications` in the config file.
 Run `svarog setup --reset` to erase production profile and activity data after
 typing the exact `destroy all` confirmation. The reset also attempts to remove
 the production saved OpenAI key. If the operating system credential store is
-unavailable, Svarog warns and continues resetting its local data. See
-[Commands](commands.md) for the full reset behavior.
+unavailable, Svarog warns and continues resetting its local data. Local database
+records are securely deleted, the database is compacted, SQLite write-ahead data
+is truncated, and the collector bearer token is rotated. See [Commands](commands.md)
+for the full reset behavior.
 
 For testing, `svarog demo` uses only `./.svarog-dev` and a separate development
 credential; it does not touch production data, credentials, or hooks.

@@ -1,3 +1,4 @@
+use crate::collector_auth;
 use crate::config::RuntimeEnv;
 use crate::models::{Agent, CodexHookEvent};
 use anyhow::{Context, Result};
@@ -31,8 +32,10 @@ pub fn print(agent: Agent) {
         }
         Agent::Custom => {
             println!("# Generic hook API");
+            println!("token_file=\"${{SVAROG_HOME:-$HOME/.config/svarog}}/collector.token\"");
             println!("curl -sS -X POST http://127.0.0.1:8787/events \\");
             println!("  -H 'content-type: application/json' \\");
+            println!("  -H \"authorization: Bearer $(tr -d '\\n' < \"$token_file\")\" \\");
             println!(
                 "  -d '{{\"agent\":\"custom\",\"event\":\"busy\",\"expected_duration_sec\":120}}'"
             );
@@ -116,7 +119,7 @@ fn ensure_svarog_hook(root: &mut Value, script: &Path) {
     if !hooks.is_object() {
         *hooks = json!({});
     }
-    let command = format!("\"{}\"", script.display());
+    let command = shell_quote(&script.display().to_string());
     for (event, matcher, timeout) in [
         ("SessionStart", "startup|resume|clear|compact", 5),
         ("UserPromptSubmit", "", 5),
@@ -243,19 +246,27 @@ pub async fn ingest_codex(env: &RuntimeEnv) -> Result<()> {
     io::stdin().read_to_string(&mut input)?;
     if let Ok(payload) = serde_json::from_str::<CodexHookEvent>(&input) {
         let url = format!("http://{}/hooks/codex", env.daemon_addr);
+        let token = collector_auth::load(&env.paths).ok();
         if let Ok(client) = reqwest::Client::builder()
             .no_proxy()
             .timeout(std::time::Duration::from_millis(500))
             .build()
         {
-            let _ = client.post(url).json(&payload).send().await;
+            if let Some(token) = token {
+                let _ = client
+                    .post(url)
+                    .bearer_auth(token.as_str())
+                    .json(&payload)
+                    .send()
+                    .await;
+            }
         }
     }
     println!("{{}}");
     Ok(())
 }
 
-fn shell_quote(value: &str) -> String {
+pub(crate) fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
@@ -324,9 +335,22 @@ mod tests {
         assert_eq!(session_end[0]["hooks"][0]["timeout"], 4);
         assert_eq!(
             session_end[1]["hooks"][0]["command"],
-            "\"/tmp/codex-event.sh\""
+            "'/tmp/codex-event.sh'"
         );
         assert_eq!(session_end[1]["hooks"][0]["timeout"], 3);
+    }
+
+    #[test]
+    fn codex_hook_command_shell_quotes_metacharacter_paths() {
+        let script = Path::new("/tmp/space ' $(touch nope); `nope`/codex-event.sh");
+        let mut root = json!({});
+        ensure_svarog_hook(&mut root, script);
+        let command = root["hooks"]["Stop"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert_eq!(command, shell_quote(&script.display().to_string()));
+        assert!(command.starts_with('\''));
+        assert!(command.ends_with('\''));
     }
 
     #[test]

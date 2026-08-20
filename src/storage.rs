@@ -321,7 +321,11 @@ impl Store {
     }
 
     pub fn reset_all_data(&self) -> Result<()> {
-        self.conn.execute_batch(
+        self.conn
+            .execute_batch("PRAGMA secure_delete = ON;")
+            .context("enabling secure SQLite deletion")?;
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        transaction.execute_batch(
             r#"
             DELETE FROM sets;
             DELETE FROM recommendations;
@@ -351,7 +355,7 @@ impl Store {
             );
             "#,
         )?;
-        self.conn.execute(
+        transaction.execute(
             r#"
             INSERT INTO app_state
                 (id, kind, current_recommendation_id, cooldown_muscle, cooldown_until, suppress_until_event_count, updated_at)
@@ -359,6 +363,16 @@ impl Store {
             "#,
             [Utc::now().to_rfc3339()],
         )?;
+        transaction.commit()?;
+        self.conn
+            .execute_batch(
+                r#"
+                PRAGMA wal_checkpoint(TRUNCATE);
+                VACUUM;
+                PRAGMA wal_checkpoint(TRUNCATE);
+                "#,
+            )
+            .context("compacting reset SQLite data")?;
         Ok(())
     }
 
@@ -2633,6 +2647,36 @@ mod tests {
         assert!(store.recent_fuel_entries(5).unwrap().is_empty());
         assert_eq!(store.water_total_today().unwrap(), WaterTotal::default());
         assert_eq!(store.state().unwrap().kind, AppStateKind::Idle);
+    }
+
+    #[test]
+    fn reset_all_data_removes_deleted_content_from_database_files() {
+        let root = tempdir().unwrap().keep();
+        let database = root.join("svarog.sqlite3");
+        let store = Store::open(&database).unwrap();
+        let marker = "SVAROG_RESET_FORENSIC_MARKER_9f6b58d9";
+        let mut sensitive_event = event();
+        sensitive_event.project = Some(marker.into());
+        store.insert_event(&sensitive_event).unwrap();
+
+        store.reset_all_data().unwrap();
+
+        for path in [
+            database.clone(),
+            database.with_extension("sqlite3-wal"),
+            database.with_extension("sqlite3-shm"),
+        ] {
+            if path.exists() {
+                let bytes = fs::read(&path).unwrap();
+                assert!(
+                    !bytes
+                        .windows(marker.len())
+                        .any(|window| window == marker.as_bytes()),
+                    "reset marker remained in {}",
+                    path.display()
+                );
+            }
+        }
     }
 
     #[test]
