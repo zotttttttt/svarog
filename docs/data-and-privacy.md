@@ -58,11 +58,11 @@ Svarog exits. Codex and OpenAI token totals are tracked separately.
 
 Desktop notifications are available on macOS and Linux and are optional during
 setup. On Linux, they require a graphical session with a Freedesktop-compatible
-notification daemon and `notify-send`; distributions other than Debian and
-Ubuntu may package that command under a different name. Notification delivery
-is best-effort and a missing command or unavailable desktop service does not
-affect recommendations. Change the setting at any time under
-`preferences.desktop_notifications` in the config file.
+notification daemon and `notify-send`; on distributions other than Debian and
+Ubuntu, the package providing that command may have a different name.
+Notification delivery is best-effort and a missing command or unavailable
+desktop service does not affect recommendations. Change the setting at any time
+under `preferences.desktop_notifications` in the config file.
 
 ## Remove or isolate data
 
