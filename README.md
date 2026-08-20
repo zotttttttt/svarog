@@ -21,7 +21,7 @@
   &nbsp;
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-888888?style=flat-square&amp;labelColor=070808" alt="Supported platforms: macOS and Linux">
   &nbsp;
-  <img src="https://img.shields.io/badge/desktop%20notifications-macOS-888888?style=flat-square&amp;labelColor=070808" alt="Desktop notifications available on macOS">
+  <img src="https://img.shields.io/badge/desktop%20notifications-macOS%20%7C%20Linux-888888?style=flat-square&amp;labelColor=070808" alt="Desktop notifications available on macOS and Linux">
 </p>
 
 Svarog is a local Rust CLI and terminal dashboard that turns the time your
@@ -68,7 +68,9 @@ collected or sent in recommendation requests. See
 ## Get started
 
 You need macOS or Linux. A Rust toolchain is only required when installing from
-source. `tmux` is optional and only needed for `svarog session codex`.
+source. `tmux` is optional and only needed for `svarog session codex`. Linux
+desktop notifications require a graphical session with a notification daemon
+and `notify-send` (provided by `libnotify-bin` on Debian and Ubuntu).
 
 ### Install a release
 

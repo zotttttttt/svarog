@@ -1835,6 +1835,22 @@ fn settings_lines(
     area_width: u16,
     area_height: u16,
 ) -> Vec<Line<'static>> {
+    settings_lines_with_notification_reason(
+        settings,
+        demo,
+        area_width,
+        area_height,
+        crate::notifications::unavailable_reason(),
+    )
+}
+
+fn settings_lines_with_notification_reason(
+    settings: &SettingsState,
+    demo: bool,
+    area_width: u16,
+    area_height: u16,
+    notification_unavailable_reason: Option<&str>,
+) -> Vec<Line<'static>> {
     if settings.selecting_archetype {
         return fitted_modal_lines(
             archetype_lines(
@@ -1866,11 +1882,10 @@ fn settings_lines(
         ),
         (
             "Notifications",
-            if settings.draft.preferences.desktop_notifications {
-                "enabled".into()
-            } else {
-                "disabled".into()
-            },
+            notification_setting_value(
+                settings.draft.preferences.desktop_notifications,
+                notification_unavailable_reason,
+            ),
         ),
         (
             "Daily forge ceiling",
@@ -2039,6 +2054,16 @@ fn settings_lines(
         lines.push(Line::from(Span::styled(error.to_string(), accent())));
     }
     lines
+}
+
+fn notification_setting_value(enabled: bool, unavailable_reason: Option<&str>) -> String {
+    if !enabled {
+        "disabled".to_string()
+    } else if let Some(reason) = unavailable_reason {
+        format!("enabled · ⚠ {}", reason)
+    } else {
+        "enabled".to_string()
+    }
 }
 
 fn fitted_modal_lines(lines: Vec<Line<'static>>, height: usize) -> Vec<Line<'static>> {
@@ -3914,6 +3939,38 @@ mod tests {
         assert!(selector.contains("You can change your archetype at any time."));
         assert!(selector.contains("[esc] Back"));
         assert!(!selector.contains('★'));
+    }
+
+    #[test]
+    fn settings_warn_when_enabled_notifications_are_unavailable() {
+        let mut settings = settings_state();
+        let warning = settings_lines_with_notification_reason(
+            &settings,
+            false,
+            120,
+            40,
+            Some("notify-send not found on PATH"),
+        )
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        assert!(warning.contains("enabled · ⚠ notify-send not found on PATH"));
+
+        settings.draft.preferences.desktop_notifications = false;
+        let disabled = settings_lines_with_notification_reason(
+            &settings,
+            false,
+            120,
+            40,
+            Some("notify-send not found on PATH"),
+        )
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        assert!(disabled.contains("Notifications          disabled"));
+        assert!(!disabled.contains("notify-send"));
     }
 
     #[test]

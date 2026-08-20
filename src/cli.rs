@@ -706,11 +706,10 @@ fn print_setup_summary(config: &Config) {
     println!("{}", muted("Notifications:"));
     println!(
         "{}",
-        text(if config.preferences.desktop_notifications {
-            "enabled"
-        } else {
-            "disabled"
-        })
+        text(notification_status(
+            config.preferences.desktop_notifications,
+            crate::notifications::unavailable_reason(),
+        ))
     );
     println!();
     println!("{}", muted("Exercise selection:"));
@@ -728,6 +727,16 @@ fn print_setup_summary(config: &Config) {
     );
     println!();
     println!("{}", ember("Happy forging."));
+}
+
+fn notification_status(enabled: bool, unavailable_reason: Option<&str>) -> String {
+    if !enabled {
+        "disabled".to_string()
+    } else if let Some(reason) = unavailable_reason {
+        format!("enabled (warning: {})", reason)
+    } else {
+        "enabled".to_string()
+    }
 }
 
 fn print_recommender_notice(config: &Config, env: &RuntimeEnv, notice: &str) {
@@ -1233,6 +1242,19 @@ mod tests {
     fn metric_prompt_choice_selects_unit_system() {
         assert_eq!(unit_system_from_metric(true), UnitSystem::Metric);
         assert_eq!(unit_system_from_metric(false), UnitSystem::Imperial);
+    }
+
+    #[test]
+    fn notification_status_warns_only_when_enabled_and_unavailable() {
+        assert_eq!(notification_status(true, None), "enabled");
+        assert_eq!(
+            notification_status(true, Some("notify-send not found on PATH")),
+            "enabled (warning: notify-send not found on PATH)"
+        );
+        assert_eq!(
+            notification_status(false, Some("notify-send not found on PATH")),
+            "disabled"
+        );
     }
 
     #[test]

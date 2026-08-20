@@ -294,9 +294,10 @@ Next likely: shoulders or walk.
   restored with a completion checkmark after success. Manual regeneration and
   automatic refill never run concurrently; `r` is a silent no-op while an
   automatic refresh is active.
-* When enabled, a desktop notification appears when a forge becomes actionable.
-  Each later Codex prompt repeats the same notification while that forge remains
-  incomplete. Agent/TUI startup, completion, and queue prefill do not notify.
+* When enabled, Svarog makes a best-effort attempt to deliver a desktop
+  notification when a forge becomes actionable. Each later Codex prompt repeats
+  the same notification while that forge remains incomplete. Agent/TUI startup,
+  completion, and queue prefill do not notify.
 * Single-key actions inside TUI:
 
   * `d` done
@@ -538,7 +539,7 @@ Initial implementation target:
 11. CLI actions: `start`, `done`, `skip`, `pain`
 12. Stats/status
 13. Hidden hook commands for Codex, Claude, Factory Droid, OpenClaw, and generic API
-14. macOS notifications
+14. macOS and Linux desktop notifications
 15. Vendor-specific hook script installers
 
 The engine treats every submitted agent turn as a movement opportunity. A
