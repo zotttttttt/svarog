@@ -25,7 +25,9 @@ impl InstallerFixture {
         fs::create_dir_all(&fake_bin).unwrap();
         fs::create_dir_all(&release_dir).unwrap();
 
-        for command in ["awk", "install", "mkdir", "mktemp", "mv", "rm", "tar"] {
+        for command in [
+            "awk", "gzip", "install", "mkdir", "mktemp", "mv", "rm", "tar",
+        ] {
             link_command(&fake_bin, command);
         }
         write_executable(

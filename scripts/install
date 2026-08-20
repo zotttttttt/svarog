@@ -11,7 +11,7 @@ if [[ "$version" == "@SVAROG_VERSION@" ]]; then
   exit 2
 fi
 
-for command_name in awk curl install mkdir mktemp mv rm tar uname; do
+for command_name in awk curl gzip install mkdir mktemp mv rm tar uname; do
   if ! command -v "$command_name" >/dev/null 2>&1; then
     echo "Missing required command: $command_name" >&2
     exit 1
