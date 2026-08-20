@@ -709,6 +709,43 @@ mod tests {
     }
 
     #[test]
+    fn forge_now_promotes_the_opposite_side_of_a_cooling_muscle() {
+        let env = test_env();
+        crate::config::save(&env.paths, &Config::default()).unwrap();
+        let store = Store::open(&env.paths.database_file).unwrap();
+        let mut completed = Recommendation {
+            id: None,
+            movement_id: "one-arm-clean".into(),
+            movement_name: "one arm clean".into(),
+            primary_muscle: "hamstrings".into(),
+            muscles: vec!["hamstrings".into()],
+            reps: 3,
+            weight_kg: Some(12.0),
+            estimated_seconds: 30,
+            agent: Agent::Codex,
+            project: None,
+            side: Some(crate::models::RecommendationSide::Right),
+            created_at: chrono::Utc::now(),
+        };
+        completed.id = Some(store.insert_recommendation(&completed).unwrap());
+        store
+            .mark_recommendation(completed.id.unwrap(), "done")
+            .unwrap();
+        store.record_set(&completed, SetStatus::Done).unwrap();
+        let mut queued = completed.clone();
+        queued.id = None;
+        queued.side = Some(crate::models::RecommendationSide::Left);
+        store.insert_queued_recommendation(&queued).unwrap();
+        drop(store);
+
+        assert!(matches!(forge_now(&env).unwrap(), ForgeNowResult::Started));
+
+        let store = Store::open(&env.paths.database_file).unwrap();
+        let promoted = store.latest_open_recommendation().unwrap().unwrap();
+        assert_eq!(promoted.side, Some(crate::models::RecommendationSide::Left));
+    }
+
+    #[test]
     fn forge_now_respects_the_daily_forge_ceiling_not_repetitions() {
         let env = test_env();
         crate::config::save(&env.paths, &Config::default()).unwrap();
@@ -801,6 +838,51 @@ mod tests {
         assert_eq!(response.recommendation.unwrap().agent, Agent::Codex);
         assert_eq!(store.queued_recommendation_count().unwrap(), 0);
         assert_eq!(store.state().unwrap().kind, AppStateKind::Recommendation);
+    }
+
+    #[test]
+    fn process_event_promotes_the_opposite_side_instead_of_falling_back() {
+        let env = test_env();
+        let config = Config {
+            recommender: Recommender {
+                backend: RecommenderBackend::Local,
+                ..Recommender::default()
+            },
+            ..Config::default()
+        };
+        crate::config::save(&env.paths, &config).unwrap();
+        let store = Store::open(&env.paths.database_file).unwrap();
+        ensure_exercise_pool(&store, &config).unwrap();
+        let mut completed = Recommendation {
+            id: None,
+            movement_id: "one-arm-clean".into(),
+            movement_name: "one arm clean".into(),
+            primary_muscle: "hamstrings".into(),
+            muscles: vec!["hamstrings".into()],
+            reps: 3,
+            weight_kg: Some(12.0),
+            estimated_seconds: 30,
+            agent: Agent::Codex,
+            project: None,
+            side: Some(crate::models::RecommendationSide::Right),
+            created_at: chrono::Utc::now(),
+        };
+        completed.id = Some(store.insert_recommendation(&completed).unwrap());
+        store
+            .mark_recommendation(completed.id.unwrap(), "done")
+            .unwrap();
+        store.record_set(&completed, SetStatus::Done).unwrap();
+        let mut queued = completed.clone();
+        queued.id = None;
+        queued.side = Some(crate::models::RecommendationSide::Left);
+        store.insert_queued_recommendation(&queued).unwrap();
+
+        assert!(!process_event(&env, event()).unwrap().recommended);
+        let response = process_event(&env, event()).unwrap();
+        let promoted = response.recommendation.unwrap();
+
+        assert_eq!(promoted.movement_id, queued.movement_id);
+        assert_eq!(promoted.side, Some(crate::models::RecommendationSide::Left));
     }
 
     #[test]

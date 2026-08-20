@@ -1365,18 +1365,22 @@ impl Store {
         project: Option<&str>,
     ) -> Result<Option<Recommendation>> {
         let mut statement = self.conn.prepare(
-            "SELECT id, primary_muscle FROM recommendations WHERE status = 'queued' ORDER BY id ASC",
+            "SELECT id, primary_muscle, side FROM recommendations WHERE status = 'queued' ORDER BY id ASC",
         )?;
         let candidates = statement
             .query_map([], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    side_from_str(row.get(2)?),
+                ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(statement);
 
         let mut recovered_id = None;
-        for (id, primary_muscle) in candidates {
-            if self.muscle_recovered(&primary_muscle, MUSCLE_COOLDOWN_MINUTES)? {
+        for (id, primary_muscle, side) in candidates {
+            if self.muscle_side_recovered(&primary_muscle, side, MUSCLE_COOLDOWN_MINUTES)? {
                 recovered_id = Some(id);
                 break;
             }
@@ -1624,6 +1628,20 @@ impl Store {
     }
 
     pub fn muscle_recovered(&self, muscle: &str, recovery_minutes: i64) -> Result<bool> {
+        self.muscle_side_recovered(muscle, None, recovery_minutes)
+    }
+
+    fn muscle_side_recovered(
+        &self,
+        muscle: &str,
+        side: Option<RecommendationSide>,
+        recovery_minutes: i64,
+    ) -> Result<bool> {
+        let side = match side {
+            Some(RecommendationSide::Left) => Some("left"),
+            Some(RecommendationSide::Right) => Some("right"),
+            Some(RecommendationSide::Bilateral) | None => None,
+        };
         let last_done = self
             .conn
             .query_row(
@@ -1632,10 +1650,16 @@ impl Store {
                 FROM sets s
                 JOIN recommendations r ON r.id = s.recommendation_id
                 WHERE s.status = 'done' AND r.primary_muscle = ?1
+                  AND (
+                    ?2 IS NULL
+                    OR s.side IS NULL
+                    OR s.side = 'bilateral'
+                    OR s.side = ?2
+                  )
                 ORDER BY s.id DESC
                 LIMIT 1
                 "#,
-                [muscle],
+                params![muscle, side],
                 |row| row.get::<_, String>(0),
             )
             .optional()
@@ -2821,6 +2845,98 @@ mod tests {
         assert!(promoted.is_none());
         assert_eq!(store.queued_recommendation_count().unwrap(), 1);
         assert_eq!(store.state().unwrap().kind, AppStateKind::Cooldown);
+    }
+
+    #[test]
+    fn queued_promotion_allows_the_opposite_side_of_a_cooling_muscle() {
+        let store = store();
+        let mut completed = recommendation();
+        completed.side = Some(RecommendationSide::Right);
+        completed.id = Some(store.insert_recommendation(&completed).unwrap());
+        store
+            .mark_recommendation(completed.id.unwrap(), "done")
+            .unwrap();
+        store.record_set(&completed, SetStatus::Done).unwrap();
+
+        let mut queued = recommendation();
+        queued.side = Some(RecommendationSide::Left);
+        store.insert_queued_recommendation(&queued).unwrap();
+
+        let promoted = store
+            .promote_next_queued_recommendation(Agent::Codex, Some("svarog"))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(promoted.side, Some(RecommendationSide::Left));
+        assert_eq!(store.queued_recommendation_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn queued_promotion_still_blocks_the_same_side_of_a_cooling_muscle() {
+        let store = store();
+        let mut completed = recommendation();
+        completed.side = Some(RecommendationSide::Right);
+        completed.id = Some(store.insert_recommendation(&completed).unwrap());
+        store
+            .mark_recommendation(completed.id.unwrap(), "done")
+            .unwrap();
+        store.record_set(&completed, SetStatus::Done).unwrap();
+
+        let mut queued = recommendation();
+        queued.side = Some(RecommendationSide::Right);
+        store.insert_queued_recommendation(&queued).unwrap();
+
+        assert!(store
+            .promote_next_queued_recommendation(Agent::Codex, Some("svarog"))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn bilateral_and_legacy_sets_block_both_sides() {
+        for completed_side in [Some(RecommendationSide::Bilateral), None] {
+            let store = store();
+            let mut completed = recommendation();
+            completed.side = completed_side;
+            completed.id = Some(store.insert_recommendation(&completed).unwrap());
+            store
+                .mark_recommendation(completed.id.unwrap(), "done")
+                .unwrap();
+            store.record_set(&completed, SetStatus::Done).unwrap();
+
+            for candidate_side in [RecommendationSide::Left, RecommendationSide::Right] {
+                assert!(!store
+                    .muscle_side_recovered(
+                        &completed.primary_muscle,
+                        Some(candidate_side),
+                        MUSCLE_COOLDOWN_MINUTES,
+                    )
+                    .unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn bilateral_candidate_is_blocked_by_either_unilateral_side() {
+        let store = store();
+        let mut completed = recommendation();
+        completed.side = Some(RecommendationSide::Left);
+        completed.id = Some(store.insert_recommendation(&completed).unwrap());
+        store
+            .mark_recommendation(completed.id.unwrap(), "done")
+            .unwrap();
+        store.record_set(&completed, SetStatus::Done).unwrap();
+
+        assert!(!store
+            .muscle_side_recovered(
+                &completed.primary_muscle,
+                Some(RecommendationSide::Bilateral),
+                MUSCLE_COOLDOWN_MINUTES,
+            )
+            .unwrap());
+        assert!(!store
+            .muscle_recovered(&completed.primary_muscle, MUSCLE_COOLDOWN_MINUTES)
+            .unwrap());
     }
 
     #[test]

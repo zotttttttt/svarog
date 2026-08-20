@@ -285,6 +285,9 @@ Next likely: shoulders or walk.
   grouped by local date. `Esc` returns to the waiting view.
 * From idle and cooldown, `n` previews the queued recommendations in the order
   Svarog currently plans to promote them. Viewing the queue does not consume it.
+  Cooldown is side-aware for unilateral work: completing one side does not block
+  an adjacent queued recommendation for the opposite side. Bilateral and legacy
+  unsided work continues to cool down the whole muscle group.
   In this preview, `r` regenerates the full queue in the background. The old
   queue stays available until a non-empty replacement is ready; failures leave
   it unchanged. The `r` control becomes an animated loading indicator and is
