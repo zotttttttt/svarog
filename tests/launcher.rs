@@ -98,6 +98,11 @@ done
             .output()
             .unwrap()
     }
+
+    fn remove_rust(&self) {
+        fs::remove_file(self.fake_bin.join("rustc")).unwrap();
+        fs::remove_file(self.fake_bin.join("cargo")).unwrap();
+    }
 }
 
 fn write_executable(path: &Path, contents: &str) {
@@ -172,6 +177,21 @@ fn launcher_can_run_existing_binary_without_updating() {
 }
 
 #[test]
+fn launcher_can_run_existing_binary_without_rust() {
+    let fixture = LauncherFixture::new(true);
+    fixture.remove_rust();
+
+    let output = fixture.run(&["status"], false);
+
+    assert!(output.status.success(), "{:?}", output);
+    assert_eq!(
+        fs::read_to_string(&fixture.result).unwrap(),
+        "old\n<status>\n"
+    );
+    assert!(!fixture.install_log.exists());
+}
+
+#[test]
 fn launcher_installs_when_binary_is_missing() {
     let fixture = LauncherFixture::new(false);
 
@@ -183,6 +203,36 @@ fn launcher_installs_when_binary_is_missing() {
         fs::read_to_string(&fixture.install_log).unwrap(),
         "install\n"
     );
+}
+
+#[test]
+fn launcher_requires_rust_only_when_a_build_is_needed() {
+    let fixture = LauncherFixture::new(false);
+    fixture.remove_rust();
+
+    let output = fixture.run(&[], false);
+
+    assert!(!output.status.success());
+    assert!(!fixture.result.exists());
+    assert!(!fixture.install_log.exists());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("verified prebuilt release"));
+    assert!(stdout.contains("https://rustup.rs"));
+}
+
+#[test]
+fn explicit_update_does_not_fall_back_when_rust_is_missing() {
+    let fixture = LauncherFixture::new(true);
+    fixture.remove_rust();
+
+    let output = fixture.run(&["--update", "status"], false);
+
+    assert!(!output.status.success());
+    assert!(!fixture.result.exists());
+    assert!(!fixture.install_log.exists());
+    assert!(String::from_utf8(output.stdout)
+        .unwrap()
+        .contains("Rust is required only when building"));
 }
 
 #[test]

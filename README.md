@@ -148,9 +148,11 @@ scripts/bootstrap
 scripts/svarog
 ```
 
-The bootstrap checks Rust; the launcher installs Svarog, guides you through
-setup, connects Codex, and opens the dashboard. Press Enter to accept the
-conservative defaults.
+The bootstrap checks for a Rust toolchain but never downloads or installs one.
+Rust is needed only to build from a checkout; the verified release installer
+above works without Rust. The launcher installs Svarog, guides you through setup,
+connects Codex, and opens the dashboard. Press Enter to accept the conservative
+defaults.
 
 After changing the checkout, run `scripts/svarog --update` to rebuild and
 install it explicitly. Without `--update`, the launcher keeps running the

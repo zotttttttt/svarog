@@ -12,6 +12,9 @@ cargo test --locked
 cargo run -- demo
 ```
 
+`scripts/bootstrap` checks these prerequisites but does not download or update
+the toolchain.
+
 The demo stores all state under `./.svarog-dev`; it does not use production
 Svarog data or hooks.
 
