@@ -538,7 +538,7 @@ Initial implementation target:
 11. CLI actions: `start`, `done`, `skip`, `pain`
 12. Stats/status
 13. Hidden hook commands for Codex, Claude, Factory Droid, OpenClaw, and generic API
-14. macOS notifications
+14. macOS and Linux desktop notifications
 15. Vendor-specific hook script installers
 
 The engine treats every submitted agent turn as a movement opportunity. A
