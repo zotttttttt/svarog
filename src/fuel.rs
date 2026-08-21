@@ -15,6 +15,7 @@ const MAX_FUEL_ITEMS: usize = 20;
 const MAX_FUEL_EVENTS: usize = 12;
 const MAX_BATCH_ITEMS: usize = 40;
 const MAX_EVENT_SOURCE_CHARS: usize = 500;
+const MAX_SUGAR_CARB_ROUNDING_GAP_G: f64 = 1.0;
 const YESTERDAY_INFERENCE_CUTOFF_HOUR: u32 = 4;
 pub const MAX_FUEL_INPUT_CHARS: usize = 2_000;
 
@@ -201,15 +202,26 @@ fn resolve_timeline_at(
             .from_local_datetime(&date.and_time(time))
             .earliest()
             .context("the requested local meal time does not exist")?;
+        let mut parsed = FuelParseResult { items: event.items };
+        normalize_model_nutrition(&mut parsed);
         events.push(TimedFuelEvent {
             consumed_at: local.with_timezone(&Utc),
             source_text: source_text.to_string(),
-            parsed: FuelParseResult { items: event.items },
+            parsed,
         });
     }
     events.sort_by_key(|event| event.consumed_at);
     validate_timed_events(&events)?;
     Ok((events, inferred_yesterday))
+}
+
+fn normalize_model_nutrition(parsed: &mut FuelParseResult) {
+    for item in &mut parsed.items {
+        let sugar_carb_gap = item.nutrition.sugar_g - item.nutrition.carbohydrates_g;
+        if sugar_carb_gap > 0.0 && sugar_carb_gap <= MAX_SUGAR_CARB_ROUNDING_GAP_G {
+            item.nutrition.sugar_g = item.nutrition.carbohydrates_g;
+        }
+    }
 }
 
 fn parse_meal_time(value: &str) -> Result<NaiveTime> {
@@ -456,6 +468,8 @@ mod tests {
         assert!(include_str!("../prompts/fuel_entry.j2").contains("no more than 40"));
         assert!(include_str!("../prompts/fuel_entry.j2")
             .contains("separate events even when they have the same time"));
+        assert!(include_str!("../prompts/fuel_entry.j2")
+            .contains("Sugar is part of total carbohydrates"));
         assert_eq!(
             schema["properties"]["events"]["items"]["properties"]["items"]["items"]
                 ["additionalProperties"],
@@ -673,6 +687,60 @@ mod tests {
         let mut sugar = parsed_item("dessert");
         sugar.items[0].nutrition.sugar_g = 60.0;
         assert!(validate_parsed(&sugar).is_err());
+    }
+
+    #[test]
+    fn model_nutrition_normalizes_only_small_sugar_carb_rounding_gaps() {
+        let mut shake = timeline(None, &[Some("12:00")]);
+        shake.events[0].source_text =
+            "protein shake with 500 ml milk and 80 g protein powder".into();
+        shake.events[0].items = vec![
+            FuelItem {
+                name: "milk".into(),
+                quantity: Some(500.0),
+                unit: Some("ml".into()),
+                nutrition: NutritionTotals {
+                    calories: 305.0,
+                    protein_g: 16.0,
+                    carbohydrates_g: 24.0,
+                    fat_g: 16.0,
+                    fiber_g: 0.0,
+                    sugar_g: 25.0,
+                    sodium_mg: 215.0,
+                    potassium_mg: 750.0,
+                },
+                assumptions: Vec::new(),
+            },
+            FuelItem {
+                name: "protein powder".into(),
+                quantity: Some(80.0),
+                unit: Some("g".into()),
+                nutrition: NutritionTotals {
+                    calories: 320.0,
+                    protein_g: 64.0,
+                    carbohydrates_g: 8.0,
+                    fat_g: 5.0,
+                    fiber_g: 0.0,
+                    sugar_g: 3.0,
+                    sodium_mg: 300.0,
+                    potassium_mg: 200.0,
+                },
+                assumptions: Vec::new(),
+            },
+        ];
+
+        let (events, _) = resolve_timeline_at(shake, local_now(13)).unwrap();
+        assert_eq!(events[0].parsed.items[0].nutrition.sugar_g, 24.0);
+        assert_eq!(events[0].parsed.items[0].nutrition.carbohydrates_g, 24.0);
+        assert_eq!(events[0].parsed.items[1].nutrition.sugar_g, 3.0);
+
+        let mut invalid = timeline(None, &[Some("12:00")]);
+        invalid.events[0].items[0].nutrition.carbohydrates_g = 23.0;
+        invalid.events[0].items[0].nutrition.sugar_g = 25.0;
+        assert!(resolve_timeline_at(invalid, local_now(13))
+            .unwrap_err()
+            .to_string()
+            .contains("implausible nutrition values"));
     }
 
     #[test]
