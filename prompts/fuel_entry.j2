@@ -17,6 +17,7 @@ Rules:
 - For beverages, treat milliliters as grams when that is an appropriate density approximation.
 - Values are totals for the described quantity, not per-100-unit values.
 - Calories, protein, carbohydrates, fat, fiber, sugar, sodium, and potassium must be finite and nonnegative.
+- Sugar is part of total carbohydrates, so `sugar_g` must never exceed `carbohydrates_g` for an item.
 - Do not provide health advice, targets, diagnoses, or recommendations.
 - Include every food and drink mentioned by the user; do not omit products or time blocks.
 - Preserve separately stated meals or drinks as separate events even when they have the same time. Every consumed portion must contribute to nutrition totals.
