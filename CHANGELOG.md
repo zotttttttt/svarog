@@ -2,6 +2,13 @@
 
 Notable changes to Svarog are recorded here by the automated release process.
 
+## [0.6.2](https://github.com/zotttttttt/svarog/compare/v0.6.1...v0.6.2) (2026-08-21)
+
+
+### Fixes
+
+* Sugar can not be more than carbs ([8c572d7](https://github.com/zotttttttt/svarog/commit/8c572d7ee3e8798a220483bb319507b796551f35))
+
 ## [0.6.1](https://github.com/zotttttttt/svarog/compare/v0.6.0...v0.6.1) (2026-08-20)
 
 
