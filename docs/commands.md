@@ -36,6 +36,33 @@ recorded check-in in your selected unit system.
 After `svarog setup` completes, press Enter at the final prompt to open the
 dashboard immediately. `svarog setup --dry-run` prints its preview and exits.
 
+## Dashboard controls
+
+While waiting:
+
+| Key | Action |
+| --- | --- |
+| `↑` / `↓` | Select Forge, Fuel, or API |
+| Enter / Esc | Open the selected detail view / go back |
+| `f` | Start the next safe movement now |
+| `a` | Log meals or adjust today's plain-water intake |
+| `l` / `n` | From Forge details, view recent / upcoming movements |
+| `r` | Regenerate from the upcoming-movements view |
+| `s` | Open Settings; use ↑/↓ to focus and ←/→ to change a field |
+
+During a movement:
+
+| Key | Action |
+| --- | --- |
+| `d` or Enter | Finish and record the displayed reps |
+| `+` / `-` | Adjust the completed reps |
+| `i` or `?` | Read step-by-step instructions |
+| `o` | Open the visual guide from the instructions screen |
+| `s` | Skip, report fatigue, or remove the exercise |
+| `p` | Report pain and block the exercise |
+
+See [Fuel and water](fuel-and-water.md) for meal and hydration behavior.
+
 ## Exercise controls
 
 | Command | Purpose |

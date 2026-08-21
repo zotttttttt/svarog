@@ -21,6 +21,30 @@ changes. Useful advanced settings include the daily forge ceiling (completed
 forges, not repetitions), notification behavior, recommender selection,
 timeouts, fallback behavior, and the Codex/OpenAI model configuration.
 
+## Forge archetypes
+
+An archetype gives recommendations a long-term direction without overriding
+your current ability, equipment, activity, fatigue, or pain. Change it at any
+time without losing workout history.
+
+| Archetype | Long-term direction |
+| --- | --- |
+| Boxer | Calisthenics, footwork, core work, conditioning, and distributed training volume |
+| Wrestler | Pulling, grip, posterior chain, carries, isometrics, and explosive strength |
+| Martial Artist | Speed, coordination, balance, core control, and explosive movement |
+| Bodybuilder | Resistance, progressive overload, and hypertrophy-focused strength work |
+| Runner | Aerobic fitness, movement volume, and durable lower-body endurance |
+| Athlete | Balanced strength, muscle, cardio, mobility, coordination, and power |
+| Gymnast | Relative strength, core control, balance, mobility, and precise movement |
+| Yogi | Mobility, flexibility, balance, breathing, and controlled body awareness |
+| Mover | Posture, core work, mobility, balance, and low-impact muscular endurance |
+| Thinker | Focus, energy, mood, stress regulation, sleep, and cognitive performance |
+| Lifer | Long-term strength, mobility, aerobic fitness, and physical independence |
+
+Choose **Custom** to name your own physical north star. Custom archetypes use
+the balanced Athlete behavior while passing your chosen direction to the
+recommender.
+
 ## Recommendation prompts
 
 The repository includes two base

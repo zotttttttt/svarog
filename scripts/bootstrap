@@ -24,7 +24,7 @@ echo "Missing prerequisites: ${missing[*]}"
 echo
 echo "Rust is required only when building Svarog from a source checkout."
 echo "To use Svarog without Rust, install the verified prebuilt release:"
-echo "  https://github.com/zotttttttt/svarog#install-with-the-release-installer"
+echo "  https://github.com/zotttttttt/svarog/blob/main/docs/installation.md"
 echo
 if command -v rustup >/dev/null 2>&1; then
   echo "rustup is installed but no usable Rust toolchain was found."
