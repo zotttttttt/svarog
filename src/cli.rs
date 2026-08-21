@@ -98,6 +98,7 @@ enum ExerciseCommand {
 pub async fn run() -> Result<()> {
     let cli = Cli::parse();
     let env = RuntimeEnv::load()?;
+    crate::update::maybe_prompt_startup(&env);
 
     match cli.command {
         None => launch(&env).await,
@@ -112,7 +113,7 @@ pub async fn run() -> Result<()> {
                 Ok(())
             } else {
                 wait_for_tui("Press Enter to open the Svarog TUI: ")?;
-                run_tui(&setup_env).await
+                run_tui_until_quit(&setup_env).await
             }
         }
         Some(Command::Init) => init(&env),
@@ -320,7 +321,7 @@ fn print_setup_intro(env: &RuntimeEnv) {
     println!();
 }
 
-async fn run_tui(env: &RuntimeEnv) -> Result<()> {
+async fn run_tui(env: &RuntimeEnv) -> Result<tui::TuiOutcome> {
     let _openai_key_cache_guard = secrets::openai_key_cache_guard(&env.paths);
     daemon::refresh_exercise_pool(env)?;
     let collector = daemon::Collector::start(env).await?;
@@ -346,8 +347,23 @@ async fn run_tui(env: &RuntimeEnv) -> Result<()> {
     #[cfg(unix)]
     signal_task.abort();
     let shutdown_result = collector.shutdown().await;
-    tui_result?;
-    shutdown_result
+    let outcome = tui_result?;
+    shutdown_result?;
+    Ok(outcome)
+}
+
+async fn run_tui_until_quit(env: &RuntimeEnv) -> Result<()> {
+    loop {
+        match run_tui(env).await? {
+            tui::TuiOutcome::Quit => return Ok(()),
+            tui::TuiOutcome::Update(request) => {
+                if let Err(error) = crate::update::perform(request) {
+                    eprintln!("Could not update Svarog: {error:#}");
+                }
+                wait_for_tui("Press Enter to return to Svarog: ")?;
+            }
+        }
+    }
 }
 
 async fn launch(env: &RuntimeEnv) -> Result<()> {
@@ -355,7 +371,7 @@ async fn launch(env: &RuntimeEnv) -> Result<()> {
         setup_pending(env)?;
         wait_for_tui("Press Enter to open the Svarog TUI: ")?;
     }
-    run_tui(env).await
+    run_tui_until_quit(env).await
 }
 
 fn production_needs_setup(env: &RuntimeEnv) -> Result<bool> {
@@ -397,7 +413,7 @@ async fn run_demo(_remove_data: bool) -> Result<()> {
         wait_for_tui("Press Enter to open the demo TUI: ")?;
     }
 
-    run_tui(&env).await
+    run_tui_until_quit(&env).await
 }
 
 fn demo_root(env: &RuntimeEnv) -> Result<PathBuf> {

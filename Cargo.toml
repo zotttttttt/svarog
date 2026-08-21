@@ -51,6 +51,7 @@ rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+semver = "1"
 tempfile = "3"
 subtle = "2"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "time"] }

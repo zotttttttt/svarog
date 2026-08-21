@@ -191,6 +191,13 @@ struct TuiState {
     saved_openai_key_available: Option<bool>,
     settings: Option<SettingsState>,
     add_fuel: Option<AddFuelState>,
+    update_requested: Option<crate::update::UpdateRequest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TuiOutcome {
+    Quit,
+    Update(crate::update::UpdateRequest),
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -280,6 +287,11 @@ struct SettingsState {
     saved_openai_key_present: bool,
     saved_openai_key_error: Option<String>,
     confirming_openai_key_delete: bool,
+    confirming_update: bool,
+    development: bool,
+    update_check: Option<Receiver<Result<Option<crate::update::AvailableUpdate>, String>>>,
+    available_update: Option<crate::update::AvailableUpdate>,
+    update_status: Option<String>,
     error: Option<String>,
 }
 
@@ -294,11 +306,13 @@ impl std::fmt::Debug for SettingsState {
                 "confirming_openai_key_delete",
                 &self.confirming_openai_key_delete,
             )
+            .field("confirming_update", &self.confirming_update)
+            .field("update_status", &self.update_status)
             .finish_non_exhaustive()
     }
 }
 
-const SETTINGS_ROWS: usize = 16;
+const SETTINGS_ROWS: usize = 17;
 
 fn settings_row_order(settings: &SettingsState) -> Vec<usize> {
     let mut rows = Vec::with_capacity(SETTINGS_ROWS);
@@ -307,6 +321,7 @@ fn settings_row_order(settings: &SettingsState) -> Vec<usize> {
         rows.push(15);
     }
     rows.extend(2..15);
+    rows.push(16);
     rows
 }
 
@@ -439,7 +454,7 @@ enum ArchetypeSelectorContext {
     Settings,
 }
 
-pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
+pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<TuiOutcome> {
     let saved_openai_key_available = config::load_or_default(&env.paths)
         .ok()
         .filter(|config| config.recommender.backend == RecommenderBackend::OpenaiKeyring)
@@ -468,10 +483,10 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
     let mut last_spark_toggle = Instant::now();
     let in_tmux = std::env::var_os("TMUX").is_some();
 
-    let result: Result<()> = (|| loop {
+    let result: Result<TuiOutcome> = (|| loop {
         if shutdown.load(Ordering::Acquire) {
             cancel_add_fuel(&mut ui);
-            break Ok(());
+            break Ok(TuiOutcome::Quit);
         }
         if last_spark_toggle.elapsed() >= Duration::from_secs(1) {
             ui.animation_frame = (ui.animation_frame + 1) % (SPARK_BURSTS.len() * 2);
@@ -481,6 +496,7 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
         let now = Instant::now();
         let queue_regeneration_finished = poll_queue_regeneration(&mut ui);
         poll_add_fuel(&mut ui);
+        poll_settings_update(&mut ui);
         refresh_add_fuel_day(&mut ui, &store);
         if view_refresh_due(
             last_view_refresh,
@@ -553,6 +569,9 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
                     if ui.settings.is_none() {
                         force_view_refresh = true;
                     }
+                    if let Some(request) = ui.update_requested.take() {
+                        break Ok(TuiOutcome::Update(request));
+                    }
                     continue;
                 }
                 if matches!(view.kind, ViewKind::Idle | ViewKind::Cooldown)
@@ -577,6 +596,11 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
                             saved_openai_key_present,
                             saved_openai_key_error: None,
                             confirming_openai_key_delete: false,
+                            confirming_update: false,
+                            development: crate::update::is_development_checkout(),
+                            update_check: None,
+                            available_update: None,
+                            update_status: None,
                             error: None,
                         };
                         refresh_saved_openai_key_state(
@@ -589,7 +613,7 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
                     continue;
                 }
                 if quit_requested(key) {
-                    break Ok(());
+                    break Ok(TuiOutcome::Quit);
                 }
                 if add_fuel_requested(key.code, view.kind, ui.waiting_page) {
                     match open_add_fuel(env, &store) {
@@ -776,6 +800,38 @@ fn apply_queue_regeneration_start(ui: &mut TuiState, start: QueueRegenerationSta
             ui.forge_now_feedback = None;
         }
         QueueRegenerationStart::Busy => {}
+    }
+}
+
+fn poll_settings_update(ui: &mut TuiState) {
+    let Some(settings) = ui.settings.as_mut() else {
+        return;
+    };
+    let Some(receiver) = settings.update_check.as_ref() else {
+        return;
+    };
+    match receiver.try_recv() {
+        Ok(Ok(Some(available))) => {
+            settings.update_status =
+                Some(format!("{} available  [enter] Install", available.version));
+            settings.available_update = Some(available);
+            settings.update_check = None;
+        }
+        Ok(Ok(None)) => {
+            settings.update_status = Some("Up to date".into());
+            settings.available_update = None;
+            settings.update_check = None;
+        }
+        Ok(Err(error)) => {
+            settings.update_status = Some(format!("Check failed: {error}"));
+            settings.available_update = None;
+            settings.update_check = None;
+        }
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+            settings.update_status = Some("Check failed: update worker stopped".into());
+            settings.update_check = None;
+        }
+        Err(std::sync::mpsc::TryRecvError::Empty) => {}
     }
 }
 
@@ -1960,6 +2016,20 @@ fn settings_lines_with_notification_reason(
                 "not set  [enter] Set".into()
             },
         ),
+        (
+            "Svarog version",
+            settings.update_status.clone().unwrap_or_else(|| {
+                format!(
+                    "{}  [enter] {}",
+                    crate::update::current_version_label(settings.development),
+                    if settings.development {
+                        "Rebuild checkout"
+                    } else {
+                        "Check for updates"
+                    }
+                )
+            }),
+        ),
     ];
     let mut lines = vec![
         with_demo(Line::from(Span::styled("Settings", text_bold())), demo),
@@ -1969,7 +2039,10 @@ fn settings_lines_with_notification_reason(
         )),
         Line::from(""),
     ];
-    let footer_height = if settings.editing || settings.confirming_openai_key_delete {
+    let footer_height = if settings.editing
+        || settings.confirming_openai_key_delete
+        || settings.confirming_update
+    {
         3
     } else {
         2
@@ -2006,7 +2079,23 @@ fn settings_lines_with_notification_reason(
             ),
         ]));
     }
-    if settings.confirming_openai_key_delete {
+    if settings.confirming_update {
+        lines.extend([
+            Line::from(""),
+            Line::from(Span::styled(
+                if settings.development {
+                    "Rebuild and restart the development checkout?"
+                } else {
+                    "Install the available update and restart Svarog?"
+                },
+                accent(),
+            )),
+            Line::from(Span::styled(
+                "Unapplied settings will be discarded. [enter/y] Continue  [esc] Cancel",
+                muted(),
+            )),
+        ]);
+    } else if settings.confirming_openai_key_delete {
         lines.extend([
             Line::from(""),
             Line::from(Span::styled("Remove saved OpenAI key?", accent())),
@@ -2632,6 +2721,24 @@ fn handle_settings_key(
         }
         return Ok(());
     }
+    if settings.confirming_update {
+        match code {
+            KeyCode::Esc => settings.confirming_update = false,
+            KeyCode::Enter | KeyCode::Char('y') => {
+                ui.update_requested = Some(if settings.development {
+                    crate::update::UpdateRequest::Development
+                } else if let Some(available) = settings.available_update.clone() {
+                    crate::update::UpdateRequest::Release(available)
+                } else {
+                    settings.confirming_update = false;
+                    return Ok(());
+                });
+                ui.settings = None;
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
     if settings.confirming_openai_key_delete {
         match code {
             KeyCode::Esc => settings.confirming_openai_key_delete = false,
@@ -2786,6 +2893,15 @@ fn handle_settings_key(
         KeyCode::Enter if settings.row == 0 => {
             settings.archetype_original = Some(settings.draft.forge.clone());
             settings.selecting_archetype = true;
+        }
+        KeyCode::Enter if settings.row == 16 => {
+            settings.error = None;
+            if settings.development || settings.available_update.is_some() {
+                settings.confirming_update = true;
+            } else if settings.update_check.is_none() {
+                settings.update_status = Some("Checking for updates…".into());
+                settings.update_check = Some(crate::update::check_latest_async());
+            }
         }
         KeyCode::Enter => begin_setting_edit(settings),
         _ => {}
@@ -3871,6 +3987,11 @@ mod tests {
             saved_openai_key_present: false,
             saved_openai_key_error: None,
             confirming_openai_key_delete: false,
+            confirming_update: false,
+            development: false,
+            update_check: None,
+            available_update: None,
+            update_status: None,
             error: None,
         }
     }
@@ -3939,6 +4060,66 @@ mod tests {
         assert!(selector.contains("You can change your archetype at any time."));
         assert!(selector.contains("[esc] Back"));
         assert!(!selector.contains('★'));
+    }
+
+    #[test]
+    fn settings_version_row_routes_updates_after_confirmation() {
+        let root = tempdir().unwrap();
+        let env = test_env(root.path().to_path_buf());
+        let mut settings = settings_state();
+        settings.row = 16;
+        settings.development = true;
+        let rendered = settings_lines(&settings, false, 120, 40)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("Svarog version"));
+        assert!(rendered.contains("Rebuild checkout"));
+
+        let mut ui = TuiState {
+            settings: Some(settings),
+            ..TuiState::default()
+        };
+        handle_settings_key(&mut ui, KeyCode::Enter, KeyModifiers::NONE, &env).unwrap();
+        assert!(ui.settings.as_ref().unwrap().confirming_update);
+        assert!(ui.update_requested.is_none());
+
+        handle_settings_key(&mut ui, KeyCode::Enter, KeyModifiers::NONE, &env).unwrap();
+        assert!(ui.settings.is_none());
+        assert_eq!(
+            ui.update_requested,
+            Some(crate::update::UpdateRequest::Development)
+        );
+    }
+
+    #[test]
+    fn settings_update_check_reports_available_release_without_closing_tui() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender
+            .send(Ok(Some(crate::update::AvailableUpdate {
+                version: semver::Version::new(0, 6, 3),
+                tag: "v0.6.3".into(),
+            })))
+            .unwrap();
+        let mut settings = settings_state();
+        settings.row = 16;
+        settings.update_check = Some(receiver);
+        settings.update_status = Some("Checking for updates…".into());
+        let mut ui = TuiState {
+            settings: Some(settings),
+            ..TuiState::default()
+        };
+
+        poll_settings_update(&mut ui);
+
+        let settings = ui.settings.as_ref().unwrap();
+        assert_eq!(
+            settings.update_status.as_deref(),
+            Some("0.6.3 available  [enter] Install")
+        );
+        assert_eq!(settings.available_update.as_ref().unwrap().tag, "v0.6.3");
+        assert!(settings.update_check.is_none());
     }
 
     #[test]

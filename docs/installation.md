@@ -46,7 +46,10 @@ before installation.
 
 ## Upgrade or choose a directory
 
-Repeat either installer flow to upgrade to the latest release.
+Use **Svarog version → Check for updates** in Settings to install the latest
+release and restart automatically. Interactive production launches also check
+periodically and offer each newly published version once. You can still repeat
+either installer flow to upgrade manually.
 
 Set `SVAROG_INSTALL_DIR` when running the downloaded installer to choose another
 absolute directory:
@@ -108,16 +111,23 @@ scripts/svarog
 ```
 
 The bootstrap checks for Rust but never downloads or installs it. The launcher
-installs the current checkout, guides you through setup, connects Codex, and
-opens the dashboard.
+builds the current checkout under `target/release` and opens it as a visibly
+marked development instance. It never replaces the production `svarog`
+executable.
 
-After changing the checkout, rebuild and install it explicitly:
+Development data is isolated under `./.svarog-dev`, including its own SQLite
+database, configuration, credentials, hooks, and daemon port. The development
+launcher cannot use or modify production state.
+
+After changing the checkout, the launcher offers to rebuild before continuing.
+Force a rebuild without the prompt with:
 
 ```bash
 scripts/svarog --update
 ```
 
-Without `--update`, the launcher keeps running the currently installed binary.
+Use `SVAROG_UPDATE=ask`, `always`, or `never` to control rebuild prompting in
+scripts and automated workflows.
 
 ## Platform notes
 

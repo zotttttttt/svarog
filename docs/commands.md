@@ -29,6 +29,11 @@ store, not `config.toml`.
 Replacing or removing a key is also immediate and independent of applying the
 selected recommender.
 
+The **Svarog version** row checks for and installs a production release, or
+rebuilds the current checkout when running through `scripts/svarog`. Updating
+restores the terminal before showing progress and restarts Svarog afterward.
+Unapplied Settings edits are discarded only after explicit confirmation.
+
 Applied weight changes are retained as local check-ins. Once you have changed a
 saved weight, the dashboard shows total weight lost or gained since the first
 recorded check-in in your selected unit system.
