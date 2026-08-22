@@ -2,6 +2,20 @@
 
 Notable changes to Svarog are recorded here by the automated release process.
 
+## [0.7.0](https://github.com/zotttttttt/svarog/compare/v0.6.2...v0.7.0) (2026-08-22)
+
+
+### Features
+
+* add isolated development and app updates ([85481d2](https://github.com/zotttttttt/svarog/commit/85481d21d2410e6b5c5c7d7bc74058022faf46d1))
+* add updates, forge equipment, and flexible fuel logging ([7efb02e](https://github.com/zotttttttt/svarog/commit/7efb02e1bd6bab4c686d3aca9a7b9e8fadc4a115))
+
+
+### Fixes
+
+* docs: simplify README and getting started ([a9f2006](https://github.com/zotttttttt/svarog/commit/a9f200650f424b1d23bea5c507d86175b667762a))
+* harden app update workflow ([acf81d2](https://github.com/zotttttttt/svarog/commit/acf81d26f5b21d28c3c3b3ee5a154bd7c9098275))
+
 ## [0.6.2](https://github.com/zotttttttt/svarog/compare/v0.6.1...v0.6.2) (2026-08-21)
 
 
