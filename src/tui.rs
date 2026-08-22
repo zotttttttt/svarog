@@ -3993,12 +3993,8 @@ fn forge_lines(rec: &Recommendation, ui: &TuiState) -> Vec<Line<'static>> {
         )),
         ui.demo,
     )];
-    if let Some(weight) = rec.weight_kg {
-        lines.push(Line::from(Span::styled(weight_label(weight), text())));
-    }
     lines.extend([
-        Line::from(""),
-        Line::from(Span::styled(format!("{} reps", rec.reps), text_bold())),
+        Line::from(Span::styled(forge_prescription_label(rec), text_bold())),
         Line::from(""),
     ]);
     lines.extend(animation_lines(ui.animation_frame));
@@ -4016,6 +4012,103 @@ fn forge_lines(rec: &Recommendation, ui: &TuiState) -> Vec<Line<'static>> {
         Line::from(Span::styled("[i] How to", muted())),
     ]);
     lines
+}
+
+fn forge_prescription_label(rec: &Recommendation) -> String {
+    let reps = format!("{} reps", rec.reps);
+    let Some(requirements) =
+        crate::exercise_catalog::equipment_requirements_for_movement(&rec.movement_id)
+    else {
+        return rec
+            .weight_kg
+            .map(|weight| format!("{} · {reps}", weight_label(weight)))
+            .unwrap_or(reps);
+    };
+
+    let equipment = requirements
+        .iter()
+        .enumerate()
+        .map(|(index, requirement)| {
+            let weight = (index == 0 && equipment_uses_weight(requirement.kind))
+                .then_some(rec.weight_kg)
+                .flatten();
+            equipment_requirement_label(requirement.kind, requirement.count, weight)
+        })
+        .collect::<Vec<_>>()
+        .join(" + ");
+
+    if equipment.is_empty() {
+        reps
+    } else {
+        format!("{equipment} · {reps}")
+    }
+}
+
+fn equipment_uses_weight(kind: &str) -> bool {
+    matches!(
+        kind,
+        "dumbbell"
+            | "kettlebell"
+            | "medicine_ball"
+            | "barbell"
+            | "e_z_curl_bar"
+            | "cable"
+            | "machine"
+    )
+}
+
+fn equipment_requirement_label(kind: &str, count: usize, weight: Option<f32>) -> String {
+    let name = equipment_display_name(kind, count);
+    match (count, weight) {
+        (1, Some(weight)) => format!("{} {name}", weight_label(weight)),
+        (_, Some(weight)) => format!("{count} × {} {name}", weight_label(weight)),
+        (1, None) => name.to_string(),
+        (_, None) => format!("{count} {name}"),
+    }
+}
+
+fn equipment_display_name(kind: &str, count: usize) -> &'static str {
+    let plural = count != 1;
+    match (kind, plural) {
+        ("bodyweight", _) => "bodyweight",
+        ("dumbbell", false) => "dumbbell",
+        ("dumbbell", true) => "dumbbells",
+        ("kettlebell", false) => "kettlebell",
+        ("kettlebell", true) => "kettlebells",
+        ("band", false) => "resistance band",
+        ("band", true) => "resistance bands",
+        ("medicine_ball", false) => "medicine ball",
+        ("medicine_ball", true) => "medicine balls",
+        ("barbell", false) => "barbell",
+        ("barbell", true) => "barbells",
+        ("e_z_curl_bar", false) => "EZ curl bar",
+        ("e_z_curl_bar", true) => "EZ curl bars",
+        ("exercise_ball", false) => "exercise ball",
+        ("exercise_ball", true) => "exercise balls",
+        ("foam_roll", false) => "foam roller",
+        ("foam_roll", true) => "foam rollers",
+        ("cable", false) => "cable machine",
+        ("cable", true) => "cable machines",
+        ("machine", false) => "machine",
+        ("machine", true) => "machines",
+        ("pull_up_bar", false) => "pull-up bar",
+        ("pull_up_bar", true) => "pull-up bars",
+        ("v_bar", false) => "V-bar",
+        ("v_bar", true) => "V-bars",
+        ("bench_or_box", false) => "bench or box",
+        ("bench_or_box", true) => "benches or boxes",
+        ("dip_station", false) => "dip station",
+        ("dip_station", true) => "dip stations",
+        ("rack", false) => "rack",
+        ("rack", true) => "racks",
+        ("wall", false) => "wall",
+        ("wall", true) => "walls",
+        ("stable_support", false) => "stable support",
+        ("stable_support", true) => "stable supports",
+        ("leg_anchor", false) => "leg anchor",
+        ("leg_anchor", true) => "leg anchors",
+        _ => "equipment",
+    }
 }
 
 fn weight_label(weight: f32) -> String {
@@ -5944,7 +6037,7 @@ mod tests {
     }
 
     #[test]
-    fn forge_lines_show_reps_and_weight() {
+    fn forge_lines_show_reps_and_weight_fallback() {
         let ui = TuiState {
             recommendation_id: Some(1),
             actual_reps: 15,
@@ -5959,11 +6052,62 @@ mod tests {
             .join("\n");
 
         assert!(text.contains("LEFT CURL"));
-        assert!(text.contains("12 kg"));
-        assert!(text.contains("10 reps"));
+        assert!(text.contains("12 kg · 10 reps"));
         assert!(!text.contains("Target"));
         assert!(text.contains("15"));
         assert!(text.contains("[i] How to"));
+    }
+
+    #[test]
+    fn forge_lines_show_weight_equipment_and_reps_on_one_bold_line() {
+        let ui = TuiState {
+            recommendation_id: Some(1),
+            actual_reps: 5,
+            ..TuiState::default()
+        };
+        let mut recommendation = rec();
+        recommendation.movement_id = "Goblet_Squat".into();
+        recommendation.movement_name = "Goblet Squat".into();
+        recommendation.reps = 5;
+
+        let lines = forge_lines(&recommendation, &ui);
+
+        assert_eq!(lines[1].to_string(), "12 kg kettlebell · 5 reps");
+        assert_eq!(lines[1].spans[0].style, text_bold());
+        assert_eq!(lines[2].to_string(), "");
+    }
+
+    #[test]
+    fn forge_prescription_names_bodyweight_and_supplemental_equipment() {
+        let mut recommendation = rec();
+        recommendation.movement_id = "Chin-Up".into();
+        recommendation.weight_kg = None;
+        recommendation.reps = 5;
+
+        assert_eq!(
+            forge_prescription_label(&recommendation),
+            "bodyweight + pull-up bar · 5 reps"
+        );
+    }
+
+    #[test]
+    fn forge_prescription_names_unweighted_and_double_equipment() {
+        let mut recommendation = rec();
+        recommendation.movement_id = "Band_Good_Morning".into();
+        recommendation.weight_kg = None;
+        recommendation.reps = 8;
+        assert_eq!(
+            forge_prescription_label(&recommendation),
+            "resistance band · 8 reps"
+        );
+
+        recommendation.movement_id = "Double_Kettlebell_Jerk".into();
+        recommendation.weight_kg = Some(8.0);
+        recommendation.reps = 5;
+        assert_eq!(
+            forge_prescription_label(&recommendation),
+            "2 × 8 kg kettlebells · 5 reps"
+        );
     }
 
     #[test]
