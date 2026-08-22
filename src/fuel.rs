@@ -14,6 +14,7 @@ pub const FUEL_MODEL: &str = "gpt-5.6-luna";
 const MAX_FUEL_ITEMS: usize = 20;
 const MAX_FUEL_EVENTS: usize = 12;
 const MAX_BATCH_ITEMS: usize = 40;
+const MAX_FUEL_ITEM_NAME_CHARS: usize = 500;
 const MAX_EVENT_SOURCE_CHARS: usize = 500;
 const MAX_SUGAR_CARB_ROUNDING_GAP_G: f64 = 1.0;
 const YESTERDAY_INFERENCE_CUTOFF_HOUR: u32 = 4;
@@ -257,7 +258,7 @@ pub(crate) fn validate_parsed(parsed: &FuelParseResult) -> Result<()> {
         bail!("nutrition parser returned too many items");
     }
     for item in &parsed.items {
-        if item.name.trim().is_empty() || item.name.chars().count() > 120 {
+        if item.name.trim().is_empty() || item.name.chars().count() > MAX_FUEL_ITEM_NAME_CHARS {
             bail!("nutrition parser returned an invalid item name");
         }
         if item
@@ -470,6 +471,7 @@ mod tests {
             .contains("separate events even when they have the same time"));
         assert!(include_str!("../prompts/fuel_entry.j2")
             .contains("Sugar is part of total carbohydrates"));
+        assert!(include_str!("../prompts/fuel_entry.j2").contains("no more than 120 characters"));
         assert_eq!(
             schema["properties"]["events"]["items"]["properties"]["items"]["items"]
                 ["additionalProperties"],
@@ -745,7 +747,16 @@ mod tests {
 
     #[test]
     fn validation_enforces_string_limits_outside_the_openai_schema() {
-        let mut long_name = parsed_item(&"n".repeat(121));
+        let reported_burger_name = "Burger with beef chop, scrambled eggs, pickles, tomatoes, lettuce, cocktail sauce, crunch sauce, and grilled pepper sauce";
+        assert_eq!(reported_burger_name.chars().count(), 121);
+        validate_parsed(&parsed_item(reported_burger_name)).unwrap();
+
+        validate_parsed(&parsed_item(&"n".repeat(MAX_FUEL_ITEM_NAME_CHARS))).unwrap();
+
+        let mut long_name = parsed_item(&"n".repeat(MAX_FUEL_ITEM_NAME_CHARS + 1));
+        assert!(validate_parsed(&long_name).is_err());
+
+        long_name.items[0].name = "  ".into();
         assert!(validate_parsed(&long_name).is_err());
 
         long_name.items[0].name = "tea".into();

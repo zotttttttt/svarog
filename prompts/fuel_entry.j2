@@ -12,6 +12,7 @@ Rules:
 - For the first event without a stated time, return time=null and inherit_previous_time=false.
 - For later items without a new stated time, place them in the preceding event. If a separate untimed event is unavoidable, return time=null and inherit_previous_time=true.
 - Preserve explicit item identities, quantities, units, and nutrition facts from the user.
+- Keep each item's `name` concise and no more than 120 characters; put supporting detail in `source_text` or `assumptions` instead.
 - Estimate missing nutrition conservatively from ordinary portions and expose every material portion, preparation, or ingredient assumption in that item's `assumptions` array.
 - Never silently invent a stated quantity. When quantity or unit was not supplied, return null for it even if you use a reasonable portion assumption to estimate nutrition.
 - For beverages, treat milliliters as grams when that is an appropriate density approximation.
