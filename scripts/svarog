@@ -3,12 +3,28 @@ set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
+dev_root="${SVAROG_DEV_ROOT:-$repo_root/.svarog-dev}"
+target_dir="${CARGO_TARGET_DIR:-$repo_root/target}"
+dev_binary="$target_dir/release/svarog"
+state_file="$dev_root/.source-fingerprint"
 
 explicit_update=false
-if [[ "${1:-}" == "--update" ]]; then
-  explicit_update=true
-  shift
-fi
+build_only=false
+case "${1:-}" in
+  --update)
+    explicit_update=true
+    shift
+    ;;
+  --build-only)
+    explicit_update=true
+    build_only=true
+    shift
+    if [[ "$#" -ne 0 ]]; then
+      echo "--build-only does not accept Svarog arguments" >&2
+      exit 2
+    fi
+    ;;
+esac
 
 for command_name in cksum find sort; do
   if ! command -v "$command_name" >/dev/null 2>&1; then
@@ -32,54 +48,71 @@ source_fingerprint="$({
   done
 } | cksum | awk '{print $1 ":" $2}')"
 
-cargo_home="${CARGO_HOME:-$HOME/.cargo}"
-installed_binary="$cargo_home/bin/svarog"
-state_file="$cargo_home/.svarog-install-state"
-existing_binary="$(command -v svarog 2>/dev/null || true)"
-selected_binary="$installed_binary"
-
-installed_matches=false
-if [[ -x "$installed_binary" && -f "$state_file" ]]; then
-  stored_root="$(sed -n '1p' "$state_file")"
-  stored_fingerprint="$(sed -n '2p' "$state_file")"
-  if [[ "$stored_root" == "$repo_root" && "$stored_fingerprint" == "$source_fingerprint" ]]; then
-    installed_matches=true
-  fi
+stored_fingerprint=""
+if [[ -f "$state_file" ]]; then
+  stored_fingerprint="$(sed -n '1p' "$state_file")"
 fi
 
-install_current_checkout() {
+build_checkout() {
   if ! command -v rustc >/dev/null 2>&1 || ! command -v cargo >/dev/null 2>&1; then
     "$script_dir/bootstrap"
   fi
-  cargo install --locked --path "$repo_root" --force
-  if [[ ! -x "$installed_binary" ]]; then
-    echo "Cargo reported success but did not install $installed_binary" >&2
+  echo "Building the changed local Svarog checkout..."
+  cargo build --release --locked --manifest-path "$repo_root/Cargo.toml"
+  if [[ ! -x "$dev_binary" ]]; then
+    echo "Cargo reported success but did not build $dev_binary" >&2
     exit 1
   fi
-  mkdir -p "$cargo_home"
+  mkdir -p "$dev_root"
   state_tmp="$state_file.tmp.$$"
-  printf '%s\n%s\n' "$repo_root" "$source_fingerprint" >"$state_tmp"
+  printf '%s\n' "$source_fingerprint" >"$state_tmp"
   mv "$state_tmp" "$state_file"
-  selected_binary="$installed_binary"
 }
 
-if [[ ! -x "$installed_binary" && -z "$existing_binary" ]]; then
-  echo "Svarog is not installed; installing the current checkout."
-  install_current_checkout
-elif [[ "$installed_matches" != true ]]; then
-  if [[ "$explicit_update" == true ]]; then
-    install_current_checkout
-  elif [[ -n "$existing_binary" ]]; then
-    selected_binary="$existing_binary"
-  elif [[ -x "$installed_binary" ]]; then
-    selected_binary="$installed_binary"
-  else
-    echo "No existing Svarog binary is available to run." >&2
-    exit 1
-  fi
-  if [[ "$explicit_update" != true ]]; then
-    echo "The local checkout has changed; run scripts/svarog --update to install it." >&2
-  fi
+needs_build=false
+if [[ ! -x "$dev_binary" || "$stored_fingerprint" != "$source_fingerprint" ]]; then
+  needs_build=true
 fi
 
-exec "$selected_binary" "$@"
+if [[ "$needs_build" == true ]]; then
+  update_policy="${SVAROG_UPDATE:-ask}"
+  if [[ "$explicit_update" == true || ! -x "$dev_binary" ]]; then
+    update_policy=always
+  fi
+  case "$update_policy" in
+    always) build_checkout ;;
+    never) ;;
+    ask)
+      if [[ -t 0 && -t 2 ]]; then
+        read -r -p "Local Svarog source has changed. Rebuild it before continuing? [Y/n] " answer
+        case "$answer" in
+          n|N|no|NO) ;;
+          *) build_checkout ;;
+        esac
+      else
+        build_checkout
+      fi
+      ;;
+    *)
+      echo "SVAROG_UPDATE must be one of: ask, always, never" >&2
+      exit 2
+      ;;
+  esac
+fi
+
+if [[ ! -x "$dev_binary" ]]; then
+  echo "No development Svarog binary is available to run." >&2
+  exit 1
+fi
+
+if [[ "$build_only" == true ]]; then
+  exit 0
+fi
+
+export SVAROG_MODE=dev
+export SVAROG_HOME="$dev_root/svarog"
+export CODEX_HOME="$dev_root/codex"
+export SVAROG_DAEMON_ADDR="${SVAROG_DAEMON_ADDR:-127.0.0.1:18787}"
+export SVAROG_DEV_LAUNCHER="$script_dir/svarog"
+
+exec "$dev_binary" "$@"

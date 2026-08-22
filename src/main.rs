@@ -17,6 +17,7 @@ mod session;
 mod stop;
 mod storage;
 mod tui;
+mod update;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

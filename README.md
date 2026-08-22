@@ -157,7 +157,7 @@ meal parsing requires the Codex or OpenAI recommender, while water stays local.
 | `↑` / `↓`, Enter, Esc | Navigate dashboard views |
 | `f` | Start the next movement now |
 | `a` | Add fuel or update water |
-| `s` | Open Settings while waiting; skip or report fatigue during a movement |
+| `s` | Open Settings, including app updates; skip or report fatigue during a movement |
 | `i` / `?` | Read movement instructions |
 | `d` / Enter | Finish and record the displayed reps |
 | `p` | Report pain and block the current exercise |

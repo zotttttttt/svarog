@@ -9,32 +9,32 @@ repository and run:
 
 ```bash
 cargo test --locked
-cargo run -- demo
+scripts/svarog
 ```
 
 `scripts/bootstrap` checks these prerequisites but does not download or update
 the toolchain.
 
-The demo stores all state under `./.svarog-dev`; it does not use production
-Svarog data or hooks.
+The launcher builds `target/release/svarog` and stores all runtime state under
+`./.svarog-dev`; it does not replace the production executable or use
+production data, credentials, hooks, or daemon port.
 
 `tmux` is optional and only needed to test `svarog session`.
 
 ## Update a development install
 
-Run the project launcher with `--update` after changing the checkout. It
-reinstalls the binary and then continues with the command you passed:
+The project launcher detects source changes and offers to rebuild before it
+continues. Force a rebuild with:
 
 ```bash
 scripts/svarog --update run
 ```
 
-Without `--update`, the launcher keeps using the currently installed binary and
-prints a reminder when the checkout changed. You can also install directly:
-
-```bash
-cargo install --locked --path . --force
-```
+Control the prompt with `SVAROG_UPDATE=ask`, `always`, or `never`. Development
+builds remain isolated even when a production `svarog` is installed on `PATH`.
+The internal `scripts/svarog --build-only` mode rebuilds and records the source
+fingerprint without launching Svarog; Settings uses it so a failed build can
+return to the previous development binary.
 
 ## Before opening a pull request
 

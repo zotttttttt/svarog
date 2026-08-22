@@ -91,9 +91,9 @@ const DOUBLE_KETTLEBELL_EXERCISE_IDS: &[&str] = &[
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct EquipmentRequirement {
-    kind: &'static str,
-    count: usize,
+pub(crate) struct EquipmentRequirement {
+    pub(crate) kind: &'static str,
+    pub(crate) count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -485,6 +485,12 @@ fn equipment_requirements(entry: &ExerciseCatalogEntry) -> Option<Vec<EquipmentR
         });
     }
     Some(requirements)
+}
+
+pub(crate) fn equipment_requirements_for_movement(
+    movement_id: &str,
+) -> Option<Vec<EquipmentRequirement>> {
+    find(movement_id).and_then(equipment_requirements)
 }
 
 fn normalize_equipment(value: &str) -> Option<&'static str> {

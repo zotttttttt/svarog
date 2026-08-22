@@ -14,6 +14,7 @@ pub const FUEL_MODEL: &str = "gpt-5.6-luna";
 const MAX_FUEL_ITEMS: usize = 20;
 const MAX_FUEL_EVENTS: usize = 12;
 const MAX_BATCH_ITEMS: usize = 40;
+const MAX_FUEL_ITEM_NAME_CHARS: usize = 500;
 const MAX_EVENT_SOURCE_CHARS: usize = 500;
 const MAX_SUGAR_CARB_ROUNDING_GAP_G: f64 = 1.0;
 const YESTERDAY_INFERENCE_CUTOFF_HOUR: u32 = 4;
@@ -181,9 +182,6 @@ fn resolve_timeline_at(
     for (index, event) in timeline.events.into_iter().enumerate() {
         let explicit_time = event.time.as_deref().map(parse_meal_time).transpose()?;
         match (explicit_time, event.inherit_previous_time, index) {
-            (Some(_), true, _) => {
-                bail!("nutrition parser returned conflicting meal time fields")
-            }
             (None, true, 0) => bail!("the first meal event cannot inherit a time"),
             (None, false, index) if index > 0 => {
                 bail!("a later untimed meal event must inherit the previous time")
@@ -257,7 +255,7 @@ pub(crate) fn validate_parsed(parsed: &FuelParseResult) -> Result<()> {
         bail!("nutrition parser returned too many items");
     }
     for item in &parsed.items {
-        if item.name.trim().is_empty() || item.name.chars().count() > 120 {
+        if item.name.trim().is_empty() || item.name.chars().count() > MAX_FUEL_ITEM_NAME_CHARS {
             bail!("nutrition parser returned an invalid item name");
         }
         if item
@@ -469,7 +467,10 @@ mod tests {
         assert!(include_str!("../prompts/fuel_entry.j2")
             .contains("separate events even when they have the same time"));
         assert!(include_str!("../prompts/fuel_entry.j2")
+            .contains("inherit_previous_time=false whenever `time` is not null"));
+        assert!(include_str!("../prompts/fuel_entry.j2")
             .contains("Sugar is part of total carbohydrates"));
+        assert!(include_str!("../prompts/fuel_entry.j2").contains("no more than 120 characters"));
         assert_eq!(
             schema["properties"]["events"]["items"]["properties"]["items"]["items"]
                 ["additionalProperties"],
@@ -647,11 +648,7 @@ mod tests {
     }
 
     #[test]
-    fn contradictory_time_inheritance_is_rejected() {
-        let mut explicit_inherit = timeline(None, &[Some("10:00")]);
-        explicit_inherit.events[0].inherit_previous_time = true;
-        assert!(resolve_timeline_at(explicit_inherit, local_now(12)).is_err());
-
+    fn invalid_untimed_inheritance_is_rejected() {
         let mut first_inherit = timeline(None, &[None]);
         first_inherit.events[0].inherit_previous_time = true;
         assert!(resolve_timeline_at(first_inherit, local_now(12)).is_err());
@@ -659,6 +656,44 @@ mod tests {
         let mut later_without_inherit = timeline(None, &[Some("10:00"), None]);
         later_without_inherit.events[1].inherit_previous_time = false;
         assert!(resolve_timeline_at(later_without_inherit, local_now(12)).is_err());
+    }
+
+    #[test]
+    fn explicit_times_override_inheritance_flags_for_repeated_times() {
+        let mut parsed = timeline(
+            None,
+            &[
+                Some("12:00"),
+                Some("14:00"),
+                Some("14:00"),
+                Some("16:00"),
+                Some("17:00"),
+                Some("17:00"),
+                Some("20:00"),
+            ],
+        );
+        parsed.events[2].inherit_previous_time = true;
+        parsed.events[5].inherit_previous_time = true;
+
+        let (events, _) = resolve_timeline_at(parsed, local_now(21)).unwrap();
+
+        assert_eq!(events.len(), 7);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.source_text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["meal 1", "meal 2", "meal 3", "meal 4", "meal 5", "meal 6", "meal 7"]
+        );
+        assert_eq!(events[2].consumed_at, events[1].consumed_at);
+        assert_eq!(events[5].consumed_at, events[4].consumed_at);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.parsed.totals().calories)
+                .sum::<f64>(),
+            2_800.0
+        );
     }
 
     #[test]
@@ -745,7 +780,16 @@ mod tests {
 
     #[test]
     fn validation_enforces_string_limits_outside_the_openai_schema() {
-        let mut long_name = parsed_item(&"n".repeat(121));
+        let reported_burger_name = "Burger with beef chop, scrambled eggs, pickles, tomatoes, lettuce, cocktail sauce, crunch sauce, and grilled pepper sauce";
+        assert_eq!(reported_burger_name.chars().count(), 121);
+        validate_parsed(&parsed_item(reported_burger_name)).unwrap();
+
+        validate_parsed(&parsed_item(&"n".repeat(MAX_FUEL_ITEM_NAME_CHARS))).unwrap();
+
+        let mut long_name = parsed_item(&"n".repeat(MAX_FUEL_ITEM_NAME_CHARS + 1));
+        assert!(validate_parsed(&long_name).is_err());
+
+        long_name.items[0].name = "  ".into();
         assert!(validate_parsed(&long_name).is_err());
 
         long_name.items[0].name = "tea".into();

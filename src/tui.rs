@@ -191,6 +191,16 @@ struct TuiState {
     saved_openai_key_available: Option<bool>,
     settings: Option<SettingsState>,
     add_fuel: Option<AddFuelState>,
+    update_requested: Option<crate::update::UpdateRequest>,
+    scheduled_update_check: Option<crate::update::UpdateCheckReceiver>,
+    scheduled_available_update: Option<crate::update::AvailableUpdate>,
+    last_update_schedule_poll: Option<Instant>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TuiOutcome {
+    Quit,
+    Update(crate::update::UpdateRequest),
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -280,6 +290,12 @@ struct SettingsState {
     saved_openai_key_present: bool,
     saved_openai_key_error: Option<String>,
     confirming_openai_key_delete: bool,
+    confirming_update: bool,
+    development: bool,
+    update_check: Option<crate::update::UpdateCheckReceiver>,
+    waiting_for_scheduled_update: bool,
+    available_update: Option<crate::update::AvailableUpdate>,
+    update_status: Option<String>,
     error: Option<String>,
 }
 
@@ -294,11 +310,13 @@ impl std::fmt::Debug for SettingsState {
                 "confirming_openai_key_delete",
                 &self.confirming_openai_key_delete,
             )
+            .field("confirming_update", &self.confirming_update)
+            .field("update_status", &self.update_status)
             .finish_non_exhaustive()
     }
 }
 
-const SETTINGS_ROWS: usize = 16;
+const SETTINGS_ROWS: usize = 17;
 
 fn settings_row_order(settings: &SettingsState) -> Vec<usize> {
     let mut rows = Vec::with_capacity(SETTINGS_ROWS);
@@ -307,6 +325,7 @@ fn settings_row_order(settings: &SettingsState) -> Vec<usize> {
         rows.push(15);
     }
     rows.extend(2..15);
+    rows.push(16);
     rows
 }
 
@@ -439,7 +458,7 @@ enum ArchetypeSelectorContext {
     Settings,
 }
 
-pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
+pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<TuiOutcome> {
     let saved_openai_key_available = config::load_or_default(&env.paths)
         .ok()
         .filter(|config| config.recommender.backend == RecommenderBackend::OpenaiKeyring)
@@ -468,10 +487,10 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
     let mut last_spark_toggle = Instant::now();
     let in_tmux = std::env::var_os("TMUX").is_some();
 
-    let result: Result<()> = (|| loop {
+    let result: Result<TuiOutcome> = (|| loop {
         if shutdown.load(Ordering::Acquire) {
             cancel_add_fuel(&mut ui);
-            break Ok(());
+            break Ok(TuiOutcome::Quit);
         }
         if last_spark_toggle.elapsed() >= Duration::from_secs(1) {
             ui.animation_frame = (ui.animation_frame + 1) % (SPARK_BURSTS.len() * 2);
@@ -481,6 +500,9 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
         let now = Instant::now();
         let queue_regeneration_finished = poll_queue_regeneration(&mut ui);
         poll_add_fuel(&mut ui);
+        poll_settings_update(&mut ui);
+        maybe_start_scheduled_update(&mut ui, env);
+        poll_scheduled_update(&mut ui, env);
         refresh_add_fuel_day(&mut ui, &store);
         if view_refresh_due(
             last_view_refresh,
@@ -498,7 +520,9 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
         sync_reps(&mut ui, view.recommendation.as_ref());
         poll_exercise_media(&mut ui, view.recommendation.as_ref());
         terminal.draw(|frame| {
-            let lines = if let Some(settings) = ui.settings.as_ref() {
+            let lines = if scheduled_update_prompt_visible(&ui, view.kind) {
+                scheduled_update_lines(ui.scheduled_available_update.as_ref().unwrap(), ui.demo)
+            } else if let Some(settings) = ui.settings.as_ref() {
                 settings_lines(settings, ui.demo, frame.area().width, frame.area().height)
             } else if let Some(add_fuel) = ui.add_fuel.as_ref() {
                 add_fuel_lines(add_fuel, ui.demo, frame.area().width, frame.area().height)
@@ -528,6 +552,28 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
                 continue;
             }
             if let Event::Key(key) = input_event {
+                if scheduled_update_prompt_visible(&ui, view.kind) {
+                    match key.code {
+                        KeyCode::Enter | KeyCode::Char('y') => {
+                            let available = ui.scheduled_available_update.take().unwrap();
+                            break Ok(TuiOutcome::Update(crate::update::UpdateRequest::Release(
+                                available,
+                            )));
+                        }
+                        KeyCode::Esc | KeyCode::Char('n') => {
+                            if let Some(available) = ui.scheduled_available_update.take() {
+                                if let Err(error) =
+                                    crate::update::dismiss_version(&env.paths, &available.version)
+                                {
+                                    ui.status_message =
+                                        Some(format!("Could not save update choice: {error}"));
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
                 if ui.add_fuel.is_some() {
                     let area = terminal.size()?;
                     let close = handle_add_fuel_key(
@@ -553,6 +599,9 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
                     if ui.settings.is_none() {
                         force_view_refresh = true;
                     }
+                    if let Some(request) = ui.update_requested.take() {
+                        break Ok(TuiOutcome::Update(request));
+                    }
                     continue;
                 }
                 if matches!(view.kind, ViewKind::Idle | ViewKind::Cooldown)
@@ -563,6 +612,16 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
                         let saved_openai_key_present =
                             ui.saved_openai_key_available.unwrap_or(false);
                         let applied_recommender_backend = draft.recommender.backend;
+                        let available_update = ui.scheduled_available_update.clone();
+                        let waiting_for_scheduled_update = ui.scheduled_update_check.is_some();
+                        let update_status = available_update
+                            .as_ref()
+                            .map(|available| {
+                                format!("{} available  [enter] Install", available.version)
+                            })
+                            .or_else(|| {
+                                waiting_for_scheduled_update.then(|| "Checking for updates…".into())
+                            });
                         let mut settings = SettingsState {
                             draft,
                             applied_recommender_backend,
@@ -577,6 +636,12 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
                             saved_openai_key_present,
                             saved_openai_key_error: None,
                             confirming_openai_key_delete: false,
+                            confirming_update: false,
+                            development: crate::update::is_development_checkout(),
+                            update_check: None,
+                            waiting_for_scheduled_update,
+                            available_update,
+                            update_status,
                             error: None,
                         };
                         refresh_saved_openai_key_state(
@@ -589,7 +654,7 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<()> {
                     continue;
                 }
                 if quit_requested(key) {
-                    break Ok(());
+                    break Ok(TuiOutcome::Quit);
                 }
                 if add_fuel_requested(key.code, view.kind, ui.waiting_page) {
                     match open_add_fuel(env, &store) {
@@ -777,6 +842,143 @@ fn apply_queue_regeneration_start(ui: &mut TuiState, start: QueueRegenerationSta
         }
         QueueRegenerationStart::Busy => {}
     }
+}
+
+fn poll_settings_update(ui: &mut TuiState) {
+    let Some(settings) = ui.settings.as_mut() else {
+        return;
+    };
+    let Some(receiver) = settings.update_check.as_ref() else {
+        return;
+    };
+    match receiver.try_recv() {
+        Ok(Ok(Some(available))) => {
+            settings.update_status =
+                Some(format!("{} available  [enter] Install", available.version));
+            settings.available_update = Some(available);
+            settings.update_check = None;
+        }
+        Ok(Ok(None)) => {
+            settings.update_status = Some("Up to date".into());
+            settings.available_update = None;
+            settings.update_check = None;
+        }
+        Ok(Err(error)) => {
+            settings.update_status = Some(format!("Check failed: {error}"));
+            settings.available_update = None;
+            settings.update_check = None;
+        }
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+            settings.update_status = Some("Check failed: update worker stopped".into());
+            settings.update_check = None;
+        }
+        Err(std::sync::mpsc::TryRecvError::Empty) => {}
+    }
+}
+
+const UPDATE_SCHEDULE_POLL_INTERVAL: Duration = Duration::from_secs(60);
+
+fn maybe_start_scheduled_update(ui: &mut TuiState, env: &RuntimeEnv) {
+    if env.mode != RuntimeMode::Production
+        || crate::update::is_development_checkout()
+        || ui.scheduled_update_check.is_some()
+        || ui.scheduled_available_update.is_some()
+        || ui
+            .settings
+            .as_ref()
+            .is_some_and(|settings| settings.update_check.is_some())
+    {
+        return;
+    }
+    let now = Instant::now();
+    if ui
+        .last_update_schedule_poll
+        .is_some_and(|last| now.saturating_duration_since(last) < UPDATE_SCHEDULE_POLL_INTERVAL)
+    {
+        return;
+    }
+    ui.last_update_schedule_poll = Some(now);
+    match crate::update::start_scheduled_check(&env.paths) {
+        Ok(Some(receiver)) => ui.scheduled_update_check = Some(receiver),
+        Ok(None) => {}
+        Err(error) => {
+            ui.status_message = Some(format!("Could not schedule update check: {error}"));
+        }
+    }
+}
+
+fn poll_scheduled_update(ui: &mut TuiState, env: &RuntimeEnv) {
+    let Some(receiver) = ui.scheduled_update_check.as_ref() else {
+        return;
+    };
+    let result = match receiver.try_recv() {
+        Ok(result) => result,
+        Err(std::sync::mpsc::TryRecvError::Empty) => return,
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => Err("update worker stopped".into()),
+    };
+    ui.scheduled_update_check = None;
+    match result {
+        Ok(Some(available)) => {
+            if !crate::update::is_version_dismissed(&env.paths, &available.version) {
+                ui.scheduled_available_update = Some(available.clone());
+                if let Some(settings) = ui.settings.as_mut() {
+                    settings.update_status =
+                        Some(format!("{} available  [enter] Install", available.version));
+                    settings.available_update = Some(available);
+                    settings.waiting_for_scheduled_update = false;
+                }
+            } else if let Some(settings) = ui.settings.as_mut() {
+                if settings.waiting_for_scheduled_update {
+                    settings.update_status = Some("Up to date".into());
+                    settings.waiting_for_scheduled_update = false;
+                }
+            }
+        }
+        Ok(None) => {
+            if let Some(settings) = ui.settings.as_mut() {
+                if settings.waiting_for_scheduled_update {
+                    settings.update_status = Some("Up to date".into());
+                    settings.waiting_for_scheduled_update = false;
+                }
+            }
+        }
+        Err(error) => {
+            if let Some(settings) = ui.settings.as_mut() {
+                if settings.waiting_for_scheduled_update {
+                    settings.update_status = Some(format!("Check failed: {error}"));
+                    settings.waiting_for_scheduled_update = false;
+                }
+            }
+        }
+    }
+}
+
+fn scheduled_update_prompt_visible(ui: &TuiState, view: ViewKind) -> bool {
+    ui.scheduled_available_update.is_some()
+        && ui.settings.is_none()
+        && ui.add_fuel.is_none()
+        && ui.waiting_page == WaitingPage::Dashboard
+        && !ui.show_help
+        && view != ViewKind::Forge
+}
+
+fn scheduled_update_lines(
+    available: &crate::update::AvailableUpdate,
+    demo: bool,
+) -> Vec<Line<'static>> {
+    vec![
+        with_demo(Line::from(Span::styled("Svarog update", text_bold())), demo),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("Svarog {} is available.", available.version),
+            accent(),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "[enter/y] Install and restart  [esc/n] Not this version",
+            muted(),
+        )),
+    ]
 }
 
 fn view_refresh_due(last_refresh: Instant, now: Instant, force: bool) -> bool {
@@ -1960,6 +2162,20 @@ fn settings_lines_with_notification_reason(
                 "not set  [enter] Set".into()
             },
         ),
+        (
+            "Svarog version",
+            settings.update_status.clone().unwrap_or_else(|| {
+                format!(
+                    "{}  [enter] {}",
+                    crate::update::current_version_label(settings.development),
+                    if settings.development {
+                        "Rebuild checkout"
+                    } else {
+                        "Check for updates"
+                    }
+                )
+            }),
+        ),
     ];
     let mut lines = vec![
         with_demo(Line::from(Span::styled("Settings", text_bold())), demo),
@@ -1969,7 +2185,10 @@ fn settings_lines_with_notification_reason(
         )),
         Line::from(""),
     ];
-    let footer_height = if settings.editing || settings.confirming_openai_key_delete {
+    let footer_height = if settings.editing
+        || settings.confirming_openai_key_delete
+        || settings.confirming_update
+    {
         3
     } else {
         2
@@ -2006,7 +2225,23 @@ fn settings_lines_with_notification_reason(
             ),
         ]));
     }
-    if settings.confirming_openai_key_delete {
+    if settings.confirming_update {
+        lines.extend([
+            Line::from(""),
+            Line::from(Span::styled(
+                if settings.development {
+                    "Rebuild and restart the development checkout?"
+                } else {
+                    "Install the available update and restart Svarog?"
+                },
+                accent(),
+            )),
+            Line::from(Span::styled(
+                "Unapplied settings will be discarded. [enter/y] Continue  [esc] Cancel",
+                muted(),
+            )),
+        ]);
+    } else if settings.confirming_openai_key_delete {
         lines.extend([
             Line::from(""),
             Line::from(Span::styled("Remove saved OpenAI key?", accent())),
@@ -2632,6 +2867,24 @@ fn handle_settings_key(
         }
         return Ok(());
     }
+    if settings.confirming_update {
+        match code {
+            KeyCode::Esc => settings.confirming_update = false,
+            KeyCode::Enter | KeyCode::Char('y') => {
+                ui.update_requested = Some(if settings.development {
+                    crate::update::UpdateRequest::Development
+                } else if let Some(available) = settings.available_update.clone() {
+                    crate::update::UpdateRequest::Release(available)
+                } else {
+                    settings.confirming_update = false;
+                    return Ok(());
+                });
+                ui.settings = None;
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
     if settings.confirming_openai_key_delete {
         match code {
             KeyCode::Esc => settings.confirming_openai_key_delete = false,
@@ -2786,6 +3039,19 @@ fn handle_settings_key(
         KeyCode::Enter if settings.row == 0 => {
             settings.archetype_original = Some(settings.draft.forge.clone());
             settings.selecting_archetype = true;
+        }
+        KeyCode::Enter if settings.row == 16 => {
+            settings.error = None;
+            if settings.development || settings.available_update.is_some() {
+                settings.confirming_update = true;
+            } else if settings.update_check.is_none() {
+                settings.update_status = Some("Checking for updates…".into());
+                if ui.scheduled_update_check.is_some() {
+                    settings.waiting_for_scheduled_update = true;
+                } else {
+                    settings.update_check = Some(crate::update::start_manual_check(&env.paths)?);
+                }
+            }
         }
         KeyCode::Enter => begin_setting_edit(settings),
         _ => {}
@@ -3727,12 +3993,8 @@ fn forge_lines(rec: &Recommendation, ui: &TuiState) -> Vec<Line<'static>> {
         )),
         ui.demo,
     )];
-    if let Some(weight) = rec.weight_kg {
-        lines.push(Line::from(Span::styled(weight_label(weight), text())));
-    }
     lines.extend([
-        Line::from(""),
-        Line::from(Span::styled(format!("{} reps", rec.reps), text_bold())),
+        Line::from(Span::styled(forge_prescription_label(rec), text_bold())),
         Line::from(""),
     ]);
     lines.extend(animation_lines(ui.animation_frame));
@@ -3750,6 +4012,103 @@ fn forge_lines(rec: &Recommendation, ui: &TuiState) -> Vec<Line<'static>> {
         Line::from(Span::styled("[i] How to", muted())),
     ]);
     lines
+}
+
+fn forge_prescription_label(rec: &Recommendation) -> String {
+    let reps = format!("{} reps", rec.reps);
+    let Some(requirements) =
+        crate::exercise_catalog::equipment_requirements_for_movement(&rec.movement_id)
+    else {
+        return rec
+            .weight_kg
+            .map(|weight| format!("{} · {reps}", weight_label(weight)))
+            .unwrap_or(reps);
+    };
+
+    let equipment = requirements
+        .iter()
+        .enumerate()
+        .map(|(index, requirement)| {
+            let weight = (index == 0 && equipment_uses_weight(requirement.kind))
+                .then_some(rec.weight_kg)
+                .flatten();
+            equipment_requirement_label(requirement.kind, requirement.count, weight)
+        })
+        .collect::<Vec<_>>()
+        .join(" + ");
+
+    if equipment.is_empty() {
+        reps
+    } else {
+        format!("{equipment} · {reps}")
+    }
+}
+
+fn equipment_uses_weight(kind: &str) -> bool {
+    matches!(
+        kind,
+        "dumbbell"
+            | "kettlebell"
+            | "medicine_ball"
+            | "barbell"
+            | "e_z_curl_bar"
+            | "cable"
+            | "machine"
+    )
+}
+
+fn equipment_requirement_label(kind: &str, count: usize, weight: Option<f32>) -> String {
+    let name = equipment_display_name(kind, count);
+    match (count, weight) {
+        (1, Some(weight)) => format!("{} {name}", weight_label(weight)),
+        (_, Some(weight)) => format!("{count} × {} {name}", weight_label(weight)),
+        (1, None) => name.to_string(),
+        (_, None) => format!("{count} {name}"),
+    }
+}
+
+fn equipment_display_name(kind: &str, count: usize) -> &'static str {
+    let plural = count != 1;
+    match (kind, plural) {
+        ("bodyweight", _) => "bodyweight",
+        ("dumbbell", false) => "dumbbell",
+        ("dumbbell", true) => "dumbbells",
+        ("kettlebell", false) => "kettlebell",
+        ("kettlebell", true) => "kettlebells",
+        ("band", false) => "resistance band",
+        ("band", true) => "resistance bands",
+        ("medicine_ball", false) => "medicine ball",
+        ("medicine_ball", true) => "medicine balls",
+        ("barbell", false) => "barbell",
+        ("barbell", true) => "barbells",
+        ("e_z_curl_bar", false) => "EZ curl bar",
+        ("e_z_curl_bar", true) => "EZ curl bars",
+        ("exercise_ball", false) => "exercise ball",
+        ("exercise_ball", true) => "exercise balls",
+        ("foam_roll", false) => "foam roller",
+        ("foam_roll", true) => "foam rollers",
+        ("cable", false) => "cable machine",
+        ("cable", true) => "cable machines",
+        ("machine", false) => "machine",
+        ("machine", true) => "machines",
+        ("pull_up_bar", false) => "pull-up bar",
+        ("pull_up_bar", true) => "pull-up bars",
+        ("v_bar", false) => "V-bar",
+        ("v_bar", true) => "V-bars",
+        ("bench_or_box", false) => "bench or box",
+        ("bench_or_box", true) => "benches or boxes",
+        ("dip_station", false) => "dip station",
+        ("dip_station", true) => "dip stations",
+        ("rack", false) => "rack",
+        ("rack", true) => "racks",
+        ("wall", false) => "wall",
+        ("wall", true) => "walls",
+        ("stable_support", false) => "stable support",
+        ("stable_support", true) => "stable supports",
+        ("leg_anchor", false) => "leg anchor",
+        ("leg_anchor", true) => "leg anchors",
+        _ => "equipment",
+    }
 }
 
 fn weight_label(weight: f32) -> String {
@@ -3871,6 +4230,12 @@ mod tests {
             saved_openai_key_present: false,
             saved_openai_key_error: None,
             confirming_openai_key_delete: false,
+            confirming_update: false,
+            development: false,
+            update_check: None,
+            waiting_for_scheduled_update: false,
+            available_update: None,
+            update_status: None,
             error: None,
         }
     }
@@ -3939,6 +4304,122 @@ mod tests {
         assert!(selector.contains("You can change your archetype at any time."));
         assert!(selector.contains("[esc] Back"));
         assert!(!selector.contains('★'));
+    }
+
+    #[test]
+    fn settings_version_row_routes_updates_after_confirmation() {
+        let root = tempdir().unwrap();
+        let env = test_env(root.path().to_path_buf());
+        let mut settings = settings_state();
+        settings.row = 16;
+        settings.development = true;
+        let rendered = settings_lines(&settings, false, 120, 40)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("Svarog version"));
+        assert!(rendered.contains("Rebuild checkout"));
+
+        let mut ui = TuiState {
+            settings: Some(settings),
+            ..TuiState::default()
+        };
+        handle_settings_key(&mut ui, KeyCode::Enter, KeyModifiers::NONE, &env).unwrap();
+        assert!(ui.settings.as_ref().unwrap().confirming_update);
+        assert!(ui.update_requested.is_none());
+
+        handle_settings_key(&mut ui, KeyCode::Enter, KeyModifiers::NONE, &env).unwrap();
+        assert!(ui.settings.is_none());
+        assert_eq!(
+            ui.update_requested,
+            Some(crate::update::UpdateRequest::Development)
+        );
+    }
+
+    #[test]
+    fn settings_update_check_reports_available_release_without_closing_tui() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender
+            .send(Ok(Some(crate::update::AvailableUpdate {
+                version: semver::Version::new(0, 6, 3),
+                tag: "v0.6.3".into(),
+            })))
+            .unwrap();
+        let mut settings = settings_state();
+        settings.row = 16;
+        settings.update_check = Some(receiver);
+        settings.update_status = Some("Checking for updates…".into());
+        let mut ui = TuiState {
+            settings: Some(settings),
+            ..TuiState::default()
+        };
+
+        poll_settings_update(&mut ui);
+
+        let settings = ui.settings.as_ref().unwrap();
+        assert_eq!(
+            settings.update_status.as_deref(),
+            Some("0.6.3 available  [enter] Install")
+        );
+        assert_eq!(settings.available_update.as_ref().unwrap().tag, "v0.6.3");
+        assert!(settings.update_check.is_none());
+    }
+
+    #[test]
+    fn scheduled_update_is_shared_with_settings_and_deferred_during_forges() {
+        let root = tempdir().unwrap();
+        let env = test_env(root.path().to_path_buf());
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let available = crate::update::AvailableUpdate {
+            version: semver::Version::new(0, 6, 3),
+            tag: "v0.6.3".into(),
+        };
+        sender.send(Ok(Some(available.clone()))).unwrap();
+        let mut settings = settings_state();
+        settings.waiting_for_scheduled_update = true;
+        settings.update_status = Some("Checking for updates…".into());
+        let mut ui = TuiState {
+            settings: Some(settings),
+            scheduled_update_check: Some(receiver),
+            ..TuiState::default()
+        };
+
+        poll_scheduled_update(&mut ui, &env);
+
+        assert_eq!(ui.scheduled_available_update, Some(available.clone()));
+        assert_eq!(
+            ui.settings.as_ref().unwrap().available_update,
+            Some(available)
+        );
+        assert!(!scheduled_update_prompt_visible(&ui, ViewKind::Idle));
+        ui.settings = None;
+        assert!(!scheduled_update_prompt_visible(&ui, ViewKind::Forge));
+        assert!(scheduled_update_prompt_visible(&ui, ViewKind::Idle));
+    }
+
+    #[test]
+    fn settings_reuses_an_in_flight_scheduled_check() {
+        let root = tempdir().unwrap();
+        let env = test_env(root.path().to_path_buf());
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        let mut settings = settings_state();
+        settings.row = 16;
+        let mut ui = TuiState {
+            settings: Some(settings),
+            scheduled_update_check: Some(receiver),
+            ..TuiState::default()
+        };
+
+        handle_settings_key(&mut ui, KeyCode::Enter, KeyModifiers::NONE, &env).unwrap();
+
+        let settings = ui.settings.as_ref().unwrap();
+        assert!(settings.waiting_for_scheduled_update);
+        assert!(settings.update_check.is_none());
+        assert_eq!(
+            settings.update_status.as_deref(),
+            Some("Checking for updates…")
+        );
     }
 
     #[test]
@@ -5556,7 +6037,7 @@ mod tests {
     }
 
     #[test]
-    fn forge_lines_show_reps_and_weight() {
+    fn forge_lines_show_reps_and_weight_fallback() {
         let ui = TuiState {
             recommendation_id: Some(1),
             actual_reps: 15,
@@ -5571,11 +6052,62 @@ mod tests {
             .join("\n");
 
         assert!(text.contains("LEFT CURL"));
-        assert!(text.contains("12 kg"));
-        assert!(text.contains("10 reps"));
+        assert!(text.contains("12 kg · 10 reps"));
         assert!(!text.contains("Target"));
         assert!(text.contains("15"));
         assert!(text.contains("[i] How to"));
+    }
+
+    #[test]
+    fn forge_lines_show_weight_equipment_and_reps_on_one_bold_line() {
+        let ui = TuiState {
+            recommendation_id: Some(1),
+            actual_reps: 5,
+            ..TuiState::default()
+        };
+        let mut recommendation = rec();
+        recommendation.movement_id = "Goblet_Squat".into();
+        recommendation.movement_name = "Goblet Squat".into();
+        recommendation.reps = 5;
+
+        let lines = forge_lines(&recommendation, &ui);
+
+        assert_eq!(lines[1].to_string(), "12 kg kettlebell · 5 reps");
+        assert_eq!(lines[1].spans[0].style, text_bold());
+        assert_eq!(lines[2].to_string(), "");
+    }
+
+    #[test]
+    fn forge_prescription_names_bodyweight_and_supplemental_equipment() {
+        let mut recommendation = rec();
+        recommendation.movement_id = "Chin-Up".into();
+        recommendation.weight_kg = None;
+        recommendation.reps = 5;
+
+        assert_eq!(
+            forge_prescription_label(&recommendation),
+            "bodyweight + pull-up bar · 5 reps"
+        );
+    }
+
+    #[test]
+    fn forge_prescription_names_unweighted_and_double_equipment() {
+        let mut recommendation = rec();
+        recommendation.movement_id = "Band_Good_Morning".into();
+        recommendation.weight_kg = None;
+        recommendation.reps = 8;
+        assert_eq!(
+            forge_prescription_label(&recommendation),
+            "resistance band · 8 reps"
+        );
+
+        recommendation.movement_id = "Double_Kettlebell_Jerk".into();
+        recommendation.weight_kg = Some(8.0);
+        recommendation.reps = 5;
+        assert_eq!(
+            forge_prescription_label(&recommendation),
+            "2 × 8 kg kettlebells · 5 reps"
+        );
     }
 
     #[test]
