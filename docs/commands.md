@@ -33,6 +33,9 @@ The **Svarog version** row checks for and installs a production release, or
 rebuilds the current checkout when running through `scripts/svarog`. Updating
 restores the terminal before showing progress and restarts Svarog afterward.
 Unapplied Settings edits are discarded only after explicit confirmation.
+Production release discovery runs in the background once per local day and
+waits for an idle dashboard before prompting, so it never interrupts a forge or
+an open editor.
 
 Applied weight changes are retained as local check-ins. Once you have changed a
 saved weight, the dashboard shows total weight lost or gained since the first

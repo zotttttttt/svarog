@@ -98,7 +98,6 @@ enum ExerciseCommand {
 pub async fn run() -> Result<()> {
     let cli = Cli::parse();
     let env = RuntimeEnv::load()?;
-    crate::update::maybe_prompt_startup(&env);
 
     match cli.command {
         None => launch(&env).await,

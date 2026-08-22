@@ -48,8 +48,9 @@ before installation.
 
 Use **Svarog version → Check for updates** in Settings to install the latest
 release and restart automatically. Interactive production launches also check
-periodically and offer each newly published version once. You can still repeat
-either installer flow to upgrade manually.
+in the background once per local calendar day, including when Svarog remains
+open across midnight, and offer each newly published version once. You can
+still repeat either installer flow to upgrade manually.
 
 Set `SVAROG_INSTALL_DIR` when running the downloaded installer to choose another
 absolute directory:

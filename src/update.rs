@@ -1,19 +1,21 @@
-use crate::config::{Paths, RuntimeEnv, RuntimeMode};
+use crate::config::Paths;
 use anyhow::{bail, Context, Result};
+use chrono::{Local, NaiveDate};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::ffi::OsString;
 use std::fs;
-use std::io::{self, IsTerminal, Write};
+use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 const REPOSITORY: &str = "zotttttttt/svarog";
-const CHECK_INTERVAL_SECS: i64 = 24 * 60 * 60;
 const SKIP_ENV: &str = "SVAROG_SKIP_UPDATE_CHECK";
+const UPDATE_STATE_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AvailableUpdate {
@@ -27,28 +29,30 @@ pub enum UpdateRequest {
     Release(AvailableUpdate),
 }
 
+pub type UpdateCheckReceiver = Receiver<Result<Option<AvailableUpdate>, String>>;
+
 #[derive(Debug, Deserialize, Serialize)]
 struct UpdateState {
     #[serde(default = "update_state_version")]
     version: u32,
     #[serde(default)]
-    last_checked_unix: i64,
+    last_attempt_local_date: Option<String>,
     #[serde(default)]
-    last_prompted_version: Option<String>,
+    dismissed_version: Option<String>,
 }
 
 impl Default for UpdateState {
     fn default() -> Self {
         Self {
             version: update_state_version(),
-            last_checked_unix: 0,
-            last_prompted_version: None,
+            last_attempt_local_date: None,
+            dismissed_version: None,
         }
     }
 }
 
 fn update_state_version() -> u32 {
-    1
+    UPDATE_STATE_VERSION
 }
 
 #[derive(Deserialize)]
@@ -56,63 +60,53 @@ struct LatestRelease {
     tag_name: String,
 }
 
-pub fn maybe_prompt_startup(env: &RuntimeEnv) {
-    if env.mode != RuntimeMode::Production
-        || env::var_os(SKIP_ENV).is_some()
-        || !io::stdin().is_terminal()
-        || !io::stderr().is_terminal()
-        || !startup_command_is_interactive()
-    {
-        return;
-    }
-
-    let mut state = load_state(&env.paths).unwrap_or_default();
-    let now = unix_now();
-    if !check_is_due(state.last_checked_unix, now) {
-        return;
-    }
-
-    let available = match check_latest() {
-        Ok(available) => available,
-        Err(_) => return,
-    };
-    state.last_checked_unix = now;
-
-    let Some(available) = available else {
-        let _ = save_state(&env.paths, &state);
-        return;
-    };
-    if version_was_prompted(&state, &available.version) {
-        let _ = save_state(&env.paths, &state);
-        return;
-    }
-
-    state.last_prompted_version = Some(available.version.to_string());
-    let _ = save_state(&env.paths, &state);
-    if !confirm(&format!(
-        "Svarog {} is available. Install it before continuing? [Y/n] ",
-        available.version
-    )) {
-        return;
-    }
-
-    eprintln!("Updating Svarog to {}...", available.version);
-    if let Err(error) = install_release(&available, &original_args()) {
-        eprintln!("Warning: could not update Svarog: {error:#}");
-        eprintln!("Continuing with the currently installed version.");
-    }
-}
-
-fn check_is_due(last_checked_unix: i64, now: i64) -> bool {
-    now.saturating_sub(last_checked_unix) >= CHECK_INTERVAL_SECS
-}
-
-fn version_was_prompted(state: &UpdateState, version: &Version) -> bool {
+fn version_was_dismissed(state: &UpdateState, version: &Version) -> bool {
     let version = version.to_string();
-    state.last_prompted_version.as_deref() == Some(version.as_str())
+    state.dismissed_version.as_deref() == Some(version.as_str())
 }
 
-pub fn check_latest_async() -> Receiver<Result<Option<AvailableUpdate>, String>> {
+pub fn start_scheduled_check(paths: &Paths) -> Result<Option<UpdateCheckReceiver>> {
+    start_scheduled_check_for_date(paths, Local::now().date_naive())
+}
+
+fn start_scheduled_check_for_date(
+    paths: &Paths,
+    date: NaiveDate,
+) -> Result<Option<UpdateCheckReceiver>> {
+    if env::var_os(SKIP_ENV).is_some() {
+        return Ok(None);
+    }
+    let mut state = load_state_recovering(paths);
+    if !scheduled_check_due(&state, date) {
+        return Ok(None);
+    }
+    state.last_attempt_local_date = Some(date.to_string());
+    save_state(paths, &state)?;
+    Ok(Some(check_latest_async()))
+}
+
+pub fn start_manual_check(paths: &Paths) -> Result<UpdateCheckReceiver> {
+    let mut state = load_state_recovering(paths);
+    state.last_attempt_local_date = Some(Local::now().date_naive().to_string());
+    save_state(paths, &state)?;
+    Ok(check_latest_async())
+}
+
+pub fn dismiss_version(paths: &Paths, version: &Version) -> Result<()> {
+    let mut state = load_state_recovering(paths);
+    state.dismissed_version = Some(version.to_string());
+    save_state(paths, &state)
+}
+
+pub fn is_version_dismissed(paths: &Paths, version: &Version) -> bool {
+    version_was_dismissed(&load_state_recovering(paths), version)
+}
+
+fn scheduled_check_due(state: &UpdateState, date: NaiveDate) -> bool {
+    state.last_attempt_local_date.as_deref() != Some(date.to_string().as_str())
+}
+
+pub fn check_latest_async() -> UpdateCheckReceiver {
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
         let _ = sender.send(check_latest().map_err(|error| format!("{error:#}")));
@@ -142,33 +136,33 @@ pub fn current_version_label(development_checkout: bool) -> String {
     }
 }
 
-fn startup_command_is_interactive() -> bool {
-    match env::args_os()
-        .nth(1)
-        .and_then(|value| value.into_string().ok())
-    {
-        None => true,
-        Some(command) => matches!(command.as_str(), "run"),
-    }
-}
-
 fn check_latest() -> Result<Option<AvailableUpdate>> {
     let api_url = env::var("SVAROG_RELEASE_API_URL")
         .unwrap_or_else(|_| format!("https://api.github.com/repos/{REPOSITORY}/releases/latest"));
+    check_latest_at(&api_url, env!("CARGO_PKG_VERSION"))
+}
+
+fn check_latest_at(api_url: &str, current_version: &str) -> Result<Option<AvailableUpdate>> {
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(5))
         .user_agent(format!("svarog/{}", env!("CARGO_PKG_VERSION")))
         .build()
         .context("creating update client")?;
-    let release: LatestRelease = client
+    let body = client
         .get(api_url)
         .send()
         .context("contacting GitHub")?
         .error_for_status()
         .context("checking the latest GitHub release")?
-        .json()
+        .bytes()
         .context("reading the latest GitHub release")?;
-    available_update(env!("CARGO_PKG_VERSION"), &release.tag_name)
+    parse_latest_release(&body, current_version)
+}
+
+fn parse_latest_release(body: &[u8], current_version: &str) -> Result<Option<AvailableUpdate>> {
+    let release: LatestRelease =
+        serde_json::from_slice(body).context("reading the latest GitHub release")?;
+    available_update(current_version, &release.tag_name)
 }
 
 fn available_update(current: &str, tag: &str) -> Result<Option<AvailableUpdate>> {
@@ -189,6 +183,12 @@ fn install_release(update: &AvailableUpdate, args: &[OsString]) -> Result<()> {
             update.tag
         )
     });
+    let executable = env::current_exe().context("locating the current Svarog executable")?;
+    download_and_run_installer(&installer_url, &executable)?;
+    restart(&executable, args)
+}
+
+fn download_and_run_installer(installer_url: &str, executable: &Path) -> Result<()> {
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(30))
         .user_agent(format!("svarog/{}", env!("CARGO_PKG_VERSION")))
@@ -202,11 +202,14 @@ fn install_release(update: &AvailableUpdate, args: &[OsString]) -> Result<()> {
         .context("downloading the Svarog installer")?
         .bytes()
         .context("reading the Svarog installer")?;
+    run_installer_bytes(&installer, executable)
+}
+
+fn run_installer_bytes(installer: &[u8], executable: &Path) -> Result<()> {
     let mut file = tempfile::NamedTempFile::new().context("creating an installer file")?;
-    file.write_all(&installer)
+    file.write_all(installer)
         .context("writing the Svarog installer")?;
 
-    let executable = env::current_exe().context("locating the current Svarog executable")?;
     let install_dir = executable
         .parent()
         .context("the current Svarog executable has no parent directory")?;
@@ -219,31 +222,32 @@ fn install_release(update: &AvailableUpdate, args: &[OsString]) -> Result<()> {
     if !status.success() {
         bail!("the Svarog installer exited with {status}");
     }
-    restart(&executable, args)
+    Ok(())
 }
 
 fn rebuild_development() -> Result<()> {
     let launcher = env::var_os("SVAROG_DEV_LAUNCHER")
         .map(PathBuf::from)
         .context("this development build was not started through scripts/svarog")?;
+    build_development_checkout(&launcher)?;
     let mut command = Command::new(&launcher);
-    command.arg("--update").args(original_args());
+    command.args(original_args());
     replace_command(command)
+}
+
+fn build_development_checkout(launcher: &Path) -> Result<()> {
+    let status = Command::new(launcher)
+        .arg("--build-only")
+        .status()
+        .context("rebuilding the development checkout")?;
+    if !status.success() {
+        bail!("development build exited with {status}");
+    }
+    Ok(())
 }
 
 fn original_args() -> Vec<OsString> {
     env::args_os().skip(1).collect()
-}
-
-fn confirm(prompt: &str) -> bool {
-    eprint!("{prompt}");
-    if io::stderr().flush().is_err() {
-        return false;
-    }
-    let mut answer = String::new();
-    io::stdin()
-        .read_line(&mut answer)
-        .is_ok_and(|_| !matches!(answer.trim().to_ascii_lowercase().as_str(), "n" | "no"))
 }
 
 fn state_file(paths: &Paths) -> PathBuf {
@@ -257,28 +261,45 @@ fn load_state(paths: &Paths) -> Result<UpdateState> {
     }
     let contents =
         fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    toml::from_str(&contents).with_context(|| format!("parsing {}", path.display()))
+    let state: UpdateState =
+        toml::from_str(&contents).with_context(|| format!("parsing {}", path.display()))?;
+    if state.version != UPDATE_STATE_VERSION {
+        return Ok(UpdateState::default());
+    }
+    Ok(state)
+}
+
+fn load_state_recovering(paths: &Paths) -> UpdateState {
+    load_state(paths).unwrap_or_default()
 }
 
 fn save_state(paths: &Paths, state: &UpdateState) -> Result<()> {
-    fs::create_dir_all(&paths.config_dir)
-        .with_context(|| format!("creating {}", paths.config_dir.display()))?;
+    paths.ensure()?;
     let path = state_file(paths);
     let contents = toml::to_string(state).context("serializing update state")?;
-    fs::write(&path, contents).with_context(|| format!("writing {}", path.display()))
-}
-
-fn unix_now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
+    let mut temp = tempfile::NamedTempFile::new_in(&paths.config_dir)
+        .with_context(|| format!("creating temporary file in {}", paths.config_dir.display()))?;
+    temp.as_file()
+        .set_permissions(fs::Permissions::from_mode(0o600))
+        .context("securing temporary update state")?;
+    temp.write_all(contents.as_bytes())
+        .with_context(|| format!("writing {}", path.display()))?;
+    temp.as_file()
+        .sync_all()
+        .with_context(|| format!("syncing {}", path.display()))?;
+    temp.persist(&path)
+        .with_context(|| format!("replacing {}", path.display()))?;
+    Ok(())
 }
 
 fn restart(executable: &Path, args: &[OsString]) -> Result<()> {
+    replace_command(restart_command(executable, args))
+}
+
+fn restart_command(executable: &Path, args: &[OsString]) -> Command {
     let mut command = Command::new(executable);
-    command.args(args).env(SKIP_ENV, "1");
-    replace_command(command)
+    command.args(args);
+    command
 }
 
 #[cfg(unix)]
@@ -307,32 +328,143 @@ mod tests {
     }
 
     #[test]
+    fn github_response_is_parsed_and_compared_semantically() {
+        let update = parse_latest_release(br#"{"tag_name":"v0.6.3"}"#, "0.6.2")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(update.version, Version::new(0, 6, 3));
+        assert_eq!(update.tag, "v0.6.3");
+    }
+
+    #[test]
+    fn downloaded_installer_receives_current_executable_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let executable = root.path().join("bin with spaces/svarog");
+        fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        fs::write(&executable, "old binary").unwrap();
+        let log = root.path().join("installer.log");
+        let installer = format!(
+            "#!/usr/bin/env bash\nprintf '%s' \"$SVAROG_INSTALL_DIR\" > '{}'\n",
+            log.display()
+        );
+
+        run_installer_bytes(installer.as_bytes(), &executable).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(log).unwrap(),
+            executable.parent().unwrap().display().to_string()
+        );
+    }
+
+    #[test]
+    fn installer_failure_is_returned_without_restarting() {
+        let root = tempfile::tempdir().unwrap();
+        let executable = root.path().join("bin/svarog");
+        fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        let error =
+            run_installer_bytes(b"#!/usr/bin/env bash\nexit 42\n", &executable).unwrap_err();
+
+        assert!(error.to_string().contains("exit status: 42"));
+    }
+
+    #[test]
+    fn failed_development_build_returns_without_replacing_the_process() {
+        let root = tempfile::tempdir().unwrap();
+        let launcher = root.path().join("svarog-launcher");
+        fs::write(&launcher, "#!/usr/bin/env bash\nexit 42\n").unwrap();
+        fs::set_permissions(&launcher, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let error = build_development_checkout(&launcher).unwrap_err();
+
+        assert!(error.to_string().contains("exit status: 42"));
+    }
+
+    #[test]
+    fn restart_command_preserves_arguments_without_disabling_future_daily_checks() {
+        let args = vec![OsString::from("run"), OsString::from("two words")];
+        let command = restart_command(Path::new("/tmp/svarog"), &args);
+
+        assert_eq!(command.get_program(), "/tmp/svarog");
+        assert_eq!(command.get_args().collect::<Vec<_>>(), args);
+        assert!(!command.get_envs().any(|(key, _)| key == SKIP_ENV));
+    }
+
+    #[test]
     fn update_state_round_trips_outside_sqlite() {
         let root = tempfile::tempdir().unwrap();
         let paths = Paths::from_root(root.path().join("svarog"));
         let state = UpdateState {
-            version: 1,
-            last_checked_unix: 123,
-            last_prompted_version: Some("0.6.3".into()),
+            version: 2,
+            last_attempt_local_date: Some("2026-08-22".into()),
+            dismissed_version: Some("0.6.3".into()),
         };
         save_state(&paths, &state).unwrap();
         let loaded = load_state(&paths).unwrap();
-        assert_eq!(loaded.last_checked_unix, 123);
-        assert_eq!(loaded.last_prompted_version.as_deref(), Some("0.6.3"));
+        assert_eq!(
+            loaded.last_attempt_local_date.as_deref(),
+            Some("2026-08-22")
+        );
+        assert_eq!(loaded.dismissed_version.as_deref(), Some("0.6.3"));
+        assert_eq!(
+            fs::metadata(state_file(&paths))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
         assert!(!paths.database_file.exists());
     }
 
     #[test]
-    fn startup_checks_are_daily_and_each_release_prompts_once() {
-        assert!(!check_is_due(100, 100 + CHECK_INTERVAL_SECS - 1));
-        assert!(check_is_due(100, 100 + CHECK_INTERVAL_SECS));
-
+    fn scheduled_checks_follow_local_calendar_dates_and_dismiss_exact_versions() {
+        let date = NaiveDate::from_ymd_opt(2026, 8, 22).unwrap();
         let state = UpdateState {
-            version: 1,
-            last_checked_unix: 0,
-            last_prompted_version: Some("0.6.3".into()),
+            version: 2,
+            last_attempt_local_date: Some(date.to_string()),
+            dismissed_version: Some("0.6.3".into()),
         };
-        assert!(version_was_prompted(&state, &Version::new(0, 6, 3)));
-        assert!(!version_was_prompted(&state, &Version::new(0, 6, 4)));
+        assert!(!scheduled_check_due(&state, date));
+        assert!(scheduled_check_due(
+            &state,
+            NaiveDate::from_ymd_opt(2026, 8, 23).unwrap()
+        ));
+        assert!(version_was_dismissed(&state, &Version::new(0, 6, 3)));
+        assert!(!version_was_dismissed(&state, &Version::new(0, 6, 4)));
+    }
+
+    #[test]
+    fn persisted_dismissal_applies_only_to_the_declined_release() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::from_root(root.path().join("svarog"));
+
+        dismiss_version(&paths, &Version::new(0, 6, 3)).unwrap();
+
+        assert!(is_version_dismissed(&paths, &Version::new(0, 6, 3)));
+        assert!(!is_version_dismissed(&paths, &Version::new(0, 6, 4)));
+    }
+
+    #[test]
+    fn legacy_and_corrupt_state_recover_as_due() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::from_root(root.path().join("svarog"));
+        fs::create_dir_all(&paths.config_dir).unwrap();
+        fs::write(
+            state_file(&paths),
+            "version = 1\nlast_checked_unix = 123\nlast_prompted_version = \"0.6.3\"\n",
+        )
+        .unwrap();
+        let legacy = load_state(&paths).unwrap();
+        assert_eq!(legacy.version, 2);
+        assert!(legacy.last_attempt_local_date.is_none());
+
+        fs::write(state_file(&paths), "not valid toml = [").unwrap();
+        let recovered = load_state_recovering(&paths);
+        assert_eq!(recovered.version, 2);
+        assert!(scheduled_check_due(
+            &recovered,
+            NaiveDate::from_ymd_opt(2026, 8, 22).unwrap()
+        ));
     }
 }

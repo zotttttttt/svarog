@@ -192,6 +192,9 @@ struct TuiState {
     settings: Option<SettingsState>,
     add_fuel: Option<AddFuelState>,
     update_requested: Option<crate::update::UpdateRequest>,
+    scheduled_update_check: Option<crate::update::UpdateCheckReceiver>,
+    scheduled_available_update: Option<crate::update::AvailableUpdate>,
+    last_update_schedule_poll: Option<Instant>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -289,7 +292,8 @@ struct SettingsState {
     confirming_openai_key_delete: bool,
     confirming_update: bool,
     development: bool,
-    update_check: Option<Receiver<Result<Option<crate::update::AvailableUpdate>, String>>>,
+    update_check: Option<crate::update::UpdateCheckReceiver>,
+    waiting_for_scheduled_update: bool,
     available_update: Option<crate::update::AvailableUpdate>,
     update_status: Option<String>,
     error: Option<String>,
@@ -497,6 +501,8 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<TuiOutcome> {
         let queue_regeneration_finished = poll_queue_regeneration(&mut ui);
         poll_add_fuel(&mut ui);
         poll_settings_update(&mut ui);
+        maybe_start_scheduled_update(&mut ui, env);
+        poll_scheduled_update(&mut ui, env);
         refresh_add_fuel_day(&mut ui, &store);
         if view_refresh_due(
             last_view_refresh,
@@ -514,7 +520,9 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<TuiOutcome> {
         sync_reps(&mut ui, view.recommendation.as_ref());
         poll_exercise_media(&mut ui, view.recommendation.as_ref());
         terminal.draw(|frame| {
-            let lines = if let Some(settings) = ui.settings.as_ref() {
+            let lines = if scheduled_update_prompt_visible(&ui, view.kind) {
+                scheduled_update_lines(ui.scheduled_available_update.as_ref().unwrap(), ui.demo)
+            } else if let Some(settings) = ui.settings.as_ref() {
                 settings_lines(settings, ui.demo, frame.area().width, frame.area().height)
             } else if let Some(add_fuel) = ui.add_fuel.as_ref() {
                 add_fuel_lines(add_fuel, ui.demo, frame.area().width, frame.area().height)
@@ -544,6 +552,28 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<TuiOutcome> {
                 continue;
             }
             if let Event::Key(key) = input_event {
+                if scheduled_update_prompt_visible(&ui, view.kind) {
+                    match key.code {
+                        KeyCode::Enter | KeyCode::Char('y') => {
+                            let available = ui.scheduled_available_update.take().unwrap();
+                            break Ok(TuiOutcome::Update(crate::update::UpdateRequest::Release(
+                                available,
+                            )));
+                        }
+                        KeyCode::Esc | KeyCode::Char('n') => {
+                            if let Some(available) = ui.scheduled_available_update.take() {
+                                if let Err(error) =
+                                    crate::update::dismiss_version(&env.paths, &available.version)
+                                {
+                                    ui.status_message =
+                                        Some(format!("Could not save update choice: {error}"));
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
                 if ui.add_fuel.is_some() {
                     let area = terminal.size()?;
                     let close = handle_add_fuel_key(
@@ -582,6 +612,16 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<TuiOutcome> {
                         let saved_openai_key_present =
                             ui.saved_openai_key_available.unwrap_or(false);
                         let applied_recommender_backend = draft.recommender.backend;
+                        let available_update = ui.scheduled_available_update.clone();
+                        let waiting_for_scheduled_update = ui.scheduled_update_check.is_some();
+                        let update_status = available_update
+                            .as_ref()
+                            .map(|available| {
+                                format!("{} available  [enter] Install", available.version)
+                            })
+                            .or_else(|| {
+                                waiting_for_scheduled_update.then(|| "Checking for updates…".into())
+                            });
                         let mut settings = SettingsState {
                             draft,
                             applied_recommender_backend,
@@ -599,8 +639,9 @@ pub fn run(env: &RuntimeEnv, shutdown: Arc<AtomicBool>) -> Result<TuiOutcome> {
                             confirming_update: false,
                             development: crate::update::is_development_checkout(),
                             update_check: None,
-                            available_update: None,
-                            update_status: None,
+                            waiting_for_scheduled_update,
+                            available_update,
+                            update_status,
                             error: None,
                         };
                         refresh_saved_openai_key_state(
@@ -833,6 +874,111 @@ fn poll_settings_update(ui: &mut TuiState) {
         }
         Err(std::sync::mpsc::TryRecvError::Empty) => {}
     }
+}
+
+const UPDATE_SCHEDULE_POLL_INTERVAL: Duration = Duration::from_secs(60);
+
+fn maybe_start_scheduled_update(ui: &mut TuiState, env: &RuntimeEnv) {
+    if env.mode != RuntimeMode::Production
+        || crate::update::is_development_checkout()
+        || ui.scheduled_update_check.is_some()
+        || ui.scheduled_available_update.is_some()
+        || ui
+            .settings
+            .as_ref()
+            .is_some_and(|settings| settings.update_check.is_some())
+    {
+        return;
+    }
+    let now = Instant::now();
+    if ui
+        .last_update_schedule_poll
+        .is_some_and(|last| now.saturating_duration_since(last) < UPDATE_SCHEDULE_POLL_INTERVAL)
+    {
+        return;
+    }
+    ui.last_update_schedule_poll = Some(now);
+    match crate::update::start_scheduled_check(&env.paths) {
+        Ok(Some(receiver)) => ui.scheduled_update_check = Some(receiver),
+        Ok(None) => {}
+        Err(error) => {
+            ui.status_message = Some(format!("Could not schedule update check: {error}"));
+        }
+    }
+}
+
+fn poll_scheduled_update(ui: &mut TuiState, env: &RuntimeEnv) {
+    let Some(receiver) = ui.scheduled_update_check.as_ref() else {
+        return;
+    };
+    let result = match receiver.try_recv() {
+        Ok(result) => result,
+        Err(std::sync::mpsc::TryRecvError::Empty) => return,
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => Err("update worker stopped".into()),
+    };
+    ui.scheduled_update_check = None;
+    match result {
+        Ok(Some(available)) => {
+            if !crate::update::is_version_dismissed(&env.paths, &available.version) {
+                ui.scheduled_available_update = Some(available.clone());
+                if let Some(settings) = ui.settings.as_mut() {
+                    settings.update_status =
+                        Some(format!("{} available  [enter] Install", available.version));
+                    settings.available_update = Some(available);
+                    settings.waiting_for_scheduled_update = false;
+                }
+            } else if let Some(settings) = ui.settings.as_mut() {
+                if settings.waiting_for_scheduled_update {
+                    settings.update_status = Some("Up to date".into());
+                    settings.waiting_for_scheduled_update = false;
+                }
+            }
+        }
+        Ok(None) => {
+            if let Some(settings) = ui.settings.as_mut() {
+                if settings.waiting_for_scheduled_update {
+                    settings.update_status = Some("Up to date".into());
+                    settings.waiting_for_scheduled_update = false;
+                }
+            }
+        }
+        Err(error) => {
+            if let Some(settings) = ui.settings.as_mut() {
+                if settings.waiting_for_scheduled_update {
+                    settings.update_status = Some(format!("Check failed: {error}"));
+                    settings.waiting_for_scheduled_update = false;
+                }
+            }
+        }
+    }
+}
+
+fn scheduled_update_prompt_visible(ui: &TuiState, view: ViewKind) -> bool {
+    ui.scheduled_available_update.is_some()
+        && ui.settings.is_none()
+        && ui.add_fuel.is_none()
+        && ui.waiting_page == WaitingPage::Dashboard
+        && !ui.show_help
+        && view != ViewKind::Forge
+}
+
+fn scheduled_update_lines(
+    available: &crate::update::AvailableUpdate,
+    demo: bool,
+) -> Vec<Line<'static>> {
+    vec![
+        with_demo(Line::from(Span::styled("Svarog update", text_bold())), demo),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("Svarog {} is available.", available.version),
+            accent(),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "[enter/y] Install and restart  [esc/n] Not this version",
+            muted(),
+        )),
+    ]
 }
 
 fn view_refresh_due(last_refresh: Instant, now: Instant, force: bool) -> bool {
@@ -2900,7 +3046,11 @@ fn handle_settings_key(
                 settings.confirming_update = true;
             } else if settings.update_check.is_none() {
                 settings.update_status = Some("Checking for updates…".into());
-                settings.update_check = Some(crate::update::check_latest_async());
+                if ui.scheduled_update_check.is_some() {
+                    settings.waiting_for_scheduled_update = true;
+                } else {
+                    settings.update_check = Some(crate::update::start_manual_check(&env.paths)?);
+                }
             }
         }
         KeyCode::Enter => begin_setting_edit(settings),
@@ -3990,6 +4140,7 @@ mod tests {
             confirming_update: false,
             development: false,
             update_check: None,
+            waiting_for_scheduled_update: false,
             available_update: None,
             update_status: None,
             error: None,
@@ -4120,6 +4271,62 @@ mod tests {
         );
         assert_eq!(settings.available_update.as_ref().unwrap().tag, "v0.6.3");
         assert!(settings.update_check.is_none());
+    }
+
+    #[test]
+    fn scheduled_update_is_shared_with_settings_and_deferred_during_forges() {
+        let root = tempdir().unwrap();
+        let env = test_env(root.path().to_path_buf());
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let available = crate::update::AvailableUpdate {
+            version: semver::Version::new(0, 6, 3),
+            tag: "v0.6.3".into(),
+        };
+        sender.send(Ok(Some(available.clone()))).unwrap();
+        let mut settings = settings_state();
+        settings.waiting_for_scheduled_update = true;
+        settings.update_status = Some("Checking for updates…".into());
+        let mut ui = TuiState {
+            settings: Some(settings),
+            scheduled_update_check: Some(receiver),
+            ..TuiState::default()
+        };
+
+        poll_scheduled_update(&mut ui, &env);
+
+        assert_eq!(ui.scheduled_available_update, Some(available.clone()));
+        assert_eq!(
+            ui.settings.as_ref().unwrap().available_update,
+            Some(available)
+        );
+        assert!(!scheduled_update_prompt_visible(&ui, ViewKind::Idle));
+        ui.settings = None;
+        assert!(!scheduled_update_prompt_visible(&ui, ViewKind::Forge));
+        assert!(scheduled_update_prompt_visible(&ui, ViewKind::Idle));
+    }
+
+    #[test]
+    fn settings_reuses_an_in_flight_scheduled_check() {
+        let root = tempdir().unwrap();
+        let env = test_env(root.path().to_path_buf());
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        let mut settings = settings_state();
+        settings.row = 16;
+        let mut ui = TuiState {
+            settings: Some(settings),
+            scheduled_update_check: Some(receiver),
+            ..TuiState::default()
+        };
+
+        handle_settings_key(&mut ui, KeyCode::Enter, KeyModifiers::NONE, &env).unwrap();
+
+        let settings = ui.settings.as_ref().unwrap();
+        assert!(settings.waiting_for_scheduled_update);
+        assert!(settings.update_check.is_none());
+        assert_eq!(
+            settings.update_status.as_deref(),
+            Some("Checking for updates…")
+        );
     }
 
     #[test]

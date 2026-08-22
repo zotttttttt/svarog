@@ -265,3 +265,26 @@ fn failed_build_does_not_write_state_or_run_existing_binary() {
     assert!(!fixture.dev_root.join(".source-fingerprint").exists());
     assert!(!fixture.result.exists());
 }
+
+#[test]
+fn build_only_updates_the_checkout_without_launching_it() {
+    let fixture = LauncherFixture::new(true);
+
+    let output = fixture.run(&["--build-only"], false);
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(fs::read_to_string(&fixture.build_log).unwrap(), "build\n");
+    assert!(fixture.dev_root.join(".source-fingerprint").exists());
+    assert!(!fixture.result.exists());
+}
+
+#[test]
+fn build_only_rejects_application_arguments() {
+    let fixture = LauncherFixture::new(true);
+
+    let output = fixture.run(&["--build-only", "status"], false);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(!fixture.build_log.exists());
+    assert!(!fixture.result.exists());
+}

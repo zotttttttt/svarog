@@ -9,10 +9,22 @@ dev_binary="$target_dir/release/svarog"
 state_file="$dev_root/.source-fingerprint"
 
 explicit_update=false
-if [[ "${1:-}" == "--update" ]]; then
-  explicit_update=true
-  shift
-fi
+build_only=false
+case "${1:-}" in
+  --update)
+    explicit_update=true
+    shift
+    ;;
+  --build-only)
+    explicit_update=true
+    build_only=true
+    shift
+    if [[ "$#" -ne 0 ]]; then
+      echo "--build-only does not accept Svarog arguments" >&2
+      exit 2
+    fi
+    ;;
+esac
 
 for command_name in cksum find sort; do
   if ! command -v "$command_name" >/dev/null 2>&1; then
@@ -91,6 +103,10 @@ fi
 if [[ ! -x "$dev_binary" ]]; then
   echo "No development Svarog binary is available to run." >&2
   exit 1
+fi
+
+if [[ "$build_only" == true ]]; then
+  exit 0
 fi
 
 export SVAROG_MODE=dev

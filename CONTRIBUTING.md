@@ -32,6 +32,9 @@ scripts/svarog --update run
 
 Control the prompt with `SVAROG_UPDATE=ask`, `always`, or `never`. Development
 builds remain isolated even when a production `svarog` is installed on `PATH`.
+The internal `scripts/svarog --build-only` mode rebuilds and records the source
+fingerprint without launching Svarog; Settings uses it so a failed build can
+return to the previous development binary.
 
 ## Before opening a pull request
 
