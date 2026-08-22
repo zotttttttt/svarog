@@ -182,9 +182,6 @@ fn resolve_timeline_at(
     for (index, event) in timeline.events.into_iter().enumerate() {
         let explicit_time = event.time.as_deref().map(parse_meal_time).transpose()?;
         match (explicit_time, event.inherit_previous_time, index) {
-            (Some(_), true, _) => {
-                bail!("nutrition parser returned conflicting meal time fields")
-            }
             (None, true, 0) => bail!("the first meal event cannot inherit a time"),
             (None, false, index) if index > 0 => {
                 bail!("a later untimed meal event must inherit the previous time")
@@ -470,6 +467,8 @@ mod tests {
         assert!(include_str!("../prompts/fuel_entry.j2")
             .contains("separate events even when they have the same time"));
         assert!(include_str!("../prompts/fuel_entry.j2")
+            .contains("inherit_previous_time=false whenever `time` is not null"));
+        assert!(include_str!("../prompts/fuel_entry.j2")
             .contains("Sugar is part of total carbohydrates"));
         assert!(include_str!("../prompts/fuel_entry.j2").contains("no more than 120 characters"));
         assert_eq!(
@@ -649,11 +648,7 @@ mod tests {
     }
 
     #[test]
-    fn contradictory_time_inheritance_is_rejected() {
-        let mut explicit_inherit = timeline(None, &[Some("10:00")]);
-        explicit_inherit.events[0].inherit_previous_time = true;
-        assert!(resolve_timeline_at(explicit_inherit, local_now(12)).is_err());
-
+    fn invalid_untimed_inheritance_is_rejected() {
         let mut first_inherit = timeline(None, &[None]);
         first_inherit.events[0].inherit_previous_time = true;
         assert!(resolve_timeline_at(first_inherit, local_now(12)).is_err());
@@ -661,6 +656,44 @@ mod tests {
         let mut later_without_inherit = timeline(None, &[Some("10:00"), None]);
         later_without_inherit.events[1].inherit_previous_time = false;
         assert!(resolve_timeline_at(later_without_inherit, local_now(12)).is_err());
+    }
+
+    #[test]
+    fn explicit_times_override_inheritance_flags_for_repeated_times() {
+        let mut parsed = timeline(
+            None,
+            &[
+                Some("12:00"),
+                Some("14:00"),
+                Some("14:00"),
+                Some("16:00"),
+                Some("17:00"),
+                Some("17:00"),
+                Some("20:00"),
+            ],
+        );
+        parsed.events[2].inherit_previous_time = true;
+        parsed.events[5].inherit_previous_time = true;
+
+        let (events, _) = resolve_timeline_at(parsed, local_now(21)).unwrap();
+
+        assert_eq!(events.len(), 7);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.source_text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["meal 1", "meal 2", "meal 3", "meal 4", "meal 5", "meal 6", "meal 7"]
+        );
+        assert_eq!(events[2].consumed_at, events[1].consumed_at);
+        assert_eq!(events[5].consumed_at, events[4].consumed_at);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.parsed.totals().calories)
+                .sum::<f64>(),
+            2_800.0
+        );
     }
 
     #[test]

@@ -8,6 +8,7 @@ Rules:
 - If the user provides no date, return null for `date`. Do not infer yesterday from meal times; Svarog handles that deterministically.
 - If the user describes more than one distinct calendar date, set `multiple_dates=true`. Otherwise set it to false.
 - Split the intake into events by stated time. Return times in 24-hour HH:MM form.
+- Set inherit_previous_time=false whenever `time` is not null.
 - Set each event's `source_text` to a concise description containing only the food and drink belonging to that event, including the user's stated quantities. Never copy the complete day into every event.
 - For the first event without a stated time, return time=null and inherit_previous_time=false.
 - For later items without a new stated time, place them in the preceding event. If a separate untimed event is unavoidable, return time=null and inherit_previous_time=true.
