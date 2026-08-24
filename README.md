@@ -1,5 +1,5 @@
 <p align="center">
-  <img width="220" src="./svarog.png" alt="Svarog logo: an ember-lit smith at an anvil">
+  <img width="220" src="./assets/svarog-emblem.svg" alt="Svarog logo: an ember-lit smith at an anvil">
 </p>
 
 <h1 align="center">Svarog</h1>
