@@ -1,5 +1,5 @@
 <p align="center">
-  <img width="220" src="./svarog.png" alt="Svarog logo: an ember-lit smith at an anvil">
+  <img width="220" src="./assets/svarog-emblem.svg" alt="Svarog logo: an ember-lit smith at an anvil">
 </p>
 
 <h1 align="center">Svarog</h1>
@@ -23,9 +23,12 @@
 </p>
 
 Svarog is a local terminal dashboard that notices when Codex starts working and
-turns that wait into a tiny workout. It adapts movements to your equipment,
-preferences, recent activity, fatigue, and pain—then learns from what you
-finish, change, or skip.
+turns that wait into a tiny workout.
+
+Svarog adapts each forge to what you complete. It balances sides and recovery,
+adjusts reps to your performance, and backs off after fatigue, skips, or pain.
+
+Svarog can’t feel what you feel, so always stop if something doesn’t feel right.
 
 <p align="center">
   <a href="./assets/2-idle.png">
@@ -102,8 +105,8 @@ a local visual guide in your browser.
 </p>
 
 > Svarog starts conservatively, respects reported pain and fatigue, and excludes
-> exercises that require a partner. Recommendations are not medical advice;
-> stop whenever a movement hurts or feels unsafe.
+> exercises that require a partner. Stop any movement that hurts. Svarog is not
+> medical advice.
 
 ## Make it yours
 
