@@ -2,6 +2,13 @@
 
 Notable changes to Svarog are recorded here by the automated release process.
 
+## [0.7.1](https://github.com/zotttttttt/svarog/compare/v0.7.0...v0.7.1) (2026-08-25)
+
+
+### Fixes
+
+* Feat/emblem in svg ([aab856a](https://github.com/zotttttttt/svarog/commit/aab856a28eba0bb77cad49ac165a36d74c14bd62))
+
 ## [0.7.0](https://github.com/zotttttttt/svarog/compare/v0.6.2...v0.7.0) (2026-08-22)
 
 
