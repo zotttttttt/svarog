@@ -179,15 +179,23 @@ reset behavior, and isolated demo mode.
 | [Fuel and water](docs/fuel-and-water.md) | Meal logging, nutrition estimates, dates, and hydration |
 | [Data and privacy](docs/data-and-privacy.md) | Stored data, network boundaries, credentials, and deletion |
 
-## Project
+## Built with
 
-Svarog uses a compact local copy of
-[free-exercise-db](https://github.com/yuhonas/free-exercise-db) at
-[revision `b0eed061`](https://github.com/yuhonas/free-exercise-db/commit/b0eed061e1c832b3ed815fbaa4b45b3cdc14df49),
-published under the [Unlicense](https://github.com/yuhonas/free-exercise-db/blob/main/LICENSE.md).
-Instructions stay local; reference images download only when requested and are
-then cached locally.
+- [Rust](https://www.rust-lang.org/) — core application
+- [Ratatui](https://ratatui.rs/) with [Crossterm](https://github.com/crossterm-rs/crossterm) — terminal interface
+- [SQLite](https://www.sqlite.org/) — local data storage
 
-Svarog is built with Rust and Ratatui and released under the [MIT License](LICENSE).
-Contributions are welcome—see [CONTRIBUTING.md](CONTRIBUTING.md). The complete
-dependency and license inventory is in [THIRD_PARTY_NOTICES.html](THIRD_PARTY_NOTICES.html).
+## Thanks
+
+- [free-exercise-db](https://github.com/yuhonas/free-exercise-db) — exercise
+  instructions and reference images that make movements easier to follow
+  ([revision `b0eed061`](https://github.com/yuhonas/free-exercise-db/commit/b0eed061e1c832b3ed815fbaa4b45b3cdc14df49),
+  [Unlicense](https://github.com/yuhonas/free-exercise-db/blob/main/LICENSE.md))
+- [Recraft](https://www.recraft.ai/) — used to create Svarog's SVG emblem and
+  app icon
+
+## License
+
+Svarog is released under the [MIT License](LICENSE).\
+Dependency licenses are listed in [Third-Party Notices](THIRD_PARTY_NOTICES.html).\
+Contributions are welcome—see [Contributing](CONTRIBUTING.md).
