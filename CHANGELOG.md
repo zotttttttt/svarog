@@ -2,6 +2,13 @@
 
 Notable changes to Svarog are recorded here by the automated release process.
 
+## [0.7.2](https://github.com/zotttttttt/svarog/compare/v0.7.1...v0.7.2) (2026-08-27)
+
+
+### Fixes
+
+* Structured thank you and license sections ([1dbd6ca](https://github.com/zotttttttt/svarog/commit/1dbd6ca7f2134fc90f2a4ade90875d3e27f22a3e))
+
 ## [0.7.1](https://github.com/zotttttttt/svarog/compare/v0.7.0...v0.7.1) (2026-08-25)
 
 
