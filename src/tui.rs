@@ -316,7 +316,7 @@ impl std::fmt::Debug for SettingsState {
     }
 }
 
-const SETTINGS_ROWS: usize = 17;
+const SETTINGS_ROWS: usize = 18;
 
 fn settings_row_order(settings: &SettingsState) -> Vec<usize> {
     let mut rows = Vec::with_capacity(SETTINGS_ROWS);
@@ -324,7 +324,8 @@ fn settings_row_order(settings: &SettingsState) -> Vec<usize> {
     if settings.draft.recommender.backend == RecommenderBackend::OpenaiKeyring {
         rows.push(15);
     }
-    rows.extend(2..15);
+    rows.extend([2, 3, 17]);
+    rows.extend(4..15);
     rows.push(16);
     rows
 }
@@ -2176,6 +2177,10 @@ fn settings_lines_with_notification_reason(
                 )
             }),
         ),
+        (
+            "Forge frequency",
+            forge_frequency_label(settings.draft.preferences.forge_frequency),
+        ),
     ];
     let mut lines = vec![
         with_demo(Line::from(Span::styled("Settings", text_bold())), demo),
@@ -2298,6 +2303,14 @@ fn notification_setting_value(enabled: bool, unavailable_reason: Option<&str>) -
         format!("enabled · ⚠ {}", reason)
     } else {
         "enabled".to_string()
+    }
+}
+
+fn forge_frequency_label(frequency: u32) -> String {
+    if frequency == 1 {
+        "Every prompt".to_string()
+    } else {
+        format!("Every {frequency} prompts")
     }
 }
 
@@ -3008,6 +3021,23 @@ fn handle_settings_key(
                             .max_daily_sets
                             .saturating_sub(1)
                             .max(1)
+                    }
+                }
+                17 => {
+                    settings.draft.preferences.forge_frequency = if forward {
+                        settings
+                            .draft
+                            .preferences
+                            .forge_frequency
+                            .saturating_add(1)
+                            .min(config::MAX_FORGE_FREQUENCY)
+                    } else {
+                        settings
+                            .draft
+                            .preferences
+                            .forge_frequency
+                            .saturating_sub(1)
+                            .max(config::MIN_FORGE_FREQUENCY)
                     }
                 }
                 4 => {
@@ -3970,7 +4000,7 @@ fn forge_lines(rec: &Recommendation, ui: &TuiState) -> Vec<Line<'static>> {
             Line::from(""),
             Line::from(Span::styled("Are you fatigued?", text())),
             Line::from(Span::styled(
-                "This skips the next 5 opportunities.",
+                "This skips the next 5 forge opportunities.",
                 muted(),
             )),
             Line::from(""),
@@ -4292,6 +4322,7 @@ mod tests {
         assert!(text.contains("Apply changes"));
         assert!(text.contains("[ctrl/cmd+s] Apply changes  [esc] Cancel settings"));
         assert!(!text.contains("› Apply changes"));
+        assert!(text.contains("Forge frequency        Every prompt"));
 
         settings.selecting_archetype = true;
         let selector = settings_lines(&settings, false, 120, 40)
@@ -4304,6 +4335,35 @@ mod tests {
         assert!(selector.contains("You can change your archetype at any time."));
         assert!(selector.contains("[esc] Back"));
         assert!(!selector.contains('★'));
+    }
+
+    #[test]
+    fn settings_adjust_forge_frequency_within_one_to_twelve() {
+        let root = tempdir().unwrap().keep();
+        let env = test_env(root);
+        let mut settings = settings_state();
+        settings.row = 17;
+        let mut ui = TuiState {
+            settings: Some(settings),
+            ..TuiState::default()
+        };
+
+        handle_settings_key(&mut ui, KeyCode::Left, KeyModifiers::NONE, &env).unwrap();
+        assert_eq!(
+            ui.settings
+                .as_ref()
+                .unwrap()
+                .draft
+                .preferences
+                .forge_frequency,
+            1
+        );
+        for _ in 0..20 {
+            handle_settings_key(&mut ui, KeyCode::Right, KeyModifiers::NONE, &env).unwrap();
+        }
+        let settings = ui.settings.as_ref().unwrap();
+        assert_eq!(settings.draft.preferences.forge_frequency, 12);
+        assert_eq!(forge_frequency_label(12), "Every 12 prompts");
     }
 
     #[test]

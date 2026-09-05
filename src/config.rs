@@ -32,6 +32,8 @@ pub struct Onboarding {
 }
 
 pub const CURRENT_ONBOARDING_VERSION: u32 = 3;
+pub const MIN_FORGE_FREQUENCY: u32 = 1;
+pub const MAX_FORGE_FREQUENCY: u32 = 12;
 pub const STEP_HEIGHT: &str = "profile.height_cm";
 pub const STEP_WEIGHT: &str = "profile.weight_kg";
 pub const STEP_AGE: &str = "profile.age";
@@ -200,6 +202,8 @@ pub struct Agents {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Preferences {
+    #[serde(default = "default_forge_frequency")]
+    pub forge_frequency: u32,
     pub default_expected_duration_sec: u32,
     pub max_daily_sets: u32,
     #[serde(default = "default_true")]
@@ -309,6 +313,7 @@ impl Default for Config {
                 codex_command: "codex".to_string(),
             },
             preferences: Preferences {
+                forge_frequency: default_forge_frequency(),
                 default_expected_duration_sec: 60,
                 max_daily_sets: 100,
                 desktop_notifications: true,
@@ -377,6 +382,10 @@ fn default_exercise_preferences() -> String {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_forge_frequency() -> u32 {
+    MIN_FORGE_FREQUENCY
 }
 
 fn default_codex_recommender_model() -> String {
@@ -638,6 +647,10 @@ pub fn save(paths: &Paths, config: &Config) -> Result<()> {
 }
 
 fn normalize_loaded_config(config: &mut Config) {
+    config.preferences.forge_frequency = config
+        .preferences
+        .forge_frequency
+        .clamp(MIN_FORGE_FREQUENCY, MAX_FORGE_FREQUENCY);
     if config.onboarding.version < 3 && config.preferences.max_daily_sets == 12 {
         config.preferences.max_daily_sets = 100;
     }
@@ -814,6 +827,7 @@ mod tests {
         let config = Config::default();
 
         assert_eq!(config.forge.archetype, ArchetypeId::Athlete);
+        assert_eq!(config.preferences.forge_frequency, 1);
         assert_eq!(config.preferences.max_daily_sets, 100);
         assert!(config.preferences.desktop_notifications);
         assert_eq!(config.profile.exercise_preferences, "automatic");
@@ -840,6 +854,52 @@ mod tests {
         assert_eq!(config.recommender.openai.model, "gpt-5.6-luna");
         assert_eq!(config.recommender.timeout_ms, 60_000);
         assert_eq!(config.onboarding.pending_steps(), CURRENT_ONBOARDING_STEPS);
+    }
+
+    #[test]
+    fn missing_forge_frequency_defaults_to_every_prompt() {
+        let root = tempdir().unwrap();
+        let paths = Paths::from_root(root.path().join("svarog"));
+        let serialized = toml::to_string_pretty(&Config::default()).unwrap();
+        let mut value: toml::Value = toml::from_str(&serialized).unwrap();
+        value
+            .get_mut("preferences")
+            .and_then(toml::Value::as_table_mut)
+            .unwrap()
+            .remove("forge_frequency");
+        paths.ensure().unwrap();
+        fs::write(&paths.config_file, toml::to_string_pretty(&value).unwrap()).unwrap();
+
+        let loaded = load_or_default(&paths).unwrap();
+
+        assert_eq!(loaded.preferences.forge_frequency, 1);
+    }
+
+    #[test]
+    fn forge_frequency_preserves_explicit_values_and_clamps_invalid_values() {
+        let root = tempdir().unwrap();
+        let paths = Paths::from_root(root.path().join("svarog"));
+        let mut config = Config::default();
+        config.preferences.forge_frequency = 7;
+        save(&paths, &config).unwrap();
+        assert_eq!(
+            load_or_default(&paths).unwrap().preferences.forge_frequency,
+            7
+        );
+
+        config.preferences.forge_frequency = 0;
+        save(&paths, &config).unwrap();
+        assert_eq!(
+            load_or_default(&paths).unwrap().preferences.forge_frequency,
+            1
+        );
+
+        config.preferences.forge_frequency = 99;
+        save(&paths, &config).unwrap();
+        assert_eq!(
+            load_or_default(&paths).unwrap().preferences.forge_frequency,
+            12
+        );
     }
 
     #[test]

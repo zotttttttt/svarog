@@ -950,7 +950,10 @@ fn action_with_options(
             store.record_set(&rec, status)?;
         }
         if fatigued {
-            store.suppress_next_opportunities(5)?;
+            let config = config::load_or_default(paths)?;
+            store.suppress_next_opportunities(fatigue_suppression_prompts(
+                config.preferences.forge_frequency,
+            ))?;
         }
     } else if let Some(id) = rec.id {
         store.set_state(AppStateKind::Active, Some(id), None, None)?;
@@ -962,6 +965,10 @@ fn action_with_options(
         println!("{next_status}");
     }
     Ok(())
+}
+
+fn fatigue_suppression_prompts(forge_frequency: u32) -> u32 {
+    forge_frequency.saturating_mul(5)
 }
 
 fn text(value: impl std::fmt::Display) -> String {
@@ -1733,5 +1740,12 @@ mod tests {
         assert!(parse_full_reset_confirmation("").is_err());
         assert!(parse_full_reset_confirmation("delete all").is_err());
         assert!(parse_full_reset_confirmation("DESTROY ALL").is_err());
+    }
+
+    #[test]
+    fn fatigue_suppression_scales_with_forge_frequency() {
+        assert_eq!(fatigue_suppression_prompts(1), 5);
+        assert_eq!(fatigue_suppression_prompts(2), 10);
+        assert_eq!(fatigue_suppression_prompts(12), 60);
     }
 }

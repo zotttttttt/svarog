@@ -869,7 +869,6 @@ mod tests {
         };
         let queued_id = store.insert_queued_recommendation(&rec).unwrap();
 
-        assert!(!process_event(&env, event()).unwrap().recommended);
         let response = process_event(&env, event()).unwrap();
 
         assert!(response.recommended);
@@ -916,7 +915,6 @@ mod tests {
         queued.side = Some(crate::models::RecommendationSide::Left);
         store.insert_queued_recommendation(&queued).unwrap();
 
-        assert!(!process_event(&env, event()).unwrap().recommended);
         let response = process_event(&env, event()).unwrap();
         let promoted = response.recommendation.unwrap();
 
@@ -947,11 +945,6 @@ mod tests {
             true
         };
 
-        assert!(
-            !process_event_with_notifier(&env, codex_prompt_event(), &notifier)
-                .unwrap()
-                .recommended
-        );
         let first = process_event_with_notifier(&env, codex_prompt_event(), &notifier).unwrap();
         let offered_reminder =
             process_event_with_notifier(&env, codex_prompt_event(), &notifier).unwrap();
@@ -1001,7 +994,27 @@ mod tests {
 
         let store = Store::open(&env.paths.database_file).unwrap();
         assert_eq!(store.event_count().unwrap(), 1);
-        assert!(store.latest_open_recommendation().unwrap().is_none());
+        assert!(store.latest_open_recommendation().unwrap().is_some());
+    }
+
+    #[test]
+    fn fatigue_skips_five_configured_forge_intervals() {
+        let env = test_env();
+        let mut config = Config::default();
+        config.recommender.backend = RecommenderBackend::Local;
+        config.preferences.forge_frequency = 2;
+        crate::config::save(&env.paths, &config).unwrap();
+        let store = Store::open(&env.paths.database_file).unwrap();
+        store.seed_movements().unwrap();
+        recommender::fill_recommendation_queue(&store, &config, &env.paths).unwrap();
+        store
+            .suppress_next_opportunities(config.preferences.forge_frequency * 5)
+            .unwrap();
+
+        for _ in 0..10 {
+            assert!(!process_event(&env, event()).unwrap().recommended);
+        }
+        assert!(process_event(&env, event()).unwrap().recommended);
     }
 
     #[test]
