@@ -1765,30 +1765,6 @@ impl Store {
             .context("loading today's stats")
     }
 
-    pub fn recent_outcomes(&self, limit: u32) -> Result<Vec<OutcomeSummary>> {
-        let mut statement = self.conn.prepare(
-            r#"
-            SELECT s.movement_id, s.status, COALESCE(r.reps, s.reps), s.reps, s.created_at
-            FROM sets s
-            LEFT JOIN recommendations r ON r.id = s.recommendation_id
-            WHERE s.status IN ('done', 'skipped', 'pain')
-            ORDER BY s.created_at DESC, s.id DESC
-            LIMIT ?1
-            "#,
-        )?;
-        let rows = statement.query_map([i64::from(limit)], |row| {
-            Ok(OutcomeSummary {
-                movement_id: row.get(0)?,
-                status: row.get(1)?,
-                prescribed_reps: row.get::<_, i64>(2)? as u32,
-                actual_reps: row.get::<_, i64>(3)? as u32,
-                created_at: row.get(4)?,
-            })
-        })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .context("loading recent forge outcomes")
-    }
-
     pub fn recent_movement_outcomes(
         &self,
         movement_id: &str,

@@ -17,9 +17,11 @@ Advanced settings live in:
 ```
 
 Stop Svarog before editing the file so a running process cannot overwrite your
-changes. Useful advanced settings include the daily forge ceiling (completed
-forges, not repetitions), notification behavior, recommender selection,
-timeouts, fallback behavior, and the Codex/OpenAI model configuration.
+changes. Useful advanced settings include forge frequency (every 1–12 Codex
+prompts), the daily forge ceiling (completed forges, not repetitions),
+notification behavior, recommender selection, timeouts, fallback behavior, and
+the Codex/OpenAI model configuration. Forge frequency defaults to every prompt
+and can be changed from Settings without repeating setup.
 
 ## Forge archetypes
 

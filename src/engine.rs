@@ -147,39 +147,7 @@ pub fn opportunity_allows(store: &Store, config: &Config) -> Result<bool> {
     if store.today_set_count()? >= config.preferences.max_daily_sets {
         return Ok(false);
     }
-    let outcomes = store.recent_outcomes(5)?;
-    let required = if outcomes.is_empty() {
-        2
-    } else {
-        let adverse = outcomes
-            .iter()
-            .take(3)
-            .filter(|item| item.status != "done" || item.actual_reps < item.prescribed_reps)
-            .count();
-        if outcomes.iter().any(|item| item.status == "pain") || adverse >= 2 {
-            5
-        } else if adverse == 1 {
-            3
-        } else {
-            let streak = outcomes
-                .iter()
-                .take_while(|item| {
-                    item.status == "done" && item.actual_reps >= item.prescribed_reps
-                })
-                .count();
-            let threshold = if crate::archetypes::get(config.forge.archetype).stats.stamina >= 8 {
-                3
-            } else {
-                5
-            };
-            if streak >= threshold {
-                1
-            } else {
-                2
-            }
-        }
-    };
-    Ok(store.events_since_last_outcome()? >= required)
+    Ok(store.events_since_last_outcome()? >= config.preferences.forge_frequency as usize)
 }
 
 #[cfg(test)]
@@ -270,21 +238,19 @@ mod tests {
     }
 
     #[test]
-    fn opportunity_gate_starts_every_second_agent_run() {
+    fn default_opportunity_gate_starts_on_first_agent_run() {
         let store = test_store();
         let config = Config::default();
         store.insert_event(&event(90)).unwrap();
 
-        assert!(!opportunity_allows(&store, &config).unwrap());
-
-        store.insert_event(&event(90)).unwrap();
         assert!(opportunity_allows(&store, &config).unwrap());
     }
 
     #[test]
-    fn opportunity_gate_backs_off_after_reduced_reps() {
+    fn configured_opportunity_gate_waits_for_frequency_after_reduced_reps() {
         let store = test_store();
-        let config = Config::default();
+        let mut config = Config::default();
+        config.preferences.forge_frequency = 2;
         let mut rec = recommend(&store, &config, &event(90)).unwrap().unwrap();
         rec.reps = 8;
         rec.id = Some(store.insert_recommendation(&rec).unwrap());
@@ -292,16 +258,14 @@ mod tests {
             .record_set_with_reps(&rec, SetStatus::Done, 4)
             .unwrap();
 
-        for _ in 0..2 {
-            store.insert_event(&event(90)).unwrap();
-        }
+        store.insert_event(&event(90)).unwrap();
         assert!(!opportunity_allows(&store, &config).unwrap());
         store.insert_event(&event(90)).unwrap();
         assert!(opportunity_allows(&store, &config).unwrap());
     }
 
     #[test]
-    fn pain_backoff_survives_a_later_compliant_forge() {
+    fn pain_does_not_override_configured_frequency() {
         let store = test_store();
         let config = Config::default();
         let mut painful = recommend(&store, &config, &event(90)).unwrap().unwrap();
@@ -312,23 +276,22 @@ mod tests {
         completed.id = Some(store.insert_recommendation(&completed).unwrap());
         store.record_set(&completed, SetStatus::Done).unwrap();
 
-        for _ in 0..4 {
-            store.insert_event(&event(90)).unwrap();
-        }
-        assert!(!opportunity_allows(&store, &config).unwrap());
         store.insert_event(&event(90)).unwrap();
         assert!(opportunity_allows(&store, &config).unwrap());
     }
 
     #[test]
-    fn high_stamina_archetype_accelerates_after_three_compliant_forges() {
+    fn archetype_does_not_override_configured_frequency() {
         let store = test_store();
-        let config = Config::default();
+        let mut config = Config::default();
+        config.preferences.forge_frequency = 2;
         for _ in 0..3 {
             let mut rec = recommend(&store, &config, &event(90)).unwrap().unwrap();
             rec.id = Some(store.insert_recommendation(&rec).unwrap());
             store.record_set(&rec, SetStatus::Done).unwrap();
         }
+        store.insert_event(&event(90)).unwrap();
+        assert!(!opportunity_allows(&store, &config).unwrap());
         store.insert_event(&event(90)).unwrap();
         assert!(opportunity_allows(&store, &config).unwrap());
     }
