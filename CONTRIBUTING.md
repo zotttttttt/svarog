@@ -76,28 +76,45 @@ be squash-merged so that Release Please can use that title as the release
 commit. As changes reach `main`, Release Please maintains a release PR with the
 next version and changelog. Merging that PR creates the tag and GitHub Release;
 the release-assets workflow then attaches macOS and Linux archives, their
-checksums, and a version-bound shell installer.
+checksums, and a version-bound shell installer before publishing `svarog-cli`
+to crates.io.
 
-## First crates.io publication
+## Crates.io publishing
 
-The crates.io package is named `svarog-cli`; its binary remains `svarog`. The
-first version must be published manually so crates.io can establish ownership
-before trusted publishing is configured.
+The crates.io package is named `svarog-cli`; its binary remains `svarog`.
+Publication uses crates.io trusted publishing, which exchanges the release
+workflow's GitHub OIDC identity for a short-lived token. No crates.io token is
+stored in the repository.
 
-After the corresponding GitHub Release has finished uploading all assets,
-check out the exact release tag in a clean worktree and run:
+Configure the publisher once in the `svarog-cli` settings on crates.io:
+
+- Repository owner: `zotttttttt`
+- Repository name: `svarog`
+- Workflow filename: `release-assets.yml`
+- Environment: `publish`
+
+Create the matching `publish` environment in the GitHub repository settings.
+Require maintainer approval, disable administrator bypass, and allow deployments
+from `main` and `v*` tags. The release workflow verifies that the tag belongs to
+a published GitHub Release and exactly matches the Cargo package version, waits
+for all release assets to upload, performs a dry run, and then publishes.
+Rerunning an already-published version is safe.
+
+To publish an existing release after enabling trusted publishing, manually run
+the **Release assets** workflow with its tag, such as `v0.7.3`. This rebuilds
+and verifies the release assets before attempting crates.io publication.
+
+The first publication of a new crate name must still be performed manually so
+crates.io can establish ownership before trusted publishing is configured:
 
 ```bash
-cargo package --list
 cargo publish --dry-run --locked
 cargo publish --locked
 ```
 
 Confirm that both `cargo install svarog-cli --locked` and
 `cargo binstall svarog-cli` install a binary whose `svarog --version` matches
-the tag. Then configure a crates.io trusted publisher for this repository and a
-dedicated GitHub Actions environment. Add automated OIDC publication in a
-follow-up change so the first release cannot race unconfigured credentials.
+the tag.
 
 ## One-time release automation setup
 
