@@ -2,6 +2,13 @@
 
 Notable changes to Svarog are recorded here by the automated release process.
 
+## [0.7.3](https://github.com/zotttttttt/svarog/compare/v0.7.2...v0.7.3) (2026-09-05)
+
+
+### Fixes
+
+* Fix/configurable forge frequency ([b2c8b34](https://github.com/zotttttttt/svarog/commit/b2c8b3467003c8a06f64da3eab9971c88731feff))
+
 ## [0.7.2](https://github.com/zotttttttt/svarog/compare/v0.7.1...v0.7.2) (2026-08-27)
 
 
