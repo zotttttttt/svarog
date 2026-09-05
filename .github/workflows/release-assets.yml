@@ -3,13 +3,57 @@ name: Release assets
 on:
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to rebuild and publish
+        required: true
+        type: string
+
+env:
+  RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+
+concurrency:
+  group: release-assets-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
 
 jobs:
+  preflight:
+    name: Verify release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+
+      - name: Verify published release and package version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          case "$RELEASE_TAG" in
+            v*) ;;
+            *)
+              echo "Release tag must start with v: ${RELEASE_TAG}" >&2
+              exit 1
+              ;;
+          esac
+
+          published_tag="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" \
+            --jq 'if .draft == false and .published_at != null then .tag_name else empty end')"
+          test "$published_tag" = "$RELEASE_TAG"
+
+          package_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          test "$RELEASE_TAG" = "v${package_version}"
+
   build:
     name: Build ${{ matrix.target }}
+    needs: preflight
     strategy:
       fail-fast: false
       matrix:
@@ -24,7 +68,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ env.RELEASE_TAG }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
@@ -38,7 +82,6 @@ jobs:
 
       - name: Verify and package binary
         env:
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
           TARGET: ${{ matrix.target }}
         run: |
           version="${RELEASE_TAG#v}"
@@ -81,7 +124,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ env.RELEASE_TAG }}
           persist-credentials: false
 
       - name: Download build artifacts
@@ -95,8 +138,6 @@ jobs:
         run: sha256sum -- *.tar.gz > SHA256SUMS
 
       - name: Generate and verify installer
-        env:
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           version="${RELEASE_TAG#v}"
           checksum_for() {
@@ -199,18 +240,16 @@ jobs:
       - name: Upload assets to GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: >-
           gh release upload "$RELEASE_TAG" dist/*.tar.gz dist/SHA256SUMS
           dist/binary-size.json dist/svarog-installer.sh
           --clobber --repo "$GITHUB_REPOSITORY"
 
       - name: Update latest binary size badge
-        if: ${{ !github.event.release.prerelease }}
+        if: ${{ github.event_name == 'workflow_dispatch' || !github.event.release.prerelease }}
         env:
           BADGE_BRANCH: badges
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           badge_path="binary-size.json"
           badge_api="repos/${GITHUB_REPOSITORY}/contents/${badge_path}"
@@ -232,3 +271,62 @@ jobs:
             -f sha="$badge_sha" \
             -f branch="$BADGE_BRANCH" \
             >/dev/null
+
+  publish-crate:
+    name: Publish crate to crates.io
+    needs: publish
+    runs-on: ubuntu-latest
+    environment: publish
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          key: publish-crate
+
+      - name: Verify release version
+        id: crate
+        run: |
+          package_name="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].name')"
+          package_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          test "$RELEASE_TAG" = "v${package_version}"
+
+          status="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+            --retry 3 \
+            --user-agent "svarog-release-workflow (${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY})" \
+            "https://crates.io/api/v1/crates/${package_name}/${package_version}")"
+          case "$status" in
+            200)
+              echo "${package_name} ${package_version} is already published."
+              echo "published=true" >> "$GITHUB_OUTPUT"
+              ;;
+            404)
+              echo "published=false" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "Unexpected crates.io response: HTTP ${status}" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Verify crate package
+        if: ${{ steps.crate.outputs.published != 'true' }}
+        run: cargo publish --dry-run --locked
+
+      - name: Authenticate with crates.io
+        if: ${{ steps.crate.outputs.published != 'true' }}
+        id: auth
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+
+      - name: Publish crate
+        if: ${{ steps.crate.outputs.published != 'true' }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        # The package was verified before the short-lived token was issued.
+        run: cargo publish --locked --no-verify
