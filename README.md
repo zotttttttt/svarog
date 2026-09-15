@@ -22,8 +22,8 @@
   <a href="https://github.com/zotttttttt/svarog/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-888888?style=flat-square&amp;labelColor=070808" alt="MIT license"></a>
 </p>
 
-Svarog is a local terminal dashboard that notices when Codex starts working and
-turns that wait into a tiny workout.
+Svarog is a local terminal dashboard that notices when Codex or Claude Code
+starts working and turns that wait into a tiny workout.
 
 Svarog adapts each forge to what you complete. It balances sides and recovery,
 adjusts reps to your performance, and backs off after fatigue, skips, or pain.
@@ -53,14 +53,17 @@ The installer selects the binary for your computer, verifies its embedded
 SHA-256 checksum, and installs it to `~/.local/bin`. If that directory is not on
 your `PATH`, it prints the exact line to add for future runs.
 
-On first run, press Enter to accept the conservative defaults. Setup connects
-Svarog to Codex lifecycle hooks and opens the dashboard. Keep it open while you
-work in any Codex terminal. Codex may ask once to trust the hook.
+On first run, choose **All**, **Codex**, or **Claude Code**, then accept the
+conservative defaults. Setup connects Svarog to the selected lifecycle hooks
+and opens the dashboard. Keep it open while you work in a selected coding-agent
+terminal. Each CLI may ask once to trust its hook; Claude Code hooks run after
+you trust the workspace.
 
 Prefer to open both tools together? With `tmux` installed, run:
 
 ```bash
 svarog session codex
+svarog session claude
 ```
 
 For provenance verification, Cargo, manual downloads, upgrades, and source
@@ -68,17 +71,17 @@ builds, see [Installation](docs/installation.md).
 
 ## How it works
 
-1. You submit a task to Codex.
-2. Codex hooks tell the local Svarog dashboard that work has started.
+1. You submit a task to a selected coding agent.
+2. Its lifecycle hooks tell the local Svarog dashboard that work has started.
 3. Svarog prepares a safe movement short enough to finish during the wait.
 4. Your completions, changed reps, skips, fatigue, and pain shape what comes
    next.
 
 A ready movement remains available until you finish, skip, or report pain—even
-if the Codex turn that triggered it has already ended. Coding prompt text is
-never collected or sent in recommendation requests.
+if the coding-agent turn that triggered it has already ended. Coding prompt
+text is never collected or sent in recommendation requests.
 
-## Forge while Codex works
+## Forge while your coding agent works
 
 Start the suggested movement with `f`, record it with Enter, or adjust the reps
 with `+` and `-`. Use `i` for instructions, `s` to skip or report fatigue, and

@@ -1,6 +1,7 @@
 use crate::cli;
 use crate::config::{
-    self, Config, Forge, Paths, RecommenderBackend, RuntimeEnv, RuntimeMode, UnitSystem,
+    self, CodingAgentSelection, Config, Forge, Paths, RecommenderBackend, RuntimeEnv, RuntimeMode,
+    UnitSystem,
 };
 use crate::daemon::{self, ForgeNowResult, QueueRegenerationResult, QueueRegenerationStart};
 use crate::exercise_catalog::{self, ExerciseCatalogEntry};
@@ -316,7 +317,7 @@ impl std::fmt::Debug for SettingsState {
     }
 }
 
-const SETTINGS_ROWS: usize = 18;
+const SETTINGS_ROWS: usize = 19;
 
 fn settings_row_order(settings: &SettingsState) -> Vec<usize> {
     let mut rows = Vec::with_capacity(SETTINGS_ROWS);
@@ -324,7 +325,7 @@ fn settings_row_order(settings: &SettingsState) -> Vec<usize> {
     if settings.draft.recommender.backend == RecommenderBackend::OpenaiKeyring {
         rows.push(15);
     }
-    rows.extend([2, 3, 17]);
+    rows.extend([2, 18, 3, 17]);
     rows.extend(4..15);
     rows.push(16);
     rows
@@ -2181,6 +2182,16 @@ fn settings_lines_with_notification_reason(
             "Forge frequency",
             forge_frequency_label(settings.draft.preferences.forge_frequency),
         ),
+        (
+            "Coding agent",
+            settings
+                .draft
+                .agents
+                .coding_agent
+                .map(CodingAgentSelection::label)
+                .unwrap_or("not configured")
+                .to_string(),
+        ),
     ];
     let mut lines = vec![
         with_demo(Line::from(Span::styled("Settings", text_bold())), demo),
@@ -2769,8 +2780,21 @@ fn apply_settings(
 ) -> Result<Option<Receiver<QueueRegenerationResult>>> {
     let previous = config::load_or_default(&env.paths)?;
     let recommender_changed = previous.recommender.backend != draft.recommender.backend;
+    let agent_changed = previous.agents.coding_agent != draft.agents.coding_agent;
+    if agent_changed {
+        let selection = draft
+            .agents
+            .coding_agent
+            .context("choose a coding agent before saving Settings")?;
+        crate::hooks::reconcile(env, selection)?;
+    }
     let config_existed = env.paths.config_file.exists();
-    config::save(&env.paths, draft)?;
+    if let Err(error) = config::save(&env.paths, draft) {
+        if let Some(selection) = previous.agents.coding_agent {
+            let _ = crate::hooks::reconcile(env, selection);
+        }
+        return Err(error);
+    }
     let equipment = exercise_catalog::locally_resolved_equipment(&draft.profile.equipment_text);
     let movements = exercise_catalog::movements_for_equipment(&equipment);
     let equipment_filter = serde_json::to_string(&crate::recommender::normalize_equipment(
@@ -2791,6 +2815,11 @@ fn apply_settings(
             std::fs::remove_file(&env.paths.config_file)
                 .with_context(|| format!("removing {}", env.paths.config_file.display()))
         };
+        if agent_changed {
+            if let Some(selection) = previous.agents.coding_agent {
+                let _ = crate::hooks::reconcile(env, selection);
+            }
+        }
         return match rollback {
             Ok(()) => Err(error.context("applying settings; previous configuration restored")),
             Err(rollback_error) => Err(anyhow::anyhow!(
@@ -3039,6 +3068,22 @@ fn handle_settings_key(
                             .saturating_sub(1)
                             .max(config::MIN_FORGE_FREQUENCY)
                     }
+                }
+                18 => {
+                    settings.draft.agents.coding_agent = Some(
+                        settings
+                            .draft
+                            .agents
+                            .coding_agent
+                            .map(|selection| {
+                                if forward {
+                                    selection.next()
+                                } else {
+                                    selection.previous()
+                                }
+                            })
+                            .unwrap_or(CodingAgentSelection::All),
+                    );
                 }
                 4 => {
                     settings.draft.profile.unit_system =
@@ -5026,7 +5071,8 @@ mod tests {
         RuntimeEnv {
             mode: RuntimeMode::Dev,
             paths: Paths::from_root(root.clone()),
-            codex_home: root,
+            codex_home: root.join("codex"),
+            claude_config_dir: root.join("claude"),
             daemon_addr: "127.0.0.1:0".parse().unwrap(),
             dry_run: true,
         }
@@ -5062,6 +5108,30 @@ mod tests {
             config::load_or_default(&env.paths).unwrap().profile.goals,
             vec!["mobility"]
         );
+    }
+
+    #[test]
+    fn settings_apply_reconciles_the_selected_coding_agent() {
+        let root = tempdir().unwrap().keep();
+        let env = test_env(root);
+        let mut previous = Config::default();
+        previous.agents.coding_agent = Some(CodingAgentSelection::Codex);
+        config::save(&env.paths, &previous).unwrap();
+        crate::hooks::reconcile(&env, CodingAgentSelection::Codex).unwrap();
+
+        let mut draft = previous;
+        draft.agents.coding_agent = Some(CodingAgentSelection::Claude);
+        assert!(apply_settings(&env, &draft).unwrap().is_none());
+
+        assert_eq!(
+            config::load_or_default(&env.paths)
+                .unwrap()
+                .agents
+                .coding_agent,
+            Some(CodingAgentSelection::Claude)
+        );
+        assert!(!crate::hooks::is_configured(&env, CodingAgentSelection::Codex).unwrap());
+        assert!(crate::hooks::is_configured(&env, CodingAgentSelection::Claude).unwrap());
     }
 
     #[test]

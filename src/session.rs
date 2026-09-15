@@ -7,9 +7,28 @@ use std::process::{Command, Stdio};
 pub fn run(agent: Agent, env: &RuntimeEnv) -> Result<()> {
     let paths = &env.paths;
     let config = load_or_default(paths)?;
+    if matches!(agent, Agent::Codex | Agent::Claude) {
+        let selection = config
+            .agents
+            .coding_agent
+            .context("choose a coding agent in Svarog Settings first")?;
+        if !selection.includes(agent) {
+            bail!("{agent} is not enabled; choose it in Svarog Settings first");
+        }
+        match agent {
+            Agent::Codex => {
+                hooks::install_global_codex(env)?;
+            }
+            Agent::Claude => {
+                hooks::install_global_claude(env)?;
+            }
+            _ => unreachable!(),
+        }
+    } else {
+        let _ = hooks::install(env, agent);
+    }
     let store = crate::storage::Store::open(&paths.database_file)?;
     store.insert_session(agent, None)?;
-    let _ = hooks::install(env, agent);
     let agent_command = match agent {
         Agent::Codex => config.agents.codex_command,
         Agent::Claude => "claude".to_string(),

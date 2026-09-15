@@ -301,8 +301,9 @@ pub struct IncomingEvent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CodexHookEvent {
+pub struct LifecycleHookEvent {
     pub session_id: String,
+    #[serde(default, alias = "prompt_id")]
     pub turn_id: Option<String>,
     pub cwd: String,
     pub hook_event_name: String,
@@ -310,7 +311,7 @@ pub struct CodexHookEvent {
     pub reason: Option<String>,
 }
 
-impl CodexHookEvent {
+impl LifecycleHookEvent {
     pub fn validate(&self) -> Result<()> {
         validate_text("session_id", &self.session_id, 256)?;
         validate_optional_text("turn_id", self.turn_id.as_deref(), 256)?;
@@ -321,9 +322,13 @@ impl CodexHookEvent {
             self.hook_event_name.as_str(),
             "SessionStart" | "UserPromptSubmit" | "Stop" | "SessionEnd"
         ) {
-            bail!("unsupported Codex lifecycle event");
+            bail!("unsupported coding-agent lifecycle event");
         }
         Ok(())
+    }
+
+    pub fn external_turn_id(&self) -> Option<&str> {
+        self.turn_id.as_deref()
     }
 
     pub fn project(&self) -> Option<String> {
@@ -394,7 +399,7 @@ mod input_validation_tests {
 
     #[test]
     fn codex_hook_accepts_only_bounded_known_lifecycle_events() {
-        let mut hook = CodexHookEvent {
+        let mut hook = LifecycleHookEvent {
             session_id: "session-1".into(),
             turn_id: Some("turn-1".into()),
             cwd: "/work/svarog".into(),
