@@ -2,6 +2,13 @@
 
 Notable changes to Svarog are recorded here by the automated release process.
 
+## [0.7.4](https://github.com/zotttttttt/svarog/compare/v0.7.3...v0.7.4) (2026-09-15)
+
+
+### Fixes
+
+* **deps:** update rustls to 0.23.45 ([#52](https://github.com/zotttttttt/svarog/issues/52)) ([9d21fc5](https://github.com/zotttttttt/svarog/commit/9d21fc5a33528408fc4ab2112e70db84c6ed9020))
+
 ## [0.7.3](https://github.com/zotttttttt/svarog/compare/v0.7.2...v0.7.3) (2026-09-05)
 
 
