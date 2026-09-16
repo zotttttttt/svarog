@@ -22,8 +22,11 @@ current user.
 
 The database contains your profile, available movement pool, queue, completed
 and skipped movements, reps, pain and fatigue reports, cooldown state, and
-recommender token totals. Setup answers can include age, height, weight, goals,
-equipment, preferences, cautious body parts, and injuries.
+recommender token totals. It also records lifecycle metadata for selected
+coding-agent activity: the agent name, project basename, external session ID,
+and event timestamps. It does not retain coding-prompt text. Setup answers can
+include age, height, weight, goals, equipment, preferences, cautious body
+parts, and injuries.
 
 ## Local collector
 

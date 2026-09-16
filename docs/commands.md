@@ -47,6 +47,20 @@ recorded check-in in your selected unit system.
 After `svarog setup` completes, press Enter at the final prompt to open the
 dashboard immediately. `svarog setup --dry-run` prints its preview and exits.
 
+## Claude Code hook health
+
+`svarog status` reports when the selected Claude Code integration is missing or
+appears disabled. `disableAllHooks: true` in readable Claude settings disables
+the installed hooks. On macOS and Linux, Svarog also checks readable file-based
+managed settings for `allowManagedHooksOnly: true`; that policy can prevent
+user-level Svarog hooks from running.
+
+Some restrictions cannot be inspected locally: server- or MDM-managed policy,
+and a Claude Code invocation using safe or bare mode. Those modes can disable
+hooks for that run. Remove the disabling setting or policy restriction, then
+run `svarog setup` to repair the selected integration. These findings are
+warnings, so setup can still finish when policy is controlled outside Svarog.
+
 ## Dashboard controls
 
 While waiting:

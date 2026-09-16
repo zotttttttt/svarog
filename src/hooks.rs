@@ -8,6 +8,19 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntegrationStatus {
+    pub configured: bool,
+    pub warnings: Vec<String>,
+}
+
+struct PreparedSettings {
+    path: PathBuf,
+    target: PathBuf,
+    original: Option<Vec<u8>>,
+    updated: Option<Vec<u8>>,
+}
+
 pub fn print(agent: Agent) {
     match agent {
         Agent::Codex => {
@@ -104,36 +117,68 @@ pub fn reconcile(env: &RuntimeEnv, selection: CodingAgentSelection) -> Result<()
     let mut prepared = Vec::new();
     for (agent, enabled, script) in specs {
         let path = settings_path(env, agent)?;
-        let original = fs::read(&path).ok();
+        let original = read_optional(&path)?;
         let updated = updated_settings(&path, agent, enabled, &script)?;
-        prepared.push((path, original, updated));
+        let target = resolve_write_target(&path)?;
+        prepared.push(PreparedSettings {
+            path,
+            target,
+            original,
+            updated,
+        });
     }
 
-    let mut written: Vec<usize> = Vec::new();
-    for (index, (path, _original, updated)) in prepared.iter().enumerate() {
-        let Some(updated) = updated else {
+    for item in prepared.iter().filter(|item| item.updated.is_some()) {
+        let parent = item
+            .target
+            .parent()
+            .with_context(|| format!("{} has no parent directory", item.target.display()))?;
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    apply_prepared(&prepared, atomic_write_resolved_user_only, restore_prepared)
+}
+
+fn apply_prepared(
+    prepared: &[PreparedSettings],
+    mut write: impl FnMut(&Path, &[u8]) -> Result<()>,
+    mut restore: impl FnMut(&PreparedSettings) -> Result<()>,
+) -> Result<()> {
+    let mut written = Vec::new();
+    for (index, item) in prepared.iter().enumerate() {
+        let Some(updated) = &item.updated else {
             continue;
         };
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-        }
-        if let Err(error) = atomic_write_user_only(path, updated) {
+        if let Err(error) = write(&item.target, updated) {
+            let mut rollback_errors = Vec::new();
             for index in written.into_iter().rev() {
-                let (written_path, previous, _) = &prepared[index];
-                match previous {
-                    Some(previous) => {
-                        let _ = atomic_write_user_only(written_path, previous);
-                    }
-                    None => {
-                        let _ = fs::remove_file(written_path);
-                    }
+                if let Err(rollback_error) = restore(&prepared[index]) {
+                    rollback_errors.push(rollback_error.to_string());
                 }
             }
-            return Err(error.context("reconciling coding-agent hooks"));
+            if rollback_errors.is_empty() {
+                return Err(
+                    error.context("reconciling coding-agent hooks; previous settings restored")
+                );
+            }
+            bail!(
+                "reconciling coding-agent hooks failed: {error}; rollback also failed: {}",
+                rollback_errors.join("; ")
+            );
         }
         written.push(index);
     }
     Ok(())
+}
+
+fn restore_prepared(item: &PreparedSettings) -> Result<()> {
+    match &item.original {
+        Some(original) => atomic_write_resolved_user_only(&item.target, original),
+        None => match fs::remove_file(&item.target) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).with_context(|| format!("removing {}", item.path.display())),
+        },
+    }
 }
 
 pub fn is_configured(env: &RuntimeEnv, selection: CodingAgentSelection) -> Result<bool> {
@@ -148,17 +193,47 @@ pub fn is_configured(env: &RuntimeEnv, selection: CodingAgentSelection) -> Resul
             if !script.is_file() {
                 return Ok(false);
             }
-            if updated_settings(&path, agent, true, &script)?.is_some() {
+            if !settings_are_current(&path, agent, true, &script)? {
                 return Ok(false);
             }
         } else if path.exists() {
             let script = PathBuf::new();
-            if updated_settings(&path, agent, false, &script)?.is_some() {
+            if !settings_are_current(&path, agent, false, &script)? {
                 return Ok(false);
             }
         }
     }
     Ok(true)
+}
+
+fn settings_are_current(path: &Path, agent: Agent, enabled: bool, script: &Path) -> Result<bool> {
+    let Some(updated) = updated_settings(path, agent, enabled, script)? else {
+        return Ok(true);
+    };
+    let Some(original) = read_optional(path)? else {
+        return Ok(false);
+    };
+    let original: Value =
+        serde_json::from_slice(&original).with_context(|| format!("parsing {}", path.display()))?;
+    let updated: Value =
+        serde_json::from_slice(&updated).context("parsing updated hook settings")?;
+    Ok(original == updated)
+}
+
+pub fn integration_status(
+    env: &RuntimeEnv,
+    selection: CodingAgentSelection,
+) -> Result<IntegrationStatus> {
+    let configured = is_configured(env, selection)?;
+    let warnings = if selection.includes(Agent::Claude) {
+        claude_hook_warnings(env)
+    } else {
+        Vec::new()
+    };
+    Ok(IntegrationStatus {
+        configured,
+        warnings,
+    })
 }
 
 fn settings_path(env: &RuntimeEnv, agent: Agent) -> Result<PathBuf> {
@@ -254,6 +329,11 @@ fn agent_name(agent: Agent) -> &'static str {
 }
 
 fn atomic_write_user_only(path: &Path, contents: &[u8]) -> Result<()> {
+    let target = resolve_write_target(path)?;
+    atomic_write_resolved_user_only(&target, contents)
+}
+
+fn atomic_write_resolved_user_only(path: &Path, contents: &[u8]) -> Result<()> {
     let parent = path
         .parent()
         .with_context(|| format!("{} has no parent directory", path.display()))?;
@@ -270,6 +350,127 @@ fn atomic_write_user_only(path: &Path, contents: &[u8]) -> Result<()> {
     temp.persist(path)
         .with_context(|| format!("replacing {}", path.display()))?;
     Ok(())
+}
+
+fn resolve_write_target(path: &Path) -> Result<PathBuf> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            let target = fs::canonicalize(path).with_context(|| {
+                format!(
+                    "resolving settings symlink {}; repair the dangling link and retry",
+                    path.display()
+                )
+            })?;
+            if !target.is_file() {
+                bail!(
+                    "settings symlink {} must point to a regular file",
+                    path.display()
+                );
+            }
+            Ok(target)
+        }
+        Ok(metadata) if !metadata.is_file() => {
+            bail!("{} must be a regular file", path.display())
+        }
+        Ok(_) => Ok(path.to_path_buf()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(path.to_path_buf()),
+        Err(error) => Err(error).with_context(|| format!("inspecting {}", path.display())),
+    }
+}
+
+fn read_optional(path: &Path) -> Result<Option<Vec<u8>>> {
+    match fs::read(path) {
+        Ok(contents) => Ok(Some(contents)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+fn claude_hook_warnings(env: &RuntimeEnv) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let settings = env.claude_config_dir.join("settings.json");
+    match json_bool(&settings, "disableAllHooks") {
+        Ok(Some(true)) => warnings.push(
+            "Claude Code user settings set disableAllHooks=true; a higher-precedence project setting may override it"
+                .to_string(),
+        ),
+        Ok(_) => {}
+        Err(error) => warnings.push(format!(
+            "could not inspect Claude Code hook-disable setting: {error}"
+        )),
+    }
+
+    match file_managed_claude_setting("allowManagedHooksOnly") {
+        Ok(Some(true)) => warnings.push(
+            "Claude Code file-based policy sets allowManagedHooksOnly=true, so user hooks are ignored"
+                .to_string(),
+        ),
+        Ok(_) => {}
+        Err(error) => warnings.push(format!(
+            "could not inspect Claude Code managed hook policy: {error}"
+        )),
+    }
+    warnings
+}
+
+fn json_bool(path: &Path, key: &str) -> Result<Option<bool>> {
+    let Some(contents) = read_optional(path)? else {
+        return Ok(None);
+    };
+    let root: Value =
+        serde_json::from_slice(&contents).with_context(|| format!("parsing {}", path.display()))?;
+    Ok(root.get(key).and_then(Value::as_bool))
+}
+
+fn file_managed_claude_setting(key: &str) -> Result<Option<bool>> {
+    let Some(root) = managed_claude_settings_dir() else {
+        return Ok(None);
+    };
+    file_managed_claude_setting_in(&root, key)
+}
+
+fn file_managed_claude_setting_in(root: &Path, key: &str) -> Result<Option<bool>> {
+    let mut paths = vec![root.join("managed-settings.json")];
+    let dropins = root.join("managed-settings.d");
+    match fs::read_dir(&dropins) {
+        Ok(entries) => {
+            let mut entries = entries
+                .filter_map(std::result::Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.extension().and_then(|value| value.to_str()) == Some("json")
+                        && !path
+                            .file_name()
+                            .and_then(|value| value.to_str())
+                            .is_some_and(|value| value.starts_with('.'))
+                })
+                .collect::<Vec<_>>();
+            entries.sort();
+            paths.extend(entries);
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).with_context(|| format!("reading {}", dropins.display())),
+    }
+    let mut effective = None;
+    for path in paths {
+        if let Some(value) = json_bool(&path, key)? {
+            effective = Some(value);
+        }
+    }
+    Ok(effective)
+}
+
+fn managed_claude_settings_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        return Some(PathBuf::from("/Library/Application Support/ClaudeCode"));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        return Some(PathBuf::from("/etc/claude-code"));
+    }
+    #[allow(unreachable_code)]
+    None
 }
 
 fn ensure_svarog_hook(root: &mut Value, agent: Agent, script: &Path) {
@@ -640,11 +841,10 @@ mod tests {
     }
 
     #[test]
-    fn claude_prompt_id_is_sanitized_into_the_shared_turn_field() {
+    fn official_claude_prompt_payload_is_sanitized() {
         let payload: LifecycleHookEvent = serde_json::from_str(
             r#"{
                 "session_id":"session-1",
-                "prompt_id":"prompt-1",
                 "cwd":"/work/svarog",
                 "hook_event_name":"UserPromptSubmit",
                 "prompt":"private prompt text",
@@ -654,9 +854,29 @@ mod tests {
         .unwrap();
         let forwarded = serde_json::to_value(payload).unwrap();
 
-        assert_eq!(forwarded["turn_id"], "prompt-1");
+        assert!(forwarded["turn_id"].is_null());
         assert!(forwarded.get("prompt").is_none());
         assert!(forwarded.get("transcript_path").is_none());
+    }
+
+    #[test]
+    fn official_claude_lifecycle_payloads_keep_only_shared_fields() {
+        for input in [
+            r#"{"session_id":"session-1","transcript_path":"/private/transcript.jsonl","cwd":"/work/svarog","permission_mode":"default","hook_event_name":"SessionStart","source":"startup","model":"claude-sonnet-4-5"}"#,
+            r#"{"session_id":"session-1","transcript_path":"/private/transcript.jsonl","cwd":"/work/svarog","permission_mode":"default","hook_event_name":"Stop","stop_hook_active":false,"last_assistant_message":"private response","background_tasks":[],"session_crons":[]}"#,
+            r#"{"session_id":"session-1","transcript_path":"/private/transcript.jsonl","cwd":"/work/svarog","hook_event_name":"SessionEnd","reason":"other"}"#,
+        ] {
+            let payload: LifecycleHookEvent = serde_json::from_str(input).unwrap();
+            payload.validate().unwrap();
+            let forwarded = serde_json::to_value(payload).unwrap();
+
+            assert!(forwarded.get("transcript_path").is_none());
+            assert!(forwarded.get("permission_mode").is_none());
+            assert!(forwarded.get("model").is_none());
+            assert!(forwarded.get("last_assistant_message").is_none());
+            assert!(forwarded.get("background_tasks").is_none());
+            assert!(forwarded.get("session_crons").is_none());
+        }
     }
 
     #[test]
@@ -729,6 +949,24 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_preflights_destinations_before_writing_settings() {
+        let root = tempdir().unwrap();
+        let mut env = test_env(root.path());
+        fs::create_dir_all(&env.codex_home).unwrap();
+        let original = br#"{"theme":"keep"}"#;
+        fs::write(env.codex_home.join("hooks.json"), original).unwrap();
+        let blocked_parent = root.path().join("not-a-directory");
+        fs::write(&blocked_parent, "blocked").unwrap();
+        env.claude_config_dir = blocked_parent.join("claude");
+
+        assert!(reconcile(&env, CodingAgentSelection::All).is_err());
+        assert_eq!(
+            fs::read(env.codex_home.join("hooks.json")).unwrap(),
+            original
+        );
+    }
+
+    #[test]
     fn global_claude_install_is_idempotent() {
         let root = tempdir().unwrap();
         let env = test_env(root.path());
@@ -739,5 +977,179 @@ mod tests {
 
         assert_eq!(first, second);
         assert_eq!(fs::read(second).unwrap(), contents);
+    }
+
+    #[test]
+    fn claude_install_preserves_absolute_and_relative_settings_symlinks() {
+        for relative in [false, true] {
+            let root = tempdir().unwrap();
+            let env = test_env(root.path());
+            fs::create_dir_all(&env.claude_config_dir).unwrap();
+            let target_dir = root.path().join("dotfiles");
+            fs::create_dir_all(&target_dir).unwrap();
+            let target = target_dir.join("claude-settings.json");
+            fs::write(&target, r#"{"theme":"dark"}"#).unwrap();
+            let link = env.claude_config_dir.join("settings.json");
+            let link_target = if relative {
+                PathBuf::from("../dotfiles/claude-settings.json")
+            } else {
+                target.clone()
+            };
+            std::os::unix::fs::symlink(link_target, &link).unwrap();
+
+            install_global_claude(&env).unwrap();
+
+            assert!(fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            let value: Value = serde_json::from_slice(&fs::read(&target).unwrap()).unwrap();
+            assert_eq!(value["theme"], "dark");
+            assert_eq!(
+                value["hooks"]["UserPromptSubmit"].as_array().unwrap().len(),
+                1
+            );
+            assert_eq!(
+                fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn claude_install_rejects_a_dangling_settings_symlink() {
+        let root = tempdir().unwrap();
+        let env = test_env(root.path());
+        fs::create_dir_all(&env.claude_config_dir).unwrap();
+        let link = env.claude_config_dir.join("settings.json");
+        std::os::unix::fs::symlink("missing.json", &link).unwrap();
+
+        let error = install_global_claude(&env).unwrap_err();
+
+        assert!(error.to_string().contains("dangling link"));
+        assert!(fs::symlink_metadata(link).unwrap().file_type().is_symlink());
+    }
+
+    #[test]
+    fn reconcile_rolls_back_a_completed_write() {
+        let root = tempdir().unwrap();
+        let first = root.path().join("first.json");
+        let second = root.path().join("second.json");
+        fs::write(&first, b"before").unwrap();
+        fs::write(&second, b"before").unwrap();
+        let prepared = vec![
+            PreparedSettings {
+                path: first.clone(),
+                target: first.clone(),
+                original: Some(b"before".to_vec()),
+                updated: Some(b"after".to_vec()),
+            },
+            PreparedSettings {
+                path: second.clone(),
+                target: second.clone(),
+                original: Some(b"before".to_vec()),
+                updated: Some(b"after".to_vec()),
+            },
+        ];
+        let mut writes = 0;
+
+        let error = apply_prepared(
+            &prepared,
+            |path, contents| {
+                writes += 1;
+                if writes == 2 {
+                    bail!("injected write failure");
+                }
+                atomic_write_resolved_user_only(path, contents)
+            },
+            restore_prepared,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("previous settings restored"));
+        assert_eq!(fs::read(first).unwrap(), b"before");
+        assert_eq!(fs::read(second).unwrap(), b"before");
+    }
+
+    #[test]
+    fn reconcile_reports_write_and_rollback_failures() {
+        let item = PreparedSettings {
+            path: PathBuf::from("first.json"),
+            target: PathBuf::from("first.json"),
+            original: Some(b"before".to_vec()),
+            updated: Some(b"after".to_vec()),
+        };
+        let prepared = [
+            item,
+            PreparedSettings {
+                path: PathBuf::from("second.json"),
+                target: PathBuf::from("second.json"),
+                original: None,
+                updated: Some(b"after".to_vec()),
+            },
+        ];
+        let mut writes = 0;
+
+        let error = apply_prepared(
+            &prepared,
+            |_path, _contents| {
+                writes += 1;
+                if writes == 2 {
+                    bail!("write failed");
+                }
+                Ok(())
+            },
+            |_item| bail!("restore failed"),
+        )
+        .unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("write failed"));
+        assert!(message.contains("restore failed"));
+    }
+
+    #[test]
+    fn claude_status_warns_without_marking_installed_hooks_missing() {
+        let root = tempdir().unwrap();
+        let env = test_env(root.path());
+        reconcile(&env, CodingAgentSelection::Claude).unwrap();
+        let path = env.claude_config_dir.join("settings.json");
+        let mut settings: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        settings["disableAllHooks"] = json!(true);
+        fs::write(&path, serde_json::to_vec_pretty(&settings).unwrap()).unwrap();
+
+        let status = integration_status(&env, CodingAgentSelection::Claude).unwrap();
+
+        assert!(status.configured);
+        assert!(status
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("disableAllHooks=true")));
+    }
+
+    #[test]
+    fn managed_hook_policy_uses_sorted_dropin_precedence() {
+        let root = tempdir().unwrap();
+        fs::write(
+            root.path().join("managed-settings.json"),
+            r#"{"allowManagedHooksOnly":true}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            file_managed_claude_setting_in(root.path(), "allowManagedHooksOnly").unwrap(),
+            Some(true)
+        );
+        let dropins = root.path().join("managed-settings.d");
+        fs::create_dir(&dropins).unwrap();
+        fs::write(
+            dropins.join("10-enable-user-hooks.json"),
+            r#"{"allowManagedHooksOnly":false}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            file_managed_claude_setting_in(root.path(), "allowManagedHooksOnly").unwrap(),
+            Some(false)
+        );
     }
 }

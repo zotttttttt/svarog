@@ -304,6 +304,9 @@ fn finish_setup(env: &RuntimeEnv, config: &Config) -> Result<()> {
     println!("{}", text("Configuring coding-agent integrations..."));
     hooks::reconcile(env, coding_agent)?;
     println!("{} {}", ember("✓"), text("Hooks configured"));
+    for warning in hooks::integration_status(env, coding_agent)?.warnings {
+        eprintln!("{} {}", ember("!"), text(warning));
+    }
     println!();
     print_setup_summary(config);
     Ok(())
@@ -390,7 +393,7 @@ fn production_needs_setup(env: &RuntimeEnv) -> Result<bool> {
     }
     let config = config::load_or_default(&env.paths)?;
     let hooks_need_repair = match config.agents.coding_agent {
-        Some(selection) => !hooks::is_configured(env, selection)?,
+        Some(selection) => !hooks::integration_status(env, selection)?.configured,
         None => true,
     };
     Ok(!config.onboarding.is_complete() || !env.paths.database_file.exists() || hooks_need_repair)
@@ -880,14 +883,31 @@ fn status(env: &RuntimeEnv) -> Result<()> {
     );
     if config_exists {
         let config = config::load_or_default(paths)?;
+        let selection = config.agents.coding_agent;
         println!(
             "Coding agent: {}",
-            config
-                .agents
-                .coding_agent
+            selection
                 .map(CodingAgentSelection::label)
                 .unwrap_or("not configured")
         );
+        if let Some(selection) = selection {
+            let integration = hooks::integration_status(env, selection)?;
+            println!(
+                "Coding-agent hooks: {}",
+                if integration.configured {
+                    if integration.warnings.is_empty() {
+                        "configured"
+                    } else {
+                        "configured (degraded)"
+                    }
+                } else {
+                    "repair required"
+                }
+            );
+            for warning in integration.warnings {
+                println!("Hook warning: {warning}");
+            }
+        }
     }
 
     if db_exists {
@@ -1527,6 +1547,37 @@ mod tests {
         hooks::reconcile(&env, CodingAgentSelection::Codex).unwrap();
 
         assert!(!production_needs_setup(&env).unwrap());
+    }
+
+    #[test]
+    fn degraded_claude_hooks_do_not_repeat_setup() {
+        let root = tempdir().unwrap();
+        let env = RuntimeEnv {
+            mode: RuntimeMode::Production,
+            paths: Paths::from_root(root.path().join("svarog")),
+            codex_home: root.path().join("codex"),
+            claude_config_dir: root.path().join("claude"),
+            daemon_addr: "127.0.0.1:8787".parse().unwrap(),
+            dry_run: false,
+        };
+        let mut config = Config::default();
+        config.agents.coding_agent = Some(CodingAgentSelection::Claude);
+        for step in config::CURRENT_ONBOARDING_STEPS {
+            config.onboarding.mark_completed(step);
+        }
+        config::save(&env.paths, &config).unwrap();
+        Store::open(&env.paths.database_file).unwrap();
+        hooks::reconcile(&env, CodingAgentSelection::Claude).unwrap();
+        let path = env.claude_config_dir.join("settings.json");
+        let mut settings: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        settings["disableAllHooks"] = serde_json::json!(true);
+        fs::write(path, serde_json::to_vec(&settings).unwrap()).unwrap();
+
+        assert!(!production_needs_setup(&env).unwrap());
+        let status = hooks::integration_status(&env, CodingAgentSelection::Claude).unwrap();
+        assert!(status.configured);
+        assert!(!status.warnings.is_empty());
     }
 
     #[test]

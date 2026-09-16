@@ -29,14 +29,7 @@ pub fn run(agent: Agent, env: &RuntimeEnv) -> Result<()> {
     }
     let store = crate::storage::Store::open(&paths.database_file)?;
     store.insert_session(agent, None)?;
-    let agent_command = match agent {
-        Agent::Codex => config.agents.codex_command,
-        Agent::Claude => "claude".to_string(),
-        Agent::Droid => "droid".to_string(),
-        Agent::FactoryDroid => "factory-droid".to_string(),
-        Agent::OpenClaw => "openclaw".to_string(),
-        Agent::Custom => std::env::var("SVAROG_AGENT_COMMAND").unwrap_or_else(|_| "sh".to_string()),
-    };
+    let agent_command = agent_command(agent, &config);
 
     ensure_tmux()?;
 
@@ -72,6 +65,17 @@ pub fn run(agent: Agent, env: &RuntimeEnv) -> Result<()> {
     run_tmux(&["set-option", "-t", &session_name, "mouse", "on"])?;
 
     run_tmux(&["attach-session", "-t", &session_name])
+}
+
+fn agent_command(agent: Agent, config: &crate::config::Config) -> String {
+    match agent {
+        Agent::Codex => config.agents.codex_command.clone(),
+        Agent::Claude => config.agents.claude_command.clone(),
+        Agent::Droid => "droid".to_string(),
+        Agent::FactoryDroid => "factory-droid".to_string(),
+        Agent::OpenClaw => "openclaw".to_string(),
+        Agent::Custom => std::env::var("SVAROG_AGENT_COMMAND").unwrap_or_else(|_| "sh".to_string()),
+    }
 }
 
 fn tui_command(executable: &std::path::Path) -> String {
@@ -129,6 +133,17 @@ mod tests {
         assert_eq!(
             tui_command(path),
             format!("{} run", hooks::shell_quote(&path.display().to_string()))
+        );
+    }
+
+    #[test]
+    fn claude_session_uses_the_configured_command() {
+        let mut config = crate::config::Config::default();
+        config.agents.claude_command = "claude-custom --flag".into();
+
+        assert_eq!(
+            agent_command(Agent::Claude, &config),
+            "claude-custom --flag"
         );
     }
 }

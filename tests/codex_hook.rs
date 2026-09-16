@@ -36,7 +36,7 @@ fn claude_hook_exits_cleanly_when_collector_is_unavailable() {
     let output = run_hook(
         &["lifecycle-hook", "claude"],
         None,
-        r#"{"session_id":"session-1","prompt_id":"prompt-1","cwd":"/work/svarog","hook_event_name":"UserPromptSubmit","prompt":"private"}"#,
+        r#"{"session_id":"session-1","transcript_path":"/private/transcript.jsonl","cwd":"/work/svarog","permission_mode":"default","hook_event_name":"UserPromptSubmit","prompt":"private"}"#,
     );
 
     assert!(

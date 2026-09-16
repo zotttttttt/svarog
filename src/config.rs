@@ -200,8 +200,14 @@ impl FromStr for UnitSystem {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Agents {
     pub codex_command: String,
+    #[serde(default = "default_claude_command")]
+    pub claude_command: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coding_agent: Option<CodingAgentSelection>,
+}
+
+fn default_claude_command() -> String {
+    "claude".to_string()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -371,6 +377,7 @@ impl Default for Config {
             forge: Forge::default(),
             agents: Agents {
                 codex_command: "codex".to_string(),
+                claude_command: default_claude_command(),
                 coding_agent: None,
             },
             preferences: Preferences {
@@ -1071,6 +1078,26 @@ mod tests {
         assert_eq!(
             load_or_default(&paths).unwrap().agents.codex_command,
             "custom-codex"
+        );
+    }
+
+    #[test]
+    fn claude_command_is_configurable_and_defaults_for_legacy_configs() {
+        let serialized = toml::to_string_pretty(&Config::default())
+            .unwrap()
+            .replace("claude_command = \"claude\"\n", "");
+        let legacy: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(legacy.agents.claude_command, "claude");
+
+        let root = tempdir().unwrap();
+        let paths = Paths::from_root(root.path().join("svarog"));
+        let mut config = legacy;
+        config.agents.claude_command = "custom-claude".into();
+        save(&paths, &config).unwrap();
+
+        assert_eq!(
+            load_or_default(&paths).unwrap().agents.claude_command,
+            "custom-claude"
         );
     }
 

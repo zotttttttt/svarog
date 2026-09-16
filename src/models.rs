@@ -303,7 +303,7 @@ pub struct IncomingEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LifecycleHookEvent {
     pub session_id: String,
-    #[serde(default, alias = "prompt_id")]
+    #[serde(default)]
     pub turn_id: Option<String>,
     pub cwd: String,
     pub hook_event_name: String,

@@ -57,7 +57,9 @@ On first run, choose **All**, **Codex**, or **Claude Code**, then accept the
 conservative defaults. Setup connects Svarog to the selected lifecycle hooks
 and opens the dashboard. Keep it open while you work in a selected coding-agent
 terminal. Each CLI may ask once to trust its hook; Claude Code hooks run after
-you trust the workspace.
+you trust the workspace in an interactive session. `claude -p` does not show
+that workspace-trust prompt, so its configured hooks can run without that
+interactive confirmation.
 
 Prefer to open both tools together? With `tmux` installed, run:
 

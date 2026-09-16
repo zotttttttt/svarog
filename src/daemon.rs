@@ -1028,33 +1028,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_claude_prompt_is_one_claude_opportunity() {
-        let env = test_env();
-        let mut config = Config::default();
-        config.recommender.backend = RecommenderBackend::Local;
-        crate::config::save(&env.paths, &config).unwrap();
-
-        let prompt = LifecycleHookEvent {
-            session_id: "claude-session".into(),
-            turn_id: Some("prompt-1".into()),
-            cwd: "/work/svarog".into(),
-            hook_event_name: "UserPromptSubmit".into(),
-            source: None,
-            reason: None,
-        };
-        process_lifecycle_hook(&env, Agent::Claude, prompt.clone()).unwrap();
-        process_lifecycle_hook(&env, Agent::Claude, prompt).unwrap();
-
-        let store = Store::open(&env.paths.database_file).unwrap();
-        assert_eq!(store.event_count().unwrap(), 1);
-        assert_eq!(
-            store.latest_open_recommendation().unwrap().unwrap().agent,
-            Agent::Claude
-        );
-    }
-
-    #[test]
-    fn claude_without_prompt_id_still_reports_each_prompt() {
+    fn claude_reports_each_official_prompt_payload() {
         let env = test_env();
         let mut config = Config::default();
         config.recommender.backend = RecommenderBackend::Local;
@@ -1262,7 +1236,7 @@ mod tests {
             .bearer_auth(token.as_str())
             .header("content-type", "application/json")
             .body(
-                r#"{"session_id":"claude-session","prompt_id":"prompt-1","cwd":"/work/svarog","hook_event_name":"UserPromptSubmit","prompt":"private"}"#,
+                r#"{"session_id":"claude-session","transcript_path":"/private/transcript.jsonl","cwd":"/work/svarog","permission_mode":"default","hook_event_name":"UserPromptSubmit","prompt":"private"}"#,
             )
             .send()
             .await
