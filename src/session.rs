@@ -7,7 +7,7 @@ use std::process::{Command, Stdio};
 pub fn run(agent: Agent, env: &RuntimeEnv) -> Result<()> {
     let paths = &env.paths;
     let config = load_or_default(paths)?;
-    if matches!(agent, Agent::Codex | Agent::Claude) {
+    if matches!(agent, Agent::Codex | Agent::Claude | Agent::Pi) {
         let selection = config
             .agents
             .coding_agent
@@ -21,6 +21,9 @@ pub fn run(agent: Agent, env: &RuntimeEnv) -> Result<()> {
             }
             Agent::Claude => {
                 hooks::install_global_claude(env)?;
+            }
+            Agent::Pi => {
+                hooks::install_global_pi(env)?;
             }
             _ => unreachable!(),
         }
@@ -71,6 +74,7 @@ fn agent_command(agent: Agent, config: &crate::config::Config) -> String {
     match agent {
         Agent::Codex => config.agents.codex_command.clone(),
         Agent::Claude => config.agents.claude_command.clone(),
+        Agent::Pi => config.agents.pi_command.clone(),
         Agent::Droid => "droid".to_string(),
         Agent::FactoryDroid => "factory-droid".to_string(),
         Agent::OpenClaw => "openclaw".to_string(),
@@ -145,5 +149,13 @@ mod tests {
             agent_command(Agent::Claude, &config),
             "claude-custom --flag"
         );
+    }
+
+    #[test]
+    fn pi_session_uses_the_configured_command() {
+        let mut config = crate::config::Config::default();
+        config.agents.pi_command = "pi-custom --flag".into();
+
+        assert_eq!(agent_command(Agent::Pi, &config), "pi-custom --flag");
     }
 }

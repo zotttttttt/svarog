@@ -15,6 +15,7 @@ requests.
 | Workout database | `~/.local/share/svarog/svarog.sqlite3` |
 | Codex hook configuration | `~/.codex/hooks.json` |
 | Claude Code hook configuration | `~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR/settings.json`) |
+| Pi extension | `~/.pi/agent/extensions/svarog.ts` (or `$PI_CODING_AGENT_DIR/extensions/svarog.ts`) |
 
 Svarog creates its config and data directories with user-only permissions on
 macOS and Linux. The config and database files are also restricted to the
@@ -36,11 +37,12 @@ stored in the Svarog config directory as `collector.token` with user-only
 permissions and rotates whenever the collector starts.
 Closing the dashboard stops collection.
 
-Codex and Claude Code lifecycle events tell Svarog when you submit a task for a
-selected coding agent to execute. They do not forward, store, or include the
-text of your coding prompts in recommendation requests. Svarog changes only its
-own hook entries and preserves other hook settings. User-level Claude Code
-hooks apply to locally running clients, not Claude Code cloud sessions.
+Codex, Claude Code, and Pi lifecycle events tell Svarog when you submit a task
+for a selected coding agent to execute. They do not forward, store, or include
+the text of your coding prompts in recommendation requests. Svarog changes only
+its own hook entries or Pi extension and preserves other agent configuration.
+User-level Claude Code hooks apply to locally running clients, not Claude Code
+cloud sessions.
 
 ## Recommender data flow
 
@@ -85,5 +87,5 @@ is truncated, and the collector bearer token is rotated. See [Commands](commands
 for the full reset behavior.
 
 For testing, `svarog demo` uses only `./.svarog-dev` and a separate development
-credential; it does not touch production data, credentials, or Codex and Claude
-Code hooks.
+credential; it does not touch production data, credentials, Codex or Claude
+Code hooks, or the production Pi extension directory.

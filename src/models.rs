@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 pub enum Agent {
     Codex,
     Claude,
+    Pi,
     Droid,
     #[value(alias = "factory_droid")]
     #[serde(alias = "factory-droid")]
@@ -25,6 +26,7 @@ impl Agent {
         match self {
             Agent::Codex => "codex",
             Agent::Claude => "claude",
+            Agent::Pi => "pi",
             Agent::Droid => "droid",
             Agent::FactoryDroid => "factory_droid",
             Agent::OpenClaw => "openclaw",
@@ -40,6 +42,7 @@ impl std::str::FromStr for Agent {
         match value {
             "codex" => Ok(Agent::Codex),
             "claude" => Ok(Agent::Claude),
+            "pi" => Ok(Agent::Pi),
             "droid" => Ok(Agent::Droid),
             "factory-droid" | "factory_droid" => Ok(Agent::FactoryDroid),
             "openclaw" | "open-claw" => Ok(Agent::OpenClaw),

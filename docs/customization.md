@@ -23,18 +23,22 @@ notification behavior, recommender selection, timeouts, fallback behavior, and
 the Codex/OpenAI model configuration. Forge frequency defaults to every prompt
 and can be changed from Settings without repeating setup.
 
-The `[agents]` section also accepts command overrides for tmux sessions. Both
+The `[agents]` section also accepts command overrides for tmux sessions. These
 are advanced settings rather than onboarding questions:
 
 ```toml
 [agents]
 codex_command = "codex"
 claude_command = "claude"
+pi_command = "pi"
+coding_agents = ["codex", "pi"]
 ```
 
-`claude_command` defaults to `claude`, including for configurations created
-before that setting existed. Set it to an absolute path or wrapper command when
-your Claude Code executable is installed elsewhere.
+`claude_command` and `pi_command` default to their standard executable names,
+including for older configurations. Set either to an absolute path or wrapper
+command when the executable is installed elsewhere. `coding_agents` accepts
+any non-empty combination of `codex`, `claude`, and `pi`; setup also accepts
+`all` as shorthand for all three.
 
 ## Forge archetypes
 

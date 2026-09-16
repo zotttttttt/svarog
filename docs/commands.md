@@ -9,6 +9,7 @@
 | `svarog` / `svarog run` | Set up if necessary, then open the dashboard and collector |
 | `svarog session codex` | Open Codex and Svarog together in a tmux session |
 | `svarog session claude` | Open Claude Code and Svarog together in a tmux session |
+| `svarog session pi` | Open Pi and Svarog together in a tmux session |
 | `svarog status` | Print the current state and recommendation |
 | `svarog stop` | Stop Svarog runtimes and Svarog-created tmux sessions |
 | `svarog setup` | Repair or revisit setup, then open the dashboard |
@@ -20,9 +21,9 @@ closes coding-agent processes inside tmux sessions created by Svarog.
 While the dashboard is waiting, press `s` to edit the Forge archetype,
 recommender, coding-agent choice, notifications, daily forge ceiling,
 measurements, goals, equipment, work setup, limitations, exercise preferences,
-and a securely saved OpenAI API key. Choose **All**, **Codex**, or **Claude
-Code** for the coding agent; applying that change reconciles only Svarog-owned
-hooks. Profile and recommender changes remain staged until you press
+and a securely saved OpenAI API key. Select `all` or any combination of
+`codex`, `claude`, and `pi`; applying that change reconciles only Svarog-owned
+hooks and extensions. Profile and recommender changes remain staged until you press
 Ctrl+S (or Command+S when supported by the terminal); Esc cancels those
 changes. Changing the recommender refreshes future forges; other Settings saves
 keep the compatible queue. Height, weight, age, and choice fields can be
@@ -112,7 +113,7 @@ svarog setup --reset
 ```
 
 You must type `destroy all` before anything is removed. The installed binary
-and Codex and Claude Code integration files remain in place. Svarog also
+and Codex, Claude Code, and Pi integration files remain in place. Svarog also
 removes its saved OpenAI API key from the operating system credential store. If
 that store is unavailable, the data reset still completes and prints a warning
 explaining that the credential may need to be removed manually.
@@ -150,4 +151,14 @@ CLAUDE_CONFIG_DIR="$PWD/.svarog-dev/claude" \
 SVAROG_DAEMON_ADDR="127.0.0.1:18787" \
 SVAROG_MODE=dev \
 claude
+```
+
+To connect a Pi process explicitly to the development sandbox:
+
+```bash
+SVAROG_HOME="$PWD/.svarog-dev/svarog" \
+PI_CODING_AGENT_DIR="$PWD/.svarog-dev/pi" \
+SVAROG_DAEMON_ADDR="127.0.0.1:18787" \
+SVAROG_MODE=dev \
+pi
 ```
