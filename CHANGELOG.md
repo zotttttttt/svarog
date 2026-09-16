@@ -2,6 +2,18 @@
 
 Notable changes to Svarog are recorded here by the automated release process.
 
+## [0.8.0](https://github.com/zotttttttt/svarog/compare/v0.7.4...v0.8.0) (2026-09-16)
+
+
+### Fixes
+
+* Add Claude Code support ([#54](https://github.com/zotttttttt/svarog/issues/54)) ([d02e052](https://github.com/zotttttttt/svarog/commit/d02e052a3cf1d1f3b6c15dc98304bdec4ae3d8f6))
+
+
+### Maintenance
+
+* release 0.8.0 ([#56](https://github.com/zotttttttt/svarog/issues/56)) ([dce1e02](https://github.com/zotttttttt/svarog/commit/dce1e024387119d384f8ca67c85850c98349a3f0))
+
 ## [0.7.4](https://github.com/zotttttttt/svarog/compare/v0.7.3...v0.7.4) (2026-09-15)
 
 
