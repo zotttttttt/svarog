@@ -2,6 +2,13 @@
 
 Notable changes to Svarog are recorded here by the automated release process.
 
+## [0.9.0](https://github.com/zotttttttt/svarog/compare/v0.8.0...v0.9.0) (2026-09-16)
+
+
+### Features
+
+* add Pi coding agent support ([#57](https://github.com/zotttttttt/svarog/issues/57)) ([a837767](https://github.com/zotttttttt/svarog/commit/a837767c8c4792942cb5fc992543ae09c9b57da2))
+
 ## [0.8.0](https://github.com/zotttttttt/svarog/compare/v0.7.4...v0.8.0) (2026-09-16)
 
 
