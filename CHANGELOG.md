@@ -2,6 +2,13 @@
 
 Notable changes to Svarog are recorded here by the automated release process.
 
+## [0.10.0](https://github.com/zotttttttt/svarog/compare/v0.9.0...v0.10.0) (2026-09-16)
+
+
+### Features
+
+* add Hermes Agent support ([#59](https://github.com/zotttttttt/svarog/issues/59)) ([53c77c9](https://github.com/zotttttttt/svarog/commit/53c77c92a3340bd1308458a3eb794664c4acd6bc))
+
 ## [0.9.0](https://github.com/zotttttttt/svarog/compare/v0.8.0...v0.9.0) (2026-09-16)
 
 
