@@ -204,6 +204,8 @@ pub struct Agents {
     pub claude_command: String,
     #[serde(default = "default_pi_command")]
     pub pi_command: String,
+    #[serde(default = "default_hermes_command")]
+    pub hermes_command: String,
     #[serde(
         default,
         rename = "coding_agents",
@@ -221,20 +223,26 @@ fn default_pi_command() -> String {
     "pi".to_string()
 }
 
+fn default_hermes_command() -> String {
+    "hermes".to_string()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CodingAgentSelection(u8);
 
 #[allow(non_upper_case_globals)]
 impl CodingAgentSelection {
-    pub const All: Self = Self(0b111);
-    pub const Codex: Self = Self(0b001);
-    pub const Claude: Self = Self(0b010);
-    pub const Pi: Self = Self(0b100);
+    pub const All: Self = Self(0b1111);
+    pub const Codex: Self = Self(0b0001);
+    pub const Claude: Self = Self(0b0010);
+    pub const Pi: Self = Self(0b0100);
+    pub const Hermes: Self = Self(0b1000);
 
-    const MANAGED: [crate::models::Agent; 3] = [
+    const MANAGED: [crate::models::Agent; 4] = [
         crate::models::Agent::Codex,
         crate::models::Agent::Claude,
         crate::models::Agent::Pi,
+        crate::models::Agent::Hermes,
     ];
 }
 
@@ -254,6 +262,7 @@ impl CodingAgentSelection {
             crate::models::Agent::Codex => Self::Codex.0,
             crate::models::Agent::Claude => Self::Claude.0,
             crate::models::Agent::Pi => Self::Pi.0,
+            crate::models::Agent::Hermes => Self::Hermes.0,
             _ => 0,
         };
         self.0 & mask != 0
@@ -266,27 +275,11 @@ impl CodingAgentSelection {
     }
 
     pub fn next(self) -> Self {
-        match self.0 {
-            0b111 => Self::Codex,
-            0b001 => Self::Claude,
-            0b010 => Self::Pi,
-            0b100 => Self(0b011),
-            0b011 => Self(0b101),
-            0b101 => Self(0b110),
-            _ => Self::All,
-        }
+        Self(if self.0 >= Self::All.0 { 1 } else { self.0 + 1 })
     }
 
     pub fn previous(self) -> Self {
-        match self.0 {
-            0b001 => Self::All,
-            0b010 => Self::Codex,
-            0b100 => Self::Claude,
-            0b011 => Self::Pi,
-            0b101 => Self(0b011),
-            0b110 => Self(0b101),
-            _ => Self(0b110),
-        }
+        Self(if self.0 <= 1 { Self::All.0 } else { self.0 - 1 })
     }
 
     fn from_agents(agents: impl IntoIterator<Item = crate::models::Agent>) -> Result<Self, String> {
@@ -296,11 +289,12 @@ impl CodingAgentSelection {
                 crate::models::Agent::Codex => Self::Codex.0,
                 crate::models::Agent::Claude => Self::Claude.0,
                 crate::models::Agent::Pi => Self::Pi.0,
+                crate::models::Agent::Hermes => Self::Hermes.0,
                 _ => return Err(format!("{agent} is not a managed coding agent")),
             };
         }
         if bits == 0 {
-            return Err("choose at least one of: codex, claude, pi".to_string());
+            return Err("choose at least one of: codex, claude, pi, hermes".to_string());
         }
         Ok(Self(bits))
     }
@@ -327,7 +321,10 @@ impl FromStr for CodingAgentSelection {
                 "codex" => Ok(crate::models::Agent::Codex),
                 "claude" | "claude code" | "claude_code" => Ok(crate::models::Agent::Claude),
                 "pi" => Ok(crate::models::Agent::Pi),
-                _ => Err("use all or a comma-separated list of: codex, claude, pi".to_string()),
+                "hermes" | "hermes agent" | "hermes_agent" => Ok(crate::models::Agent::Hermes),
+                _ => Err(
+                    "use all or a comma-separated list of: codex, claude, pi, hermes".to_string(),
+                ),
             })
             .collect::<Result<Vec<_>, _>>()?;
         Self::from_agents(agents)
@@ -479,6 +476,7 @@ impl Default for Config {
                 codex_command: "codex".to_string(),
                 claude_command: default_claude_command(),
                 pi_command: default_pi_command(),
+                hermes_command: default_hermes_command(),
                 coding_agent: None,
             },
             preferences: Preferences {
@@ -593,6 +591,7 @@ pub struct RuntimeEnv {
     pub codex_home: PathBuf,
     pub claude_config_dir: PathBuf,
     pub pi_config_dir: PathBuf,
+    pub hermes_home: PathBuf,
     pub daemon_addr: SocketAddr,
     pub dry_run: bool,
 }
@@ -666,6 +665,7 @@ impl RuntimeEnv {
         let codex_home = resolve_codex_home(mode)?;
         let claude_config_dir = resolve_claude_config_dir(mode)?;
         let pi_config_dir = resolve_pi_config_dir(mode)?;
+        let hermes_home = resolve_hermes_home(mode)?;
         let daemon_addr = resolve_daemon_addr(mode)?;
         Ok(Self {
             mode,
@@ -673,6 +673,7 @@ impl RuntimeEnv {
             codex_home,
             claude_config_dir,
             pi_config_dir,
+            hermes_home,
             daemon_addr,
             dry_run,
         })
@@ -691,6 +692,7 @@ impl RuntimeEnv {
             codex_home: root.join("codex"),
             claude_config_dir: root.join("claude"),
             pi_config_dir: root.join("pi"),
+            hermes_home: root.join("hermes"),
             daemon_addr: "127.0.0.1:18787".parse().unwrap(),
             dry_run: false,
         }
@@ -717,6 +719,10 @@ impl RuntimeEnv {
             (
                 "PI_CODING_AGENT_DIR",
                 self.pi_config_dir.to_string_lossy().to_string(),
+            ),
+            (
+                "HERMES_HOME",
+                self.hermes_home.to_string_lossy().to_string(),
             ),
             ("SVAROG_DAEMON_ADDR", self.daemon_addr.to_string()),
             (
@@ -796,6 +802,22 @@ fn resolve_pi_config_dir(mode: RuntimeMode) -> Result<PathBuf> {
             .context("determining current directory")?
             .join(".svarog-dev")
             .join("pi")),
+    }
+}
+
+fn resolve_hermes_home(mode: RuntimeMode) -> Result<PathBuf> {
+    if let Ok(root) = std::env::var("HERMES_HOME") {
+        return Ok(PathBuf::from(root));
+    }
+    match mode {
+        RuntimeMode::Production => {
+            let dirs = BaseDirs::new().context("could not determine user directories")?;
+            Ok(dirs.home_dir().join(".hermes"))
+        }
+        RuntimeMode::Dev => Ok(std::env::current_dir()
+            .context("determining current directory")?
+            .join(".svarog-dev")
+            .join("hermes")),
     }
 }
 
@@ -993,6 +1015,7 @@ mod tests {
         std::env::remove_var("CODEX_HOME");
         std::env::remove_var("CLAUDE_CONFIG_DIR");
         std::env::remove_var("PI_CODING_AGENT_DIR");
+        std::env::remove_var("HERMES_HOME");
         std::env::remove_var("SVAROG_DAEMON_ADDR");
         std::env::remove_var("SVAROG_MODE");
     }
@@ -1248,6 +1271,26 @@ mod tests {
     }
 
     #[test]
+    fn hermes_command_is_configurable_and_defaults_for_legacy_configs() {
+        let serialized = toml::to_string_pretty(&Config::default())
+            .unwrap()
+            .replace("hermes_command = \"hermes\"\n", "");
+        let legacy: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(legacy.agents.hermes_command, "hermes");
+
+        let root = tempdir().unwrap();
+        let paths = Paths::from_root(root.path().join("svarog"));
+        let mut config = legacy;
+        config.agents.hermes_command = "custom-hermes".into();
+        save(&paths, &config).unwrap();
+
+        assert_eq!(
+            load_or_default(&paths).unwrap().agents.hermes_command,
+            "custom-hermes"
+        );
+    }
+
+    #[test]
     fn coding_agent_selection_round_trips_and_migrates_legacy_values() {
         let mut config = Config::default();
         assert_eq!(config.agents.coding_agent, None);
@@ -1276,6 +1319,19 @@ mod tests {
         assert_eq!("Codex".parse(), Ok(CodingAgentSelection::Codex));
         assert_eq!("Claude Code".parse(), Ok(CodingAgentSelection::Claude));
         assert_eq!("pi".parse(), Ok(CodingAgentSelection::Pi));
+        assert_eq!("Hermes Agent".parse(), Ok(CodingAgentSelection::Hermes));
+        assert!(CodingAgentSelection::All.includes(crate::models::Agent::Hermes));
+        let mut selection = CodingAgentSelection::All;
+        for expected in 1..=15 {
+            selection = selection.next();
+            assert_eq!(selection.0, expected);
+        }
+        assert_eq!(selection, CodingAgentSelection::All);
+        for expected in (1..15).rev() {
+            selection = selection.previous();
+            assert_eq!(selection.0, expected);
+        }
+        assert_eq!(selection.previous(), CodingAgentSelection::All);
         assert_eq!(
             "claude, pi"
                 .parse::<CodingAgentSelection>()
@@ -1529,6 +1585,7 @@ mod tests {
         assert!(env.codex_home.ends_with(".svarog-dev/codex"));
         assert!(env.claude_config_dir.ends_with(".svarog-dev/claude"));
         assert!(env.pi_config_dir.ends_with(".svarog-dev/pi"));
+        assert!(env.hermes_home.ends_with(".svarog-dev/hermes"));
         assert_eq!(env.daemon_addr.to_string(), "127.0.0.1:18787");
         assert!(env.dry_run);
         clear_runtime_env();
@@ -1543,6 +1600,7 @@ mod tests {
         std::env::set_var("CODEX_HOME", root.join("codex"));
         std::env::set_var("CLAUDE_CONFIG_DIR", root.join("claude"));
         std::env::set_var("PI_CODING_AGENT_DIR", root.join("pi"));
+        std::env::set_var("HERMES_HOME", root.join("hermes"));
         std::env::set_var("SVAROG_DAEMON_ADDR", "127.0.0.1:19999");
 
         let env = RuntimeEnv::load_with_options(false, false).unwrap();
@@ -1554,6 +1612,7 @@ mod tests {
         assert_eq!(env.codex_home, root.join("codex"));
         assert_eq!(env.claude_config_dir, root.join("claude"));
         assert_eq!(env.pi_config_dir, root.join("pi"));
+        assert_eq!(env.hermes_home, root.join("hermes"));
         assert_eq!(env.daemon_addr.to_string(), "127.0.0.1:19999");
         clear_runtime_env();
     }
@@ -1584,6 +1643,7 @@ mod tests {
         assert!(pairs.iter().any(|(key, _)| *key == "CODEX_HOME"));
         assert!(pairs.iter().any(|(key, _)| *key == "CLAUDE_CONFIG_DIR"));
         assert!(pairs.iter().any(|(key, _)| *key == "PI_CODING_AGENT_DIR"));
+        assert!(pairs.iter().any(|(key, _)| *key == "HERMES_HOME"));
         assert!(pairs
             .iter()
             .any(|(key, value)| *key == "SVAROG_DAEMON_ADDR" && value == "127.0.0.1:18787"));

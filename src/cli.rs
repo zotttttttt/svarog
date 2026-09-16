@@ -135,6 +135,7 @@ pub async fn run() -> Result<()> {
                     Agent::Codex => hooks::install_global_codex(&env)?,
                     Agent::Claude => hooks::install_global_claude(&env)?,
                     Agent::Pi => hooks::install_global_pi(&env)?,
+                    Agent::Hermes => hooks::install_global_hermes(&env)?,
                     _ => hooks::install(&env, agent)?,
                 };
                 println!("Installed {} hook: {}", agent, path.display());
@@ -552,8 +553,13 @@ fn setup_dry_run(env: &RuntimeEnv) -> Result<()> {
         text(env.pi_config_dir.join("extensions/svarog.ts").display())
     );
     println!(
+        "{} {}",
+        muted("Would install Hermes hook config when selected:"),
+        text(env.hermes_home.join("config.yaml").display())
+    );
+    println!(
         "{}",
-        muted("Would require agent choices: all / codex / claude / pi")
+        muted("Would require agent choices: all / codex / claude / pi / hermes")
     );
     println!(
         "{} {}",
@@ -873,6 +879,7 @@ fn status(env: &RuntimeEnv) -> Result<()> {
     println!("Codex: {}", env.codex_home.display());
     println!("Claude Code: {}", env.claude_config_dir.display());
     println!("Pi: {}", env.pi_config_dir.display());
+    println!("Hermes: {}", env.hermes_home.display());
     let config_exists = paths.config_file.exists();
     let db_exists = paths.database_file.exists();
     println!(
@@ -1151,14 +1158,16 @@ fn prompt_string(label: &str, default: &str) -> Result<String> {
 fn prompt_coding_agent() -> Result<CodingAgentSelection> {
     print!(
         "{}: ",
-        text("Coding agents (all / codex / claude / pi; comma-separated)")
+        text("Coding agents (all / codex / claude / pi / hermes; comma-separated)")
     );
     io::stdout().flush()?;
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
     let value = input.trim();
     if value.is_empty() {
-        bail!("coding agent selection is required; choose all or list codex, claude, and pi");
+        bail!(
+            "coding agent selection is required; choose all or list codex, claude, pi, and hermes"
+        );
     }
     value.parse().map_err(anyhow::Error::msg)
 }
@@ -1433,6 +1442,7 @@ mod tests {
             codex_home: root.join("codex"),
             claude_config_dir: root.join("claude"),
             pi_config_dir: root.join("pi"),
+            hermes_home: root.join("hermes"),
             daemon_addr: "127.0.0.1:18787".parse().unwrap(),
             dry_run: true,
         };
@@ -1545,6 +1555,7 @@ mod tests {
             codex_home: root.path().join("codex"),
             claude_config_dir: root.path().join("claude"),
             pi_config_dir: root.path().join("pi"),
+            hermes_home: root.path().join("hermes"),
             daemon_addr: "127.0.0.1:8787".parse().unwrap(),
             dry_run: false,
         };
@@ -1573,6 +1584,7 @@ mod tests {
             codex_home: root.path().join("codex"),
             claude_config_dir: root.path().join("claude"),
             pi_config_dir: root.path().join("pi"),
+            hermes_home: root.path().join("hermes"),
             daemon_addr: "127.0.0.1:8787".parse().unwrap(),
             dry_run: false,
         };
@@ -1640,6 +1652,7 @@ mod tests {
             codex_home: root.path().join("codex"),
             claude_config_dir: root.path().join("claude"),
             pi_config_dir: root.path().join("pi"),
+            hermes_home: root.path().join("hermes"),
             daemon_addr: "127.0.0.1:8787".parse().unwrap(),
             dry_run: false,
         };
@@ -1702,6 +1715,7 @@ mod tests {
             codex_home: root.path().join("codex"),
             claude_config_dir: root.path().join("claude"),
             pi_config_dir: root.path().join("pi"),
+            hermes_home: root.path().join("hermes"),
             daemon_addr: "127.0.0.1:8787".parse().unwrap(),
             dry_run: false,
         };

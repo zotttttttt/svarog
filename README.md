@@ -22,8 +22,9 @@
   <a href="https://github.com/zotttttttt/svarog/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-888888?style=flat-square&amp;labelColor=070808" alt="MIT license"></a>
 </p>
 
-Svarog is a local terminal dashboard that notices when Codex, Claude Code, or
-[Pi](https://pi.dev/) starts working and turns that wait into a tiny workout.
+Svarog is a local terminal dashboard that notices when Codex, Claude Code,
+[Pi](https://pi.dev/), or Hermes Agent starts working and turns that wait into
+a tiny workout.
 
 Svarog adapts each forge to what you complete. It balances sides and recovery,
 adjusts reps to your performance, and backs off after fatigue, skips, or pain.
@@ -54,12 +55,14 @@ SHA-256 checksum, and installs it to `~/.local/bin`. If that directory is not on
 your `PATH`, it prints the exact line to add for future runs.
 
 On first run, choose `all` or a comma-separated combination of `codex`,
-`claude`, and `pi`, then accept the conservative defaults. Setup connects
-Svarog to the selected lifecycle hooks and opens the dashboard. Keep it open
+`claude`, `pi`, and `hermes`, then accept the conservative defaults. Setup
+connects Svarog to the selected lifecycle hooks and opens the dashboard. Keep it open
 while you work in a selected coding-agent terminal. Claude Code hooks run after
 you trust the workspace in an interactive session. `claude -p` does not show
 that workspace-trust prompt, so its configured hooks can run without that
 interactive confirmation. Pi loads Svarog automatically as a global extension.
+Hermes setup installs Svarog's shell hook and scoped approvals under
+`$HERMES_HOME` (normally `~/.hermes`).
 
 Prefer to open both tools together? With `tmux` installed, run:
 
@@ -67,6 +70,7 @@ Prefer to open both tools together? With `tmux` installed, run:
 svarog session codex
 svarog session claude
 svarog session pi
+svarog session hermes
 ```
 
 For provenance verification, Cargo, manual downloads, upgrades, and source
@@ -81,8 +85,9 @@ builds, see [Installation](docs/installation.md).
    next.
 
 A ready movement remains available until you finish, skip, or report pain—even
-if the coding-agent turn that triggered it has already ended. Coding prompt
-text is never collected or sent in recommendation requests.
+if the coding-agent turn that triggered it has already ended. Coding prompts,
+conversation history, and agent results are never collected or sent in
+recommendation requests.
 
 ## Forge while your coding agent works
 

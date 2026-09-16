@@ -7,6 +7,8 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
+use yaml_edit::{Document, SequenceBuilder, YamlFile, YamlKind, YamlNode};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IntegrationStatus {
@@ -37,6 +39,10 @@ pub fn print(agent: Agent) {
         Agent::Pi => {
             println!("# Pi lifecycle events are sent by the managed Svarog extension");
             println!("svarog lifecycle-hook pi");
+        }
+        Agent::Hermes => {
+            println!("# Hermes lifecycle hooks read JSON on stdin");
+            println!("svarog lifecycle-hook hermes");
         }
         Agent::Droid => {
             println!("# Factory Droid / Droid lifecycle hook command");
@@ -92,6 +98,10 @@ pub fn install_global_pi(env: &RuntimeEnv) -> Result<PathBuf> {
     install_global(env, Agent::Pi)
 }
 
+pub fn install_global_hermes(env: &RuntimeEnv) -> Result<PathBuf> {
+    install_global(env, Agent::Hermes)
+}
+
 #[cfg(test)]
 fn install_codex_hook_config(codex_home: &Path, script: &Path) -> Result<PathBuf> {
     let path = codex_home.join("hooks.json");
@@ -105,6 +115,11 @@ fn install_codex_hook_config(codex_home: &Path, script: &Path) -> Result<PathBuf
 fn install_global(env: &RuntimeEnv, agent: Agent) -> Result<PathBuf> {
     let script = install(env, agent)?;
     let path = settings_path(env, agent)?;
+    if agent == Agent::Hermes {
+        let prepared = prepare_hermes_settings(env, true, &script)?;
+        apply_prepared(&prepared, atomic_write_resolved_user_only, restore_prepared)?;
+        return Ok(path);
+    }
     if agent == Agent::Pi {
         let (contents, _) = updated_pi_extension(&path, true, &script)?;
         if let Some(contents) = contents {
@@ -129,6 +144,7 @@ pub fn reconcile(env: &RuntimeEnv, selection: CodingAgentSelection) -> Result<()
     let codex_script = install(env, Agent::Codex)?;
     let claude_script = install(env, Agent::Claude)?;
     let pi_script = install(env, Agent::Pi)?;
+    let hermes_script = install(env, Agent::Hermes)?;
     let specs = [
         (Agent::Codex, selection.includes(Agent::Codex), codex_script),
         (
@@ -137,11 +153,20 @@ pub fn reconcile(env: &RuntimeEnv, selection: CodingAgentSelection) -> Result<()
             claude_script,
         ),
         (Agent::Pi, selection.includes(Agent::Pi), pi_script),
+        (
+            Agent::Hermes,
+            selection.includes(Agent::Hermes),
+            hermes_script,
+        ),
     ];
     let mut prepared = Vec::new();
     for (agent, enabled, script) in specs {
         let path = settings_path(env, agent)?;
         let original = read_optional(&path)?;
+        if agent == Agent::Hermes {
+            prepared.extend(prepare_hermes_settings(env, enabled, &script)?);
+            continue;
+        }
         let (updated, remove) = if agent == Agent::Pi {
             updated_pi_extension(&path, enabled, &script)?
         } else {
@@ -172,6 +197,13 @@ fn apply_prepared(
     mut write: impl FnMut(&Path, &[u8]) -> Result<()>,
     mut restore: impl FnMut(&PreparedSettings) -> Result<()>,
 ) -> Result<()> {
+    for item in prepared.iter().filter(|item| item.updated.is_some()) {
+        let parent = item
+            .target
+            .parent()
+            .with_context(|| format!("{} has no parent directory", item.target.display()))?;
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
     let mut written = Vec::new();
     for (index, item) in prepared.iter().enumerate() {
         let result = if item.remove {
@@ -226,7 +258,7 @@ fn restore_prepared(item: &PreparedSettings) -> Result<()> {
 }
 
 pub fn is_configured(env: &RuntimeEnv, selection: CodingAgentSelection) -> Result<bool> {
-    for agent in [Agent::Codex, Agent::Claude, Agent::Pi] {
+    for agent in [Agent::Codex, Agent::Claude, Agent::Pi, Agent::Hermes] {
         let path = settings_path(env, agent)?;
         if selection.includes(agent) {
             let script = env
@@ -240,9 +272,18 @@ pub fn is_configured(env: &RuntimeEnv, selection: CodingAgentSelection) -> Resul
             if !settings_are_current(&path, agent, true, &script)? {
                 return Ok(false);
             }
-        } else if path.exists() {
-            let script = PathBuf::new();
-            if !settings_are_current(&path, agent, false, &script)? {
+            if agent == Agent::Hermes && !hermes_allowlist_is_current(env, true, &script)? {
+                return Ok(false);
+            }
+        } else {
+            if path.exists() {
+                let script = PathBuf::new();
+                if !settings_are_current(&path, agent, false, &script)? {
+                    return Ok(false);
+                }
+            }
+            if agent == Agent::Hermes && !hermes_allowlist_is_current(env, false, &PathBuf::new())?
+            {
                 return Ok(false);
             }
         }
@@ -251,6 +292,13 @@ pub fn is_configured(env: &RuntimeEnv, selection: CodingAgentSelection) -> Resul
 }
 
 fn settings_are_current(path: &Path, agent: Agent, enabled: bool, script: &Path) -> Result<bool> {
+    if agent == Agent::Hermes {
+        let updated = updated_hermes_config(path, enabled, script)?;
+        return match updated {
+            None => Ok(true),
+            Some(updated) => Ok(read_optional(path)?.as_deref() == Some(updated.as_slice())),
+        };
+    }
     if agent == Agent::Pi {
         let (updated, remove) = updated_pi_extension(path, enabled, script)?;
         if remove {
@@ -295,8 +343,345 @@ fn settings_path(env: &RuntimeEnv, agent: Agent) -> Result<PathBuf> {
         Agent::Codex => Ok(env.codex_home.join("hooks.json")),
         Agent::Claude => Ok(env.claude_config_dir.join("settings.json")),
         Agent::Pi => Ok(env.pi_config_dir.join("extensions").join("svarog.ts")),
+        Agent::Hermes => Ok(env.hermes_home.join("config.yaml")),
         _ => bail!("{agent} does not have a managed lifecycle integration"),
     }
+}
+
+const HERMES_EVENTS: [(&str, u64); 4] = [
+    ("on_session_start", 5),
+    ("pre_llm_call", 5),
+    ("on_session_end", 5),
+    ("on_session_finalize", 3),
+];
+
+fn prepare_hermes_settings(
+    env: &RuntimeEnv,
+    enabled: bool,
+    script: &Path,
+) -> Result<Vec<PreparedSettings>> {
+    let config_path = env.hermes_home.join("config.yaml");
+    let allowlist_path = env.hermes_home.join("shell-hooks-allowlist.json");
+    let mut prepared = Vec::new();
+    for (path, updated) in [
+        (
+            config_path.clone(),
+            updated_hermes_config(&config_path, enabled, script)?,
+        ),
+        (
+            allowlist_path.clone(),
+            updated_hermes_allowlist(&allowlist_path, enabled, script)?,
+        ),
+    ] {
+        let original = read_optional(&path)?;
+        let target = resolve_write_target(&path)?;
+        prepared.push(PreparedSettings {
+            path,
+            target,
+            original,
+            updated,
+            remove: false,
+        });
+    }
+    Ok(prepared)
+}
+
+fn updated_hermes_config(path: &Path, enabled: bool, script: &Path) -> Result<Option<Vec<u8>>> {
+    let original = read_optional(path)?;
+    if original.is_none() && !enabled {
+        return Ok(None);
+    }
+    let command = shell_quote(&script.display().to_string());
+    if original.is_none() {
+        let contents = hermes_hooks_document(&command)?.to_string().into_bytes();
+        return Ok(Some(contents));
+    }
+    let input = original
+        .as_deref()
+        .map(String::from_utf8_lossy)
+        .map(|value| value.into_owned())
+        .unwrap_or_else(|| "{}\n".to_string());
+    let yaml = YamlFile::from_str(&input).with_context(|| {
+        format!(
+            "parsing {}; repair the existing Hermes hook configuration and retry",
+            path.display()
+        )
+    })?;
+    let document = yaml
+        .document()
+        .with_context(|| format!("{} must contain one YAML document", path.display()))?;
+    let root = document
+        .as_mapping()
+        .with_context(|| format!("{} must contain a YAML mapping", path.display()))?;
+    ensure_unique_yaml_key(&root, "hooks", path)?;
+    let repaired_misplaced_hooks = repair_misplaced_hermes_hooks(&root)?;
+    if root
+        .get("hooks")
+        .is_some_and(|value| is_empty_yaml_scalar(&value) && repaired_misplaced_hooks)
+    {
+        root.remove("hooks");
+    }
+    if root.get("hooks").is_none() {
+        if enabled {
+            root.set("hooks", hermes_hooks_mapping(&command)?);
+        }
+        let updated = yaml.to_string().into_bytes();
+        return Ok((original.as_deref() != Some(updated.as_slice())).then_some(updated));
+    }
+    let hooks_value = root.get("hooks").expect("checked above");
+    let hooks = hooks_value.as_mapping().with_context(|| {
+        format!(
+            "{}.hooks must contain a YAML mapping; found {}",
+            path.display(),
+            yaml_kind_name(&hooks_value)
+        )
+    })?;
+    for (event, _) in HERMES_EVENTS {
+        ensure_unique_yaml_key(hooks, event, path)?;
+    }
+    if hooks.is_empty() && enabled {
+        root.set("hooks", hermes_hooks_mapping(&command)?);
+        let updated = yaml.to_string().into_bytes();
+        return Ok((original.as_deref() != Some(updated.as_slice())).then_some(updated));
+    }
+    for (event, timeout) in HERMES_EVENTS {
+        if hooks.get(event).is_none() {
+            if enabled {
+                hooks.set(event, hermes_hook_sequence(&command, timeout)?);
+            }
+            continue;
+        }
+        let entries = hooks.get_sequence(event).with_context(|| {
+            format!(
+                "{}.hooks.{event} must contain a YAML sequence",
+                path.display()
+            )
+        })?;
+        let mut replacement = SequenceBuilder::new();
+        for entry in entries.values() {
+            if !is_managed_hermes_hook(&entry) {
+                replacement = replacement.item(entry);
+            }
+        }
+        if enabled {
+            replacement = replacement.item(hermes_hook_entry(&command, timeout)?);
+        }
+        hooks.set(
+            event,
+            replacement
+                .build_document()
+                .as_sequence()
+                .context("built Hermes hook list was not a sequence")?,
+        );
+    }
+    let updated = yaml.to_string().into_bytes();
+    Ok((original.as_deref() != Some(updated.as_slice())).then_some(updated))
+}
+
+fn hermes_hook_entry(command: &str, timeout: u64) -> Result<yaml_edit::Mapping> {
+    let command = serde_json::to_string(command)?;
+    let document = Document::from_str(&format!("{{command: {command}, timeout: {timeout}}}"))
+        .context("building Hermes hook entry")?;
+    document
+        .as_mapping()
+        .context("built Hermes hook entry was not a mapping")
+}
+
+fn repair_misplaced_hermes_hooks(root: &yaml_edit::Mapping) -> Result<bool> {
+    let mut repaired = false;
+    for (event, _) in HERMES_EVENTS {
+        let occurrences = root.find_all_entries_by_key(event).collect::<Vec<_>>();
+        for occurrence in occurrences {
+            let Some(value) = occurrence.value_node() else {
+                continue;
+            };
+            let Some(entries) = value.as_sequence() else {
+                continue;
+            };
+            let values = entries.values().collect::<Vec<_>>();
+            if !values.iter().any(is_managed_hermes_hook) {
+                continue;
+            }
+            repaired = true;
+            let mut replacement = SequenceBuilder::new();
+            let mut kept = 0;
+            for entry in values {
+                if !is_managed_hermes_hook(&entry) {
+                    replacement = replacement.item(entry);
+                    kept += 1;
+                }
+            }
+            if kept == 0 {
+                occurrence.remove();
+            } else {
+                occurrence.set_value(
+                    replacement
+                        .build_document()
+                        .as_sequence()
+                        .context("built repaired Hermes hook list was not a sequence")?,
+                    false,
+                );
+            }
+        }
+    }
+    Ok(repaired)
+}
+
+fn is_managed_hermes_hook(entry: &YamlNode) -> bool {
+    entry
+        .as_mapping()
+        .and_then(|mapping| mapping.get("command"))
+        .and_then(|value| value.as_scalar().map(|scalar| scalar.as_string()))
+        .is_some_and(|value| is_hermes_command(&value))
+}
+
+fn is_empty_yaml_scalar(value: &YamlNode) -> bool {
+    value
+        .as_scalar()
+        .is_some_and(|scalar| scalar.as_string().is_empty())
+}
+
+fn yaml_kind_name(value: &YamlNode) -> &'static str {
+    match value.kind() {
+        YamlKind::Scalar if is_empty_yaml_scalar(value) => "null",
+        YamlKind::Scalar => "a scalar",
+        YamlKind::Mapping => "a mapping",
+        YamlKind::Sequence => "a sequence",
+        YamlKind::Alias => "an alias",
+        YamlKind::Tagged(_) => "a tagged value",
+        YamlKind::Document => "a document",
+    }
+}
+
+fn ensure_unique_yaml_key(mapping: &yaml_edit::Mapping, key: &str, path: &Path) -> Result<()> {
+    let matches = mapping
+        .iter()
+        .filter(|(candidate, _)| {
+            candidate
+                .as_scalar()
+                .is_some_and(|scalar| scalar.as_string() == key)
+        })
+        .count();
+    if matches > 1 {
+        bail!(
+            "{} contains duplicate YAML key {key:?}; remove the duplicate and retry",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn hermes_hook_sequence(command: &str, timeout: u64) -> Result<yaml_edit::Sequence> {
+    SequenceBuilder::new()
+        .item(hermes_hook_entry(command, timeout)?)
+        .build_document()
+        .as_sequence()
+        .context("built Hermes hook list was not a sequence")
+}
+
+fn hermes_hooks_mapping(command: &str) -> Result<yaml_edit::Mapping> {
+    hermes_hooks_document(command)?
+        .as_mapping()
+        .and_then(|root| root.get_mapping("hooks"))
+        .context("built Hermes hooks value was not a mapping")
+}
+
+fn hermes_hooks_document(command: &str) -> Result<Document> {
+    let command = serde_json::to_string(command)?;
+    let mut text = String::from("hooks:\n");
+    for (event, timeout) in HERMES_EVENTS {
+        text.push_str(&format!(
+            "  {event}:\n    - {{command: {command}, timeout: {timeout}}}\n"
+        ));
+    }
+    Document::from_str(&text).context("building Hermes hooks mapping")
+}
+
+fn updated_hermes_allowlist(path: &Path, enabled: bool, script: &Path) -> Result<Option<Vec<u8>>> {
+    let original = read_optional(path)?;
+    if original.is_none() && !enabled {
+        return Ok(None);
+    }
+    let mut root = match original.as_deref() {
+        Some(contents) => serde_json::from_slice::<Value>(contents)
+            .with_context(|| format!("parsing {}", path.display()))?,
+        None => json!({"approvals": []}),
+    };
+    let object = root
+        .as_object_mut()
+        .with_context(|| format!("{} must contain a JSON object", path.display()))?;
+    let approvals = object
+        .entry("approvals")
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+        .with_context(|| format!("{}.approvals must contain a JSON array", path.display()))?;
+    let command = shell_quote(&script.display().to_string());
+    let existing = approvals
+        .iter()
+        .filter(|entry| entry.get("command").and_then(Value::as_str) == Some(command.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    approvals.retain(|entry| {
+        !entry
+            .get("command")
+            .and_then(Value::as_str)
+            .is_some_and(is_hermes_command)
+    });
+    if enabled {
+        let approved_at = chrono::Utc::now().to_rfc3339();
+        for (event, _) in HERMES_EVENTS {
+            approvals.push(
+                existing
+                    .iter()
+                    .find(|entry| entry.get("event").and_then(Value::as_str) == Some(event))
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        json!({
+                            "event": event,
+                            "command": command,
+                            "approved_at": approved_at,
+                        })
+                    }),
+            );
+        }
+    }
+    let contents = format!("{}\n", serde_json::to_string_pretty(&root)?).into_bytes();
+    Ok((original.as_deref() != Some(contents.as_slice())).then_some(contents))
+}
+
+fn hermes_allowlist_is_current(env: &RuntimeEnv, enabled: bool, script: &Path) -> Result<bool> {
+    let path = env.hermes_home.join("shell-hooks-allowlist.json");
+    let Some(original) = read_optional(&path)? else {
+        return Ok(!enabled);
+    };
+    let root: Value = serde_json::from_slice(&original)?;
+    let approvals = root
+        .get("approvals")
+        .and_then(Value::as_array)
+        .with_context(|| format!("{}.approvals must contain a JSON array", path.display()))?;
+    let command = shell_quote(&script.display().to_string());
+    let managed = approvals
+        .iter()
+        .filter(|entry| {
+            entry
+                .get("command")
+                .and_then(Value::as_str)
+                .is_some_and(is_hermes_command)
+        })
+        .collect::<Vec<_>>();
+    if !enabled {
+        return Ok(managed.is_empty());
+    }
+    Ok(HERMES_EVENTS.iter().all(|(event, _)| {
+        managed.iter().any(|entry| {
+            entry.get("event").and_then(Value::as_str) == Some(*event)
+                && entry.get("command").and_then(Value::as_str) == Some(command.as_str())
+        })
+    }))
+}
+
+fn is_hermes_command(command: &str) -> bool {
+    command.contains("hermes-event.sh") || command.contains("svarog lifecycle-hook hermes")
 }
 
 fn updated_pi_extension(
@@ -415,6 +800,7 @@ fn agent_name(agent: Agent) -> &'static str {
         Agent::Codex => "Codex",
         Agent::Claude => "Claude Code",
         Agent::Pi => "Pi",
+        Agent::Hermes => "Hermes Agent",
         _ => "coding agent",
     }
 }
@@ -670,7 +1056,7 @@ fn is_svarog_hook(value: &Value, agent: Agent) -> bool {
 
 fn hook_script(agent: Agent, env_pairs: &[(&'static str, String)], executable: &Path) -> String {
     let event = match agent {
-        Agent::Claude | Agent::Codex | Agent::Pi => "tool_start",
+        Agent::Claude | Agent::Codex | Agent::Pi | Agent::Hermes => "tool_start",
         Agent::Droid | Agent::FactoryDroid | Agent::OpenClaw => "task_start",
         Agent::Custom => "busy",
     };
@@ -679,7 +1065,10 @@ fn hook_script(agent: Agent, env_pairs: &[(&'static str, String)], executable: &
         .map(|(key, value)| format!("export {key}={}", shell_quote(value)))
         .collect::<Vec<_>>()
         .join("\n");
-    if matches!(agent, Agent::Codex | Agent::Claude | Agent::Pi) {
+    if matches!(
+        agent,
+        Agent::Codex | Agent::Claude | Agent::Pi | Agent::Hermes
+    ) {
         return format!(
             r#"#!/usr/bin/env sh
 set -eu
@@ -800,7 +1189,10 @@ export default function (pi: ExtensionAPI) {{
 }
 
 pub async fn ingest_lifecycle(env: &RuntimeEnv, agent: Agent) -> Result<()> {
-    if !matches!(agent, Agent::Codex | Agent::Claude | Agent::Pi) {
+    if !matches!(
+        agent,
+        Agent::Codex | Agent::Claude | Agent::Pi | Agent::Hermes
+    ) {
         bail!("{agent} does not provide supported lifecycle hook input");
     }
     if std::env::var_os("SVAROG_RECOMMENDER").is_some() {
@@ -809,7 +1201,7 @@ pub async fn ingest_lifecycle(env: &RuntimeEnv, agent: Agent) -> Result<()> {
     }
     let mut input = String::new();
     io::stdin().read_to_string(&mut input)?;
-    if let Ok(payload) = serde_json::from_str::<LifecycleHookEvent>(&input) {
+    if let Ok(payload) = parse_lifecycle_payload(agent, &input) {
         let url = format!("http://{}/hooks/{}", env.daemon_addr, agent.as_str());
         let token = collector_auth::load(&env.paths).ok();
         if let Ok(client) = reqwest::Client::builder()
@@ -831,6 +1223,66 @@ pub async fn ingest_lifecycle(env: &RuntimeEnv, agent: Agent) -> Result<()> {
     Ok(())
 }
 
+fn parse_lifecycle_payload(agent: Agent, input: &str) -> Result<LifecycleHookEvent> {
+    if agent != Agent::Hermes {
+        return serde_json::from_str(input).context("parsing lifecycle hook payload");
+    }
+    let root: Value = serde_json::from_str(input).context("parsing Hermes hook payload")?;
+    let event = root
+        .get("hook_event_name")
+        .and_then(Value::as_str)
+        .context("Hermes hook payload is missing hook_event_name")?;
+    let hook_event_name = match event {
+        "on_session_start" => "SessionStart",
+        "pre_llm_call" => "UserPromptSubmit",
+        "on_session_end" => "Stop",
+        "on_session_finalize" => "SessionEnd",
+        _ => bail!("unsupported Hermes lifecycle event"),
+    };
+    let extra = root.get("extra").and_then(Value::as_object);
+    let text = |key: &str| {
+        extra
+            .and_then(|value| value.get(key))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    };
+    Ok(LifecycleHookEvent {
+        session_id: root
+            .get("session_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        turn_id: text("turn_id"),
+        cwd: root
+            .get("cwd")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        hook_event_name: hook_event_name.to_owned(),
+        source: Some("hermes".to_owned()),
+        reason: text("reason").or_else(|| {
+            (event == "on_session_end").then(|| {
+                let completed = extra
+                    .and_then(|value| value.get("completed"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let interrupted = extra
+                    .and_then(|value| value.get("interrupted"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if interrupted {
+                    "interrupted"
+                } else if completed {
+                    "completed"
+                } else {
+                    "incomplete"
+                }
+                .to_owned()
+            })
+        }),
+    })
+}
+
 pub(crate) fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
@@ -848,6 +1300,7 @@ mod tests {
             codex_home: root.join("codex"),
             claude_config_dir: root.join("claude"),
             pi_config_dir: root.join("pi"),
+            hermes_home: root.join("hermes"),
             daemon_addr: "127.0.0.1:18787".parse().unwrap(),
             dry_run: false,
         }
@@ -1056,6 +1509,280 @@ mod tests {
             assert!(forwarded.get("background_tasks").is_none());
             assert!(forwarded.get("session_crons").is_none());
         }
+    }
+
+    #[test]
+    fn hermes_payloads_map_lifecycle_and_discard_private_content() {
+        let cases = [
+            ("on_session_start", "SessionStart", None),
+            ("pre_llm_call", "UserPromptSubmit", Some("turn-1")),
+            ("on_session_end", "Stop", Some("turn-1")),
+            ("on_session_finalize", "SessionEnd", None),
+        ];
+        for (event, expected, turn_id) in cases {
+            let input = json!({
+                "hook_event_name": event,
+                "session_id": "session-1",
+                "cwd": "/work/svarog",
+                "tool_input": {"secret": "private tool input"},
+                "extra": {
+                    "turn_id": turn_id,
+                    "user_message": "private prompt",
+                    "conversation_history": ["private history"],
+                    "assistant_response": "private response",
+                    "completed": true
+                }
+            });
+            let payload = parse_lifecycle_payload(Agent::Hermes, &input.to_string()).unwrap();
+            payload.validate().unwrap();
+            assert_eq!(payload.hook_event_name, expected);
+            assert_eq!(payload.turn_id.as_deref(), turn_id);
+            assert_eq!(payload.source.as_deref(), Some("hermes"));
+            let forwarded = serde_json::to_value(payload).unwrap();
+            for private in [
+                "tool_input",
+                "user_message",
+                "conversation_history",
+                "assistant_response",
+            ] {
+                assert!(forwarded.get(private).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn hermes_reconcile_preserves_yaml_comments_hooks_and_scoped_approvals() {
+        let root = tempdir().unwrap();
+        let env = test_env(root.path());
+        fs::create_dir_all(&env.hermes_home).unwrap();
+        let config_path = env.hermes_home.join("config.yaml");
+        let allowlist_path = env.hermes_home.join("shell-hooks-allowlist.json");
+        fs::write(
+            &config_path,
+            "# keep this comment\nmodel:\n  default: test-model\nhooks:\n  pre_llm_call:\n    - {command: \"echo keep\", timeout: 9}\n  outbound: []\n",
+        )
+        .unwrap();
+        fs::write(
+            &allowlist_path,
+            r#"{"approvals":[{"event":"pre_llm_call","command":"echo keep","approved_at":"earlier"}]}"#,
+        )
+        .unwrap();
+
+        reconcile(&env, CodingAgentSelection::Hermes).unwrap();
+
+        let first_config = fs::read(&config_path).unwrap();
+        let first_allowlist = fs::read(&allowlist_path).unwrap();
+        let config = String::from_utf8(first_config.clone()).unwrap();
+        assert!(config.contains("# keep this comment"));
+        assert!(config.contains("default: test-model"));
+        assert!(config.contains("command: \"echo keep\""));
+        assert!(config.contains("outbound: []"));
+        for event in HERMES_EVENTS.map(|(event, _)| event) {
+            assert!(config.contains(event));
+        }
+        let allowlist: Value = serde_json::from_slice(&first_allowlist).unwrap();
+        assert_eq!(allowlist["approvals"].as_array().unwrap().len(), 5);
+        assert!(allowlist["approvals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["command"] == "echo keep"));
+        assert!(is_configured(&env, CodingAgentSelection::Hermes).unwrap());
+
+        reconcile(&env, CodingAgentSelection::Hermes).unwrap();
+        assert_eq!(fs::read(&config_path).unwrap(), first_config);
+        assert_eq!(fs::read(&allowlist_path).unwrap(), first_allowlist);
+
+        reconcile(&env, CodingAgentSelection::Codex).unwrap();
+        let config = fs::read_to_string(&config_path).unwrap();
+        assert!(config.contains("echo keep"));
+        assert!(!config.contains("hermes-event.sh"));
+        let allowlist: Value = serde_json::from_slice(&fs::read(&allowlist_path).unwrap()).unwrap();
+        assert_eq!(allowlist["approvals"].as_array().unwrap().len(), 1);
+        assert_eq!(allowlist["approvals"][0]["command"], "echo keep");
+    }
+
+    #[test]
+    fn hermes_reconcile_creates_a_valid_idempotent_config() {
+        let root = tempdir().unwrap();
+        let env = test_env(root.path());
+
+        reconcile(&env, CodingAgentSelection::Hermes).unwrap();
+
+        let config_path = env.hermes_home.join("config.yaml");
+        let first = fs::read_to_string(&config_path).unwrap();
+        let yaml = YamlFile::from_str(&first).unwrap();
+        let root = yaml.document().unwrap().as_mapping().unwrap();
+        let hooks = root.get_mapping("hooks").unwrap();
+        for (event, _) in HERMES_EVENTS {
+            assert!(root.get(event).is_none());
+            assert_eq!(hooks.get_sequence(event).unwrap().values().count(), 1);
+        }
+        assert!(is_configured(&env, CodingAgentSelection::Hermes).unwrap());
+
+        reconcile(&env, CodingAgentSelection::Hermes).unwrap();
+        assert_eq!(fs::read_to_string(config_path).unwrap(), first);
+    }
+
+    #[test]
+    fn hermes_reconcile_adds_a_nested_mapping_to_an_existing_config() {
+        let root = tempdir().unwrap();
+        let env = test_env(root.path());
+        fs::create_dir_all(&env.hermes_home).unwrap();
+        let config_path = env.hermes_home.join("config.yaml");
+        fs::write(
+            &config_path,
+            "# keep this comment\nmodel:\n  default: test-model\n",
+        )
+        .unwrap();
+
+        reconcile(&env, CodingAgentSelection::Hermes).unwrap();
+
+        let first = fs::read_to_string(&config_path).unwrap();
+        assert!(first.contains("# keep this comment"));
+        assert!(first.contains("default: test-model"));
+        let yaml = YamlFile::from_str(&first).unwrap();
+        let root = yaml.document().unwrap().as_mapping().unwrap();
+        let hooks = root.get_mapping("hooks").unwrap();
+        for (event, _) in HERMES_EVENTS {
+            assert!(
+                root.get(event).is_none(),
+                "{event} escaped the hooks mapping"
+            );
+            let entries = hooks.get_sequence(event).unwrap();
+            assert_eq!(entries.values().count(), 1);
+        }
+        assert!(is_configured(&env, CodingAgentSelection::Hermes).unwrap());
+
+        reconcile(&env, CodingAgentSelection::Hermes).unwrap();
+        assert_eq!(fs::read_to_string(config_path).unwrap(), first);
+    }
+
+    #[test]
+    fn hermes_reconcile_repairs_misplaced_svarog_hooks_and_preserves_other_entries() {
+        let root = tempdir().unwrap();
+        let env = test_env(root.path());
+        fs::create_dir_all(&env.hermes_home).unwrap();
+        let config_path = env.hermes_home.join("config.yaml");
+        fs::write(
+            &config_path,
+            "# keep this comment\nmodel: test-model\non_session_start:\n  - {command: \"'/old/hermes-event.sh'\", timeout: 5}\n  - {command: \"echo keep\", timeout: 9}\non_session_start:\n  - {command: \"'/older/hermes-event.sh'\", timeout: 5}\npre_llm_call:\n  - {command: \"'/old/hermes-event.sh'\", timeout: 5}\non_session_end:\n  - {command: \"'/old/hermes-event.sh'\", timeout: 5}\non_session_finalize:\n  - {command: \"'/old/hermes-event.sh'\", timeout: 3}\nhooks:\n",
+        )
+        .unwrap();
+
+        reconcile(&env, CodingAgentSelection::Hermes).unwrap();
+
+        let first = fs::read_to_string(&config_path).unwrap();
+        assert!(first.contains("# keep this comment"));
+        let yaml = YamlFile::from_str(&first).unwrap();
+        let root = yaml.document().unwrap().as_mapping().unwrap();
+        let hooks = root.get_mapping("hooks").unwrap();
+        let misplaced = root.get_sequence("on_session_start").unwrap();
+        assert_eq!(misplaced.values().count(), 1);
+        assert!(misplaced
+            .values()
+            .next()
+            .is_some_and(|entry| !is_managed_hermes_hook(&entry)));
+        for (event, _) in HERMES_EVENTS {
+            if event != "on_session_start" {
+                assert!(root.get(event).is_none());
+            }
+            let entries = hooks.get_sequence(event).unwrap();
+            assert_eq!(entries.values().count(), 1);
+            assert!(entries.values().next().is_some_and(|entry| {
+                is_managed_hermes_hook(&entry)
+                    && entry
+                        .as_mapping()
+                        .and_then(|mapping| mapping.get("command"))
+                        .and_then(|value| value.as_scalar().map(|scalar| scalar.as_string()))
+                        .is_some_and(|command| !command.contains("/old/"))
+            }));
+        }
+
+        reconcile(&env, CodingAgentSelection::Hermes).unwrap();
+        assert_eq!(fs::read_to_string(config_path).unwrap(), first);
+    }
+
+    #[test]
+    fn hermes_deselection_cleans_up_misplaced_svarog_hooks() {
+        let root = tempdir().unwrap();
+        let env = test_env(root.path());
+        fs::create_dir_all(&env.hermes_home).unwrap();
+        let config_path = env.hermes_home.join("config.yaml");
+        fs::write(
+            &config_path,
+            "model: test-model\non_session_start:\n  - {command: \"'/old/hermes-event.sh'\", timeout: 5}\nhooks:\n",
+        )
+        .unwrap();
+
+        reconcile(&env, CodingAgentSelection::Codex).unwrap();
+
+        let config = fs::read_to_string(config_path).unwrap();
+        let yaml = YamlFile::from_str(&config).unwrap();
+        let root = yaml.document().unwrap().as_mapping().unwrap();
+        assert!(root.get("hooks").is_none());
+        assert!(root.get("on_session_start").is_none());
+        assert!(config.contains("model: test-model"));
+    }
+
+    #[test]
+    fn non_mapping_hermes_hooks_are_preserved_with_an_accurate_error() {
+        let root = tempdir().unwrap();
+        let env = test_env(root.path());
+        fs::create_dir_all(&env.hermes_home).unwrap();
+        let config_path = env.hermes_home.join("config.yaml");
+        let allowlist_path = env.hermes_home.join("shell-hooks-allowlist.json");
+        fs::write(&config_path, "hooks: []\n").unwrap();
+        fs::write(&allowlist_path, r#"{"approvals":[]}"#).unwrap();
+
+        let error = reconcile(&env, CodingAgentSelection::Hermes).unwrap_err();
+
+        assert!(error.to_string().contains("found a sequence"));
+        assert_eq!(fs::read_to_string(config_path).unwrap(), "hooks: []\n");
+        assert_eq!(
+            fs::read_to_string(allowlist_path).unwrap(),
+            r#"{"approvals":[]}"#
+        );
+    }
+
+    #[test]
+    fn malformed_hermes_config_is_preserved_without_touching_allowlist() {
+        let root = tempdir().unwrap();
+        let env = test_env(root.path());
+        fs::create_dir_all(&env.hermes_home).unwrap();
+        let config_path = env.hermes_home.join("config.yaml");
+        let allowlist_path = env.hermes_home.join("shell-hooks-allowlist.json");
+        fs::write(&config_path, "hooks: [not closed").unwrap();
+        fs::write(&allowlist_path, r#"{"approvals":[]}"#).unwrap();
+
+        let error = reconcile(&env, CodingAgentSelection::Hermes).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("repair the existing Hermes hook"));
+        assert_eq!(
+            fs::read_to_string(&config_path).unwrap(),
+            "hooks: [not closed"
+        );
+        assert_eq!(
+            fs::read_to_string(&allowlist_path).unwrap(),
+            r#"{"approvals":[]}"#
+        );
+    }
+
+    #[test]
+    fn duplicate_hermes_hook_keys_are_rejected_without_changes() {
+        let root = tempdir().unwrap();
+        let env = test_env(root.path());
+        fs::create_dir_all(&env.hermes_home).unwrap();
+        let config_path = env.hermes_home.join("config.yaml");
+        let original = "hooks:\n  pre_llm_call: []\n  pre_llm_call: []\n";
+        fs::write(&config_path, original).unwrap();
+
+        let error = reconcile(&env, CodingAgentSelection::Hermes).unwrap_err();
+
+        assert!(error.to_string().contains("duplicate YAML key"));
+        assert_eq!(fs::read_to_string(config_path).unwrap(), original);
     }
 
     #[test]

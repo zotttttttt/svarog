@@ -5086,6 +5086,7 @@ mod tests {
             codex_home: root.join("codex"),
             claude_config_dir: root.join("claude"),
             pi_config_dir: root.join("pi"),
+            hermes_home: root.join("hermes"),
             daemon_addr: "127.0.0.1:0".parse().unwrap(),
             dry_run: true,
         }

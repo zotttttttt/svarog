@@ -203,6 +203,7 @@ fn router(
         .route("/hooks/codex", post(handle_codex_hook))
         .route("/hooks/claude", post(handle_claude_hook))
         .route("/hooks/pi", post(handle_pi_hook))
+        .route("/hooks/hermes", post(handle_hermes_hook))
         .layer(DefaultBodyLimit::max(64 * 1024))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -261,6 +262,13 @@ async fn handle_pi_hook(
     Json(payload): Json<LifecycleHookEvent>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     handle_lifecycle_hook(state, Agent::Pi, payload).await
+}
+
+async fn handle_hermes_hook(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<LifecycleHookEvent>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    handle_lifecycle_hook(state, Agent::Hermes, payload).await
 }
 
 async fn handle_lifecycle_hook(
@@ -548,6 +556,7 @@ mod tests {
             codex_home: root.join("codex"),
             claude_config_dir: root.join("claude"),
             pi_config_dir: root.join("pi"),
+            hermes_home: root.join("hermes"),
             daemon_addr: "127.0.0.1:18787".parse().unwrap(),
             dry_run: false,
         }
