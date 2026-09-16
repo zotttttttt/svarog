@@ -2,8 +2,8 @@ use crate::config::{Config, UnitSystem};
 #[cfg(test)]
 use crate::models::FuelParseResult;
 use crate::models::{
-    Agent, AgentEvent, AppState, AppStateKind, CodexHookEvent, ForgeActivitySummary,
-    ForgeActivityTotals, FuelEntry, Movement, MovementSidedness, MovementStatus, NutritionTotals,
+    Agent, AgentEvent, AppState, AppStateKind, ForgeActivitySummary, ForgeActivityTotals,
+    FuelEntry, LifecycleHookEvent, Movement, MovementSidedness, MovementStatus, NutritionTotals,
     Recommendation, RecommendationSide, RecommenderTokenProvider, RecommenderTokenUsage,
     RecommenderTokenUsageSummary, SetStatus, TimedFuelEvent, TokenUsageTotals, WaterTotal,
 };
@@ -850,34 +850,35 @@ impl Store {
         Ok(self.conn.last_insert_rowid())
     }
 
-    pub fn record_codex_session(&self, event: &CodexHookEvent) -> Result<i64> {
+    pub fn record_agent_session(&self, agent: Agent, event: &LifecycleHookEvent) -> Result<i64> {
         let now = Utc::now().to_rfc3339();
         let project = event.project();
         self.conn.execute(
             r#"
             INSERT INTO sessions (agent, project, external_id, updated_at, ended_at, created_at)
-            VALUES ('codex', ?1, ?2, ?3, NULL, ?3)
+            VALUES (?1, ?2, ?3, ?4, NULL, ?4)
             ON CONFLICT(agent, external_id) WHERE external_id IS NOT NULL DO UPDATE SET
                 project = excluded.project,
                 updated_at = excluded.updated_at,
                 ended_at = NULL
             "#,
-            params![project.as_deref(), &event.session_id, &now],
+            params![agent.as_str(), project.as_deref(), &event.session_id, &now],
         )?;
         self.conn
             .query_row(
-                "SELECT id FROM sessions WHERE agent = 'codex' AND external_id = ?1",
-                [&event.session_id],
+                "SELECT id FROM sessions WHERE agent = ?1 AND external_id = ?2",
+                params![agent.as_str(), &event.session_id],
                 |row| row.get(0),
             )
-            .context("loading Codex session")
+            .with_context(|| format!("loading {agent} session"))
     }
 
-    pub fn record_codex_prompt(&self, event: &CodexHookEvent) -> Result<bool> {
-        let Some(turn_id) = event.turn_id.as_deref() else {
-            return Ok(false);
+    pub fn record_agent_prompt(&self, agent: Agent, event: &LifecycleHookEvent) -> Result<bool> {
+        let Some(turn_id) = event.external_turn_id() else {
+            self.record_agent_session(agent, event)?;
+            return Ok(agent == Agent::Claude);
         };
-        let session_id = self.record_codex_session(event)?;
+        let session_id = self.record_agent_session(agent, event)?;
         let changed = self.conn.execute(
             r#"
             INSERT OR IGNORE INTO turns
@@ -894,11 +895,11 @@ impl Store {
         Ok(changed == 1)
     }
 
-    pub fn record_codex_stop(&self, event: &CodexHookEvent) -> Result<()> {
-        let Some(turn_id) = event.turn_id.as_deref() else {
+    pub fn record_agent_stop(&self, agent: Agent, event: &LifecycleHookEvent) -> Result<()> {
+        let Some(turn_id) = event.external_turn_id() else {
             return Ok(());
         };
-        let session_id = self.record_codex_session(event)?;
+        let session_id = self.record_agent_session(agent, event)?;
         self.conn.execute(
             "UPDATE turns SET stopped_at = ?1 WHERE session_id = ?2 AND external_id = ?3",
             params![Utc::now().to_rfc3339(), session_id, turn_id],
@@ -906,15 +907,15 @@ impl Store {
         Ok(())
     }
 
-    pub fn record_codex_session_end(&self, event: &CodexHookEvent) -> Result<()> {
+    pub fn record_agent_session_end(&self, agent: Agent, event: &LifecycleHookEvent) -> Result<()> {
         let now = Utc::now().to_rfc3339();
         self.conn.execute(
             r#"
             UPDATE sessions
             SET updated_at = ?1, ended_at = ?1
-            WHERE agent = 'codex' AND external_id = ?2
+            WHERE agent = ?2 AND external_id = ?3
             "#,
-            params![now, &event.session_id],
+            params![now, agent.as_str(), &event.session_id],
         )?;
         Ok(())
     }
@@ -2112,7 +2113,7 @@ mod tests {
         drop(connection);
 
         let store = Store::open(&database).unwrap();
-        let event = CodexHookEvent {
+        let event = LifecycleHookEvent {
             session_id: "session-1".into(),
             turn_id: Some("turn-1".into()),
             cwd: "/work/svarog".into(),
@@ -2121,15 +2122,15 @@ mod tests {
             reason: None,
         };
 
-        assert!(store.record_codex_prompt(&event).unwrap());
-        assert!(!store.record_codex_prompt(&event).unwrap());
+        assert!(store.record_agent_prompt(Agent::Codex, &event).unwrap());
+        assert!(!store.record_agent_prompt(Agent::Codex, &event).unwrap());
     }
 
     #[test]
     fn codex_session_end_is_lifecycle_only() {
         let root = tempdir().unwrap().keep();
         let store = Store::open(&root.join("svarog.sqlite3")).unwrap();
-        let event = CodexHookEvent {
+        let event = LifecycleHookEvent {
             session_id: "session-1".into(),
             turn_id: None,
             cwd: "/work/svarog".into(),
@@ -2137,8 +2138,10 @@ mod tests {
             source: Some("startup".into()),
             reason: None,
         };
-        store.record_codex_session(&event).unwrap();
-        store.record_codex_session_end(&event).unwrap();
+        store.record_agent_session(Agent::Codex, &event).unwrap();
+        store
+            .record_agent_session_end(Agent::Codex, &event)
+            .unwrap();
 
         let ended_at: Option<String> = store
             .conn

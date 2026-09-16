@@ -14,6 +14,7 @@ requests.
 | Collector authentication token | `~/.config/svarog/collector.token` |
 | Workout database | `~/.local/share/svarog/svarog.sqlite3` |
 | Codex hook configuration | `~/.codex/hooks.json` |
+| Claude Code hook configuration | `~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR/settings.json`) |
 
 Svarog creates its config and data directories with user-only permissions on
 macOS and Linux. The config and database files are also restricted to the
@@ -21,8 +22,11 @@ current user.
 
 The database contains your profile, available movement pool, queue, completed
 and skipped movements, reps, pain and fatigue reports, cooldown state, and
-recommender token totals. Setup answers can include age, height, weight, goals,
-equipment, preferences, cautious body parts, and injuries.
+recommender token totals. It also records lifecycle metadata for selected
+coding-agent activity: the agent name, project basename, external session ID,
+and event timestamps. It does not retain coding-prompt text. Setup answers can
+include age, height, weight, goals, equipment, preferences, cautious body
+parts, and injuries.
 
 ## Local collector
 
@@ -32,8 +36,11 @@ stored in the Svarog config directory as `collector.token` with user-only
 permissions and rotates whenever the collector starts.
 Closing the dashboard stops collection.
 
-Codex lifecycle events tell Svarog when you submit a task for Codex to execute.
-They do not forward the text of your coding prompts.
+Codex and Claude Code lifecycle events tell Svarog when you submit a task for a
+selected coding agent to execute. They do not forward, store, or include the
+text of your coding prompts in recommendation requests. Svarog changes only its
+own hook entries and preserves other hook settings. User-level Claude Code
+hooks apply to locally running clients, not Claude Code cloud sessions.
 
 ## Recommender data flow
 
@@ -78,4 +85,5 @@ is truncated, and the collector bearer token is rotated. See [Commands](commands
 for the full reset behavior.
 
 For testing, `svarog demo` uses only `./.svarog-dev` and a separate development
-credential; it does not touch production data, credentials, or hooks.
+credential; it does not touch production data, credentials, or Codex and Claude
+Code hooks.

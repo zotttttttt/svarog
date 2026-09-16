@@ -31,7 +31,7 @@ pub struct Onboarding {
     pub completed_steps: Vec<String>,
 }
 
-pub const CURRENT_ONBOARDING_VERSION: u32 = 3;
+pub const CURRENT_ONBOARDING_VERSION: u32 = 4;
 pub const MIN_FORGE_FREQUENCY: u32 = 1;
 pub const MAX_FORGE_FREQUENCY: u32 = 12;
 pub const STEP_HEIGHT: &str = "profile.height_cm";
@@ -47,6 +47,7 @@ pub const STEP_ARCHETYPE: &str = "forge.archetype";
 pub const STEP_DESKTOP_NOTIFICATIONS: &str = "preferences.desktop_notifications";
 pub const STEP_CODEX_COMMAND: &str = "agents.codex_command";
 pub const STEP_EXERCISE_PREFERENCES: &str = "profile.exercise_preferences";
+pub const STEP_CODING_AGENT: &str = "agents.coding_agent";
 const LEGACY_STEP_RECOMMENDER_BACKEND: &str = "recommender.backend";
 const LEGACY_STEP_FORGE_INTENSITY: &str = "preferences.forge_intensity";
 const LEGACY_STEP_FORGE_FREQUENCY: &str = "preferences.forge_frequency";
@@ -70,7 +71,7 @@ pub const ORIGINAL_ONBOARDING_STEPS: [&str; 14] = [
 ];
 
 // Add every new question here with a stable ID and increment the version above.
-pub const CURRENT_ONBOARDING_STEPS: [&str; 12] = [
+pub const CURRENT_ONBOARDING_STEPS: [&str; 13] = [
     STEP_HEIGHT,
     STEP_WEIGHT,
     STEP_AGE,
@@ -81,6 +82,7 @@ pub const CURRENT_ONBOARDING_STEPS: [&str; 12] = [
     STEP_CAUTIOUS_BODY_PARTS,
     STEP_INJURIES,
     STEP_DESKTOP_NOTIFICATIONS,
+    STEP_CODING_AGENT,
     STEP_EXERCISE_PREFERENCES,
     STEP_ARCHETYPE,
 ];
@@ -198,6 +200,70 @@ impl FromStr for UnitSystem {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Agents {
     pub codex_command: String,
+    #[serde(default = "default_claude_command")]
+    pub claude_command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coding_agent: Option<CodingAgentSelection>,
+}
+
+fn default_claude_command() -> String {
+    "claude".to_string()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodingAgentSelection {
+    All,
+    Codex,
+    Claude,
+}
+
+impl CodingAgentSelection {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Codex => "Codex",
+            Self::Claude => "Claude Code",
+        }
+    }
+
+    pub fn includes(self, agent: crate::models::Agent) -> bool {
+        matches!(self, Self::All)
+            || matches!(
+                (self, agent),
+                (Self::Codex, crate::models::Agent::Codex)
+                    | (Self::Claude, crate::models::Agent::Claude)
+            )
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::All => Self::Codex,
+            Self::Codex => Self::Claude,
+            Self::Claude => Self::All,
+        }
+    }
+
+    pub fn previous(self) -> Self {
+        match self {
+            Self::All => Self::Claude,
+            Self::Claude => Self::Codex,
+            Self::Codex => Self::All,
+        }
+    }
+}
+
+impl FromStr for CodingAgentSelection {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value.trim().to_lowercase().as_str() {
+            "all" => Ok(Self::All),
+            "codex" => Ok(Self::Codex),
+            "claude" | "claude code" | "claude_code" => Ok(Self::Claude),
+            _ => Err("use one of: all, codex, claude".to_string()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -311,6 +377,8 @@ impl Default for Config {
             forge: Forge::default(),
             agents: Agents {
                 codex_command: "codex".to_string(),
+                claude_command: default_claude_command(),
+                coding_agent: None,
             },
             preferences: Preferences {
                 forge_frequency: default_forge_frequency(),
@@ -422,6 +490,7 @@ pub struct RuntimeEnv {
     pub mode: RuntimeMode,
     pub paths: Paths,
     pub codex_home: PathBuf,
+    pub claude_config_dir: PathBuf,
     pub daemon_addr: SocketAddr,
     pub dry_run: bool,
 }
@@ -493,11 +562,13 @@ impl RuntimeEnv {
         };
         let paths = resolve_svarog_paths(mode)?;
         let codex_home = resolve_codex_home(mode)?;
+        let claude_config_dir = resolve_claude_config_dir(mode)?;
         let daemon_addr = resolve_daemon_addr(mode)?;
         Ok(Self {
             mode,
             paths,
             codex_home,
+            claude_config_dir,
             daemon_addr,
             dry_run,
         })
@@ -514,6 +585,7 @@ impl RuntimeEnv {
             mode: RuntimeMode::Dev,
             paths: Paths::from_root(root.join("svarog")),
             codex_home: root.join("codex"),
+            claude_config_dir: root.join("claude"),
             daemon_addr: "127.0.0.1:18787".parse().unwrap(),
             dry_run: false,
         }
@@ -533,6 +605,10 @@ impl RuntimeEnv {
                 self.paths.config_dir.to_string_lossy().to_string(),
             ),
             ("CODEX_HOME", self.codex_home.to_string_lossy().to_string()),
+            (
+                "CLAUDE_CONFIG_DIR",
+                self.claude_config_dir.to_string_lossy().to_string(),
+            ),
             ("SVAROG_DAEMON_ADDR", self.daemon_addr.to_string()),
             (
                 "SVAROG_MODE",
@@ -579,6 +655,22 @@ fn resolve_codex_home(mode: RuntimeMode) -> Result<PathBuf> {
             .context("determining current directory")?
             .join(".svarog-dev")
             .join("codex")),
+    }
+}
+
+fn resolve_claude_config_dir(mode: RuntimeMode) -> Result<PathBuf> {
+    if let Ok(root) = std::env::var("CLAUDE_CONFIG_DIR") {
+        return Ok(PathBuf::from(root));
+    }
+    match mode {
+        RuntimeMode::Production => {
+            let dirs = BaseDirs::new().context("could not determine user directories")?;
+            Ok(dirs.home_dir().join(".claude"))
+        }
+        RuntimeMode::Dev => Ok(std::env::current_dir()
+            .context("determining current directory")?
+            .join(".svarog-dev")
+            .join("claude")),
     }
 }
 
@@ -774,6 +866,7 @@ mod tests {
     fn clear_runtime_env() {
         std::env::remove_var("SVAROG_HOME");
         std::env::remove_var("CODEX_HOME");
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
         std::env::remove_var("SVAROG_DAEMON_ADDR");
         std::env::remove_var("SVAROG_MODE");
     }
@@ -989,6 +1082,46 @@ mod tests {
     }
 
     #[test]
+    fn claude_command_is_configurable_and_defaults_for_legacy_configs() {
+        let serialized = toml::to_string_pretty(&Config::default())
+            .unwrap()
+            .replace("claude_command = \"claude\"\n", "");
+        let legacy: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(legacy.agents.claude_command, "claude");
+
+        let root = tempdir().unwrap();
+        let paths = Paths::from_root(root.path().join("svarog"));
+        let mut config = legacy;
+        config.agents.claude_command = "custom-claude".into();
+        save(&paths, &config).unwrap();
+
+        assert_eq!(
+            load_or_default(&paths).unwrap().agents.claude_command,
+            "custom-claude"
+        );
+    }
+
+    #[test]
+    fn coding_agent_selection_round_trips_and_has_no_default() {
+        let mut config = Config::default();
+        assert_eq!(config.agents.coding_agent, None);
+
+        config.agents.coding_agent = Some(CodingAgentSelection::Claude);
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        let parsed: Config = toml::from_str(&serialized).unwrap();
+
+        assert!(serialized.contains("coding_agent = \"claude\""));
+        assert_eq!(
+            parsed.agents.coding_agent,
+            Some(CodingAgentSelection::Claude)
+        );
+        assert_eq!("all".parse(), Ok(CodingAgentSelection::All));
+        assert_eq!("Codex".parse(), Ok(CodingAgentSelection::Codex));
+        assert_eq!("Claude Code".parse(), Ok(CodingAgentSelection::Claude));
+        assert!("".parse::<CodingAgentSelection>().is_err());
+    }
+
+    #[test]
     fn load_migrates_only_the_old_default_timeout() {
         let root = tempdir().unwrap();
         let old_paths = Paths::from_root(root.path().join("old"));
@@ -1064,7 +1197,11 @@ mod tests {
         assert!(loaded.preferences.desktop_notifications);
         assert_eq!(
             loaded.onboarding.pending_steps(),
-            vec![STEP_DESKTOP_NOTIFICATIONS, STEP_ARCHETYPE]
+            vec![
+                STEP_DESKTOP_NOTIFICATIONS,
+                STEP_CODING_AGENT,
+                STEP_ARCHETYPE
+            ]
         );
         assert!(!loaded.onboarding.is_complete());
     }
@@ -1088,14 +1225,10 @@ mod tests {
     }
 
     #[test]
-    fn onboarding_ends_with_notifications_preferences_then_archetype() {
+    fn onboarding_ends_with_agent_preferences_then_archetype() {
         assert_eq!(
             &CURRENT_ONBOARDING_STEPS[CURRENT_ONBOARDING_STEPS.len() - 3..],
-            [
-                STEP_DESKTOP_NOTIFICATIONS,
-                STEP_EXERCISE_PREFERENCES,
-                STEP_ARCHETYPE,
-            ]
+            [STEP_CODING_AGENT, STEP_EXERCISE_PREFERENCES, STEP_ARCHETYPE,]
         );
     }
 
@@ -1228,6 +1361,7 @@ mod tests {
             .config_file
             .ends_with(".svarog-dev/svarog/config.toml"));
         assert!(env.codex_home.ends_with(".svarog-dev/codex"));
+        assert!(env.claude_config_dir.ends_with(".svarog-dev/claude"));
         assert_eq!(env.daemon_addr.to_string(), "127.0.0.1:18787");
         assert!(env.dry_run);
         clear_runtime_env();
@@ -1240,6 +1374,7 @@ mod tests {
         let root = tempdir().unwrap().keep();
         std::env::set_var("SVAROG_HOME", root.join("svarog"));
         std::env::set_var("CODEX_HOME", root.join("codex"));
+        std::env::set_var("CLAUDE_CONFIG_DIR", root.join("claude"));
         std::env::set_var("SVAROG_DAEMON_ADDR", "127.0.0.1:19999");
 
         let env = RuntimeEnv::load_with_options(false, false).unwrap();
@@ -1249,6 +1384,7 @@ mod tests {
             root.join("svarog").join("config.toml")
         );
         assert_eq!(env.codex_home, root.join("codex"));
+        assert_eq!(env.claude_config_dir, root.join("claude"));
         assert_eq!(env.daemon_addr.to_string(), "127.0.0.1:19999");
         clear_runtime_env();
     }
@@ -1277,6 +1413,7 @@ mod tests {
             .any(|(key, value)| *key == "SVAROG_MODE" && value == "dev"));
         assert!(pairs.iter().any(|(key, _)| *key == "SVAROG_HOME"));
         assert!(pairs.iter().any(|(key, _)| *key == "CODEX_HOME"));
+        assert!(pairs.iter().any(|(key, _)| *key == "CLAUDE_CONFIG_DIR"));
         assert!(pairs
             .iter()
             .any(|(key, value)| *key == "SVAROG_DAEMON_ADDR" && value == "127.0.0.1:18787"));
@@ -1291,6 +1428,7 @@ mod tests {
         let production = tempdir().unwrap();
         std::env::set_var("SVAROG_HOME", production.path().join("svarog"));
         std::env::set_var("CODEX_HOME", production.path().join("codex"));
+        std::env::set_var("CLAUDE_CONFIG_DIR", production.path().join("claude"));
         std::env::set_var("SVAROG_DAEMON_ADDR", "127.0.0.1:8787");
 
         let env = RuntimeEnv::demo_for_project(project.path().to_path_buf());

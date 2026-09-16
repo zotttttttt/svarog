@@ -117,8 +117,8 @@ marked development instance. It never replaces the production `svarog`
 executable.
 
 Development data is isolated under `./.svarog-dev`, including its own SQLite
-database, configuration, credentials, hooks, and daemon port. The development
-launcher cannot use or modify production state.
+database, configuration, credentials, Codex and Claude Code hook configuration,
+and daemon port. The development launcher cannot use or modify production state.
 
 After changing the checkout, the launcher offers to rebuild before continuing.
 Force a rebuild without the prompt with:
@@ -135,6 +135,7 @@ scripts and automated workflows.
 - Svarog release binaries support Apple Silicon macOS, Intel macOS, and x86-64
   Linux.
 - The macOS binaries are not currently Apple code-signed or notarized.
-- `tmux` is optional and only required for `svarog session codex`.
+- `tmux` is optional and only required for `svarog session codex` or
+  `svarog session claude`.
 - Linux desktop notifications require a graphical session, a notification
   daemon, and `notify-send` (`libnotify-bin` on Debian and Ubuntu).

@@ -1,4 +1,4 @@
-use crate::config::{self, Config, RuntimeEnv, UnitSystem};
+use crate::config::{self, CodingAgentSelection, Config, RuntimeEnv, UnitSystem};
 use crate::daemon;
 use crate::hooks;
 use crate::models::{Agent, AppStateKind, IncomingEvent, MovementStatus, SetStatus};
@@ -54,6 +54,10 @@ enum Command {
     Stop,
     #[command(hide = true)]
     CodexHook,
+    #[command(hide = true)]
+    LifecycleHook {
+        agent: Agent,
+    },
     #[command(hide = true)]
     Daemon,
     Status,
@@ -121,18 +125,18 @@ pub async fn run() -> Result<()> {
         Some(Command::Demo { remove_data }) => run_demo(remove_data).await,
         Some(Command::Run) => launch(&env).await,
         Some(Command::Stop) => stop::run(&env),
-        Some(Command::CodexHook) => hooks::ingest_codex(&env).await,
+        Some(Command::CodexHook) => hooks::ingest_lifecycle(&env, Agent::Codex).await,
+        Some(Command::LifecycleHook { agent }) => hooks::ingest_lifecycle(&env, agent).await,
         Some(Command::Daemon) => daemon::run().await,
         Some(Command::Status) => status(&env),
         Some(Command::Hook { agent, install }) => {
             if install {
-                if agent == Agent::Codex {
-                    let path = hooks::install_global_codex(&env)?;
-                    println!("Installed Codex hook config: {}", path.display());
-                } else {
-                    let path = hooks::install(&env, agent)?;
-                    println!("Installed hook script: {}", path.display());
-                }
+                let path = match agent {
+                    Agent::Codex => hooks::install_global_codex(&env)?,
+                    Agent::Claude => hooks::install_global_claude(&env)?,
+                    _ => hooks::install(&env, agent)?,
+                };
+                println!("Installed {} hook: {}", agent, path.display());
             } else {
                 hooks::print(agent);
             }
@@ -292,10 +296,17 @@ fn finish_setup(env: &RuntimeEnv, config: &Config) -> Result<()> {
         println!("{} {}", ember("✓"), text("Recommendation engine ready"));
     }
 
+    let coding_agent = config
+        .agents
+        .coding_agent
+        .context("choose a coding agent before finishing setup")?;
     println!();
-    println!("{}", text("Installing Codex integration..."));
-    hooks::install_global_codex(env)?;
-    println!("{} {}", ember("✓"), text("Hook installed"));
+    println!("{}", text("Configuring coding-agent integrations..."));
+    hooks::reconcile(env, coding_agent)?;
+    println!("{} {}", ember("✓"), text("Hooks configured"));
+    for warning in hooks::integration_status(env, coding_agent)?.warnings {
+        eprintln!("{} {}", ember("!"), text(warning));
+    }
     println!();
     print_setup_summary(config);
     Ok(())
@@ -316,7 +327,10 @@ fn print_setup_intro(env: &RuntimeEnv) {
     );
     println!("{}", muted("and connect to your coding agent."));
     println!();
-    println!("{}", text_bold("Press Enter to accept defaults."));
+    println!(
+        "{}",
+        text_bold("Press Enter to accept defaults except where a choice is required.")
+    );
     println!();
 }
 
@@ -378,9 +392,11 @@ fn production_needs_setup(env: &RuntimeEnv) -> Result<bool> {
         return Ok(true);
     }
     let config = config::load_or_default(&env.paths)?;
-    Ok(!config.onboarding.is_complete()
-        || !env.paths.database_file.exists()
-        || !env.codex_home.join("hooks.json").exists())
+    let hooks_need_repair = match config.agents.coding_agent {
+        Some(selection) => !hooks::integration_status(env, selection)?.configured,
+        None => true,
+    };
+    Ok(!config.onboarding.is_complete() || !env.paths.database_file.exists() || hooks_need_repair)
 }
 
 async fn run_demo(_remove_data: bool) -> Result<()> {
@@ -421,6 +437,7 @@ fn demo_root(env: &RuntimeEnv) -> Result<PathBuf> {
     };
     if root.file_name().and_then(|name| name.to_str()) != Some(".svarog-dev")
         || env.codex_home.parent() != Some(root)
+        || env.claude_config_dir.parent() != Some(root)
     {
         bail!(
             "refusing to use an invalid demo sandbox: {}",
@@ -521,6 +538,15 @@ fn setup_dry_run(env: &RuntimeEnv) -> Result<()> {
         "{} {}",
         muted("Would install Codex hook config:"),
         text(env.codex_home.join("hooks.json").display())
+    );
+    println!(
+        "{} {}",
+        muted("Would install Claude Code hook config when selected:"),
+        text(env.claude_config_dir.join("settings.json").display())
+    );
+    println!(
+        "{}",
+        muted("Would require an agent choice: All / Codex / Claude Code")
     );
     println!(
         "{} {}",
@@ -653,6 +679,10 @@ fn collect_profile(config: &mut Config, paths: &config::Paths, all: bool) -> Res
             Ok(())
         },
     )?;
+    onboarding_step(config, paths, config::STEP_CODING_AGENT, all, |config| {
+        config.agents.coding_agent = Some(prompt_coding_agent()?);
+        Ok(())
+    })?;
     onboarding_step(
         config,
         paths,
@@ -699,7 +729,7 @@ fn print_setup_summary(config: &Config) {
     println!();
     println!(
         "{}",
-        text("You'll receive forging sessions while `svarog run` is open and Codex works.")
+        text("You'll receive forging sessions while `svarog run` is open and your coding agent works.")
     );
     println!();
     println!("{}", ember("Current settings"));
@@ -734,12 +764,21 @@ fn print_setup_summary(config: &Config) {
     println!("{}", muted("Recommendation engine:"));
     println!("{}", text(config.recommender.backend.label()));
     println!();
-    println!("{}", muted("Agent:"));
-    println!("{}", text("Codex"));
+    println!("{}", muted("Coding agent:"));
+    println!(
+        "{}",
+        text(
+            config
+                .agents
+                .coding_agent
+                .map(CodingAgentSelection::label)
+                .unwrap_or("not configured")
+        )
+    );
     println!();
     println!(
         "{}",
-        muted("Codex may ask once to trust the Svarog hook. Use /hooks if prompted.")
+        muted("Your coding agent may ask once to trust the Svarog hook. Use /hooks if prompted.")
     );
     println!();
     println!("{}", ember("Happy forging."));
@@ -823,6 +862,7 @@ fn status(env: &RuntimeEnv) -> Result<()> {
     println!("Environment: {}", env.mode_label());
     println!("Collector: {} (runs with `svarog run`)", env.daemon_addr);
     println!("Codex: {}", env.codex_home.display());
+    println!("Claude Code: {}", env.claude_config_dir.display());
     let config_exists = paths.config_file.exists();
     let db_exists = paths.database_file.exists();
     println!(
@@ -841,6 +881,34 @@ fn status(env: &RuntimeEnv) -> Result<()> {
             "missing".into()
         }
     );
+    if config_exists {
+        let config = config::load_or_default(paths)?;
+        let selection = config.agents.coding_agent;
+        println!(
+            "Coding agent: {}",
+            selection
+                .map(CodingAgentSelection::label)
+                .unwrap_or("not configured")
+        );
+        if let Some(selection) = selection {
+            let integration = hooks::integration_status(env, selection)?;
+            println!(
+                "Coding-agent hooks: {}",
+                if integration.configured {
+                    if integration.warnings.is_empty() {
+                        "configured"
+                    } else {
+                        "configured (degraded)"
+                    }
+                } else {
+                    "repair required"
+                }
+            );
+            for warning in integration.warnings {
+                println!("Hook warning: {warning}");
+            }
+        }
+    }
 
     if db_exists {
         let store = Store::open(&paths.database_file)?;
@@ -1068,6 +1136,18 @@ fn prompt_string(label: &str, default: &str) -> Result<String> {
     } else {
         Ok(value.to_string())
     }
+}
+
+fn prompt_coding_agent() -> Result<CodingAgentSelection> {
+    print!("{}: ", text("Coding agent (All / Codex / Claude Code)"));
+    io::stdout().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let value = input.trim();
+    if value.is_empty() {
+        bail!("coding agent selection is required; choose All, Codex, or Claude Code");
+    }
+    value.parse().map_err(anyhow::Error::msg)
 }
 
 fn prompt_multiline_string(label: &str, default: &str) -> Result<String> {
@@ -1338,6 +1418,7 @@ mod tests {
             mode: RuntimeMode::Dev,
             paths: Paths::from_root(root.join("svarog")),
             codex_home: root.join("codex"),
+            claude_config_dir: root.join("claude"),
             daemon_addr: "127.0.0.1:18787".parse().unwrap(),
             dry_run: true,
         };
@@ -1448,12 +1529,14 @@ mod tests {
             mode: RuntimeMode::Production,
             paths: Paths::from_root(root.path().join("svarog")),
             codex_home: root.path().join("codex"),
+            claude_config_dir: root.path().join("claude"),
             daemon_addr: "127.0.0.1:8787".parse().unwrap(),
             dry_run: false,
         };
         assert!(production_needs_setup(&env).unwrap());
 
         let mut config = Config::default();
+        config.agents.coding_agent = Some(CodingAgentSelection::Codex);
         for step in config::CURRENT_ONBOARDING_STEPS {
             config.onboarding.mark_completed(step);
         }
@@ -1461,10 +1544,40 @@ mod tests {
         assert!(production_needs_setup(&env).unwrap());
 
         Store::open(&env.paths.database_file).unwrap();
-        fs::create_dir_all(&env.codex_home).unwrap();
-        fs::write(env.codex_home.join("hooks.json"), "{}").unwrap();
+        hooks::reconcile(&env, CodingAgentSelection::Codex).unwrap();
 
         assert!(!production_needs_setup(&env).unwrap());
+    }
+
+    #[test]
+    fn degraded_claude_hooks_do_not_repeat_setup() {
+        let root = tempdir().unwrap();
+        let env = RuntimeEnv {
+            mode: RuntimeMode::Production,
+            paths: Paths::from_root(root.path().join("svarog")),
+            codex_home: root.path().join("codex"),
+            claude_config_dir: root.path().join("claude"),
+            daemon_addr: "127.0.0.1:8787".parse().unwrap(),
+            dry_run: false,
+        };
+        let mut config = Config::default();
+        config.agents.coding_agent = Some(CodingAgentSelection::Claude);
+        for step in config::CURRENT_ONBOARDING_STEPS {
+            config.onboarding.mark_completed(step);
+        }
+        config::save(&env.paths, &config).unwrap();
+        Store::open(&env.paths.database_file).unwrap();
+        hooks::reconcile(&env, CodingAgentSelection::Claude).unwrap();
+        let path = env.claude_config_dir.join("settings.json");
+        let mut settings: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        settings["disableAllHooks"] = serde_json::json!(true);
+        fs::write(path, serde_json::to_vec(&settings).unwrap()).unwrap();
+
+        assert!(!production_needs_setup(&env).unwrap());
+        let status = hooks::integration_status(&env, CodingAgentSelection::Claude).unwrap();
+        assert!(status.configured);
+        assert!(!status.warnings.is_empty());
     }
 
     #[test]
@@ -1509,11 +1622,13 @@ mod tests {
             mode: RuntimeMode::Production,
             paths: Paths::from_root(root.path().join("svarog")),
             codex_home: root.path().join("codex"),
+            claude_config_dir: root.path().join("claude"),
             daemon_addr: "127.0.0.1:8787".parse().unwrap(),
             dry_run: false,
         };
         let mut config = Config::default();
         config.recommender.backend = RecommenderBackend::Local;
+        config.agents.coding_agent = Some(CodingAgentSelection::Codex);
         for step in config::CURRENT_ONBOARDING_STEPS {
             config.onboarding.mark_completed(step);
         }
@@ -1568,6 +1683,7 @@ mod tests {
             mode: RuntimeMode::Production,
             paths: Paths::from_root(root.path().join("svarog")),
             codex_home: root.path().join("codex"),
+            claude_config_dir: root.path().join("claude"),
             daemon_addr: "127.0.0.1:8787".parse().unwrap(),
             dry_run: false,
         };

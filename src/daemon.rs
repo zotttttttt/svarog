@@ -1,7 +1,7 @@
 use crate::collector_auth;
 use crate::config::{load_or_default, Config, RuntimeEnv};
 use crate::engine;
-use crate::models::{Agent, AppStateKind, CodexHookEvent, IncomingEvent, Recommendation};
+use crate::models::{Agent, AppStateKind, IncomingEvent, LifecycleHookEvent, Recommendation};
 use crate::notifications;
 use crate::recommender;
 use crate::secrets;
@@ -25,7 +25,7 @@ use zeroize::Zeroizing;
 
 struct AppState {
     env: RuntimeEnv,
-    accept_codex: bool,
+    accept_lifecycle_hooks: bool,
     collector_token: Zeroizing<String>,
     event_lock: Mutex<()>,
 }
@@ -187,16 +187,21 @@ impl Drop for TuiLock {
     }
 }
 
-fn router(env: RuntimeEnv, accept_codex: bool, collector_token: Zeroizing<String>) -> Router {
+fn router(
+    env: RuntimeEnv,
+    accept_lifecycle_hooks: bool,
+    collector_token: Zeroizing<String>,
+) -> Router {
     let state = Arc::new(AppState {
         env,
-        accept_codex,
+        accept_lifecycle_hooks,
         collector_token,
         event_lock: Mutex::new(()),
     });
     let protected = Router::new()
         .route("/events", post(handle_event))
         .route("/hooks/codex", post(handle_codex_hook))
+        .route("/hooks/claude", post(handle_claude_hook))
         .layer(DefaultBodyLimit::max(64 * 1024))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -238,31 +243,50 @@ async fn handle_event(
 
 async fn handle_codex_hook(
     State(state): State<Arc<AppState>>,
-    Json(payload): Json<CodexHookEvent>,
+    Json(payload): Json<LifecycleHookEvent>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    handle_lifecycle_hook(state, Agent::Codex, payload).await
+}
+
+async fn handle_claude_hook(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<LifecycleHookEvent>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    handle_lifecycle_hook(state, Agent::Claude, payload).await
+}
+
+async fn handle_lifecycle_hook(
+    state: Arc<AppState>,
+    agent: Agent,
+    payload: LifecycleHookEvent,
 ) -> Result<StatusCode, (StatusCode, String)> {
     payload
         .validate()
         .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
-    if !state.accept_codex {
+    if !state.accept_lifecycle_hooks {
         return Ok(StatusCode::NO_CONTENT);
     }
     let _guard = state.event_lock.lock().await;
-    process_codex_hook(&state.env, payload)
+    process_lifecycle_hook(&state.env, agent, payload)
         .map(|_| StatusCode::NO_CONTENT)
         .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))
 }
 
-pub fn process_codex_hook(env: &RuntimeEnv, payload: CodexHookEvent) -> Result<()> {
+pub fn process_lifecycle_hook(
+    env: &RuntimeEnv,
+    agent: Agent,
+    payload: LifecycleHookEvent,
+) -> Result<()> {
     payload.validate()?;
     let store = Store::open(&env.paths.database_file)?;
     match payload.hook_event_name.as_str() {
         "SessionStart" => {
-            store.record_codex_session(&payload)?;
+            store.record_agent_session(agent, &payload)?;
         }
         "UserPromptSubmit" => {
-            if store.record_codex_prompt(&payload)? {
+            if store.record_agent_prompt(agent, &payload)? {
                 let event = IncomingEvent {
-                    agent: Agent::Codex,
+                    agent,
                     event: "user_prompt_submit".to_string(),
                     expected_duration_sec: None,
                     duration_sec: None,
@@ -271,11 +295,16 @@ pub fn process_codex_hook(env: &RuntimeEnv, payload: CodexHookEvent) -> Result<(
                 process_event(env, event)?;
             }
         }
-        "Stop" => store.record_codex_stop(&payload)?,
-        "SessionEnd" => store.record_codex_session_end(&payload)?,
+        "Stop" => store.record_agent_stop(agent, &payload)?,
+        "SessionEnd" => store.record_agent_session_end(agent, &payload)?,
         _ => {}
     }
     Ok(())
+}
+
+#[cfg(test)]
+fn process_codex_hook(env: &RuntimeEnv, payload: LifecycleHookEvent) -> Result<()> {
+    process_lifecycle_hook(env, Agent::Codex, payload)
 }
 
 pub fn process_event(env: &RuntimeEnv, payload: IncomingEvent) -> Result<EventResponse> {
@@ -509,6 +538,7 @@ mod tests {
             mode: RuntimeMode::Dev,
             paths: Paths::from_root(root.join("svarog")),
             codex_home: root.join("codex"),
+            claude_config_dir: root.join("claude"),
             daemon_addr: "127.0.0.1:18787".parse().unwrap(),
             dry_run: false,
         }
@@ -829,8 +859,8 @@ mod tests {
         assert!(store.latest_open_recommendation().unwrap().is_some());
     }
 
-    fn codex_hook(event_name: &str, turn_id: Option<&str>) -> CodexHookEvent {
-        CodexHookEvent {
+    fn codex_hook(event_name: &str, turn_id: Option<&str>) -> LifecycleHookEvent {
+        LifecycleHookEvent {
             session_id: "session-1".into(),
             turn_id: turn_id.map(str::to_owned),
             cwd: "/work/svarog".into(),
@@ -998,6 +1028,28 @@ mod tests {
     }
 
     #[test]
+    fn claude_reports_each_official_prompt_payload() {
+        let env = test_env();
+        let mut config = Config::default();
+        config.recommender.backend = RecommenderBackend::Local;
+        crate::config::save(&env.paths, &config).unwrap();
+        let prompt = LifecycleHookEvent {
+            session_id: "old-claude-session".into(),
+            turn_id: None,
+            cwd: "/work/svarog".into(),
+            hook_event_name: "UserPromptSubmit".into(),
+            source: None,
+            reason: None,
+        };
+
+        process_lifecycle_hook(&env, Agent::Claude, prompt.clone()).unwrap();
+        process_lifecycle_hook(&env, Agent::Claude, prompt).unwrap();
+
+        let store = Store::open(&env.paths.database_file).unwrap();
+        assert_eq!(store.event_count().unwrap(), 2);
+    }
+
+    #[test]
     fn fatigue_skips_five_configured_forge_intervals() {
         let env = test_env();
         let mut config = Config::default();
@@ -1077,7 +1129,7 @@ mod tests {
         crate::config::save(&env.paths, &config).unwrap();
         let state = Arc::new(AppState {
             env: env.clone(),
-            accept_codex: true,
+            accept_lifecycle_hooks: true,
             collector_token: Zeroizing::new("a".repeat(64)),
             event_lock: Mutex::new(()),
         });
@@ -1104,7 +1156,7 @@ mod tests {
         let env = test_env();
         let state = Arc::new(AppState {
             env: env.clone(),
-            accept_codex: false,
+            accept_lifecycle_hooks: false,
             collector_token: Zeroizing::new("a".repeat(64)),
             event_lock: Mutex::new(()),
         });
@@ -1178,8 +1230,20 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let claude_url = format!("http://{}/hooks/claude", collector.addr());
+        let claude_response = client
+            .post(&claude_url)
+            .bearer_auth(token.as_str())
+            .header("content-type", "application/json")
+            .body(
+                r#"{"session_id":"claude-session","transcript_path":"/private/transcript.jsonl","cwd":"/work/svarog","permission_mode":"default","hook_event_name":"UserPromptSubmit","prompt":"private"}"#,
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(claude_response.status(), StatusCode::NO_CONTENT);
         let store = Store::open(&env.paths.database_file).unwrap();
-        assert_eq!(store.event_count().unwrap(), 1);
+        assert_eq!(store.event_count().unwrap(), 2);
         drop(store);
         collector.shutdown().await.unwrap();
         assert!(client

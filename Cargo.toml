@@ -1,13 +1,13 @@
 [package]
 name = "svarog-cli"
-version = "0.7.4"
+version = "0.8.0"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT"
 description = "A CLI sidecar that turns AI-agent waiting time into tiny, adaptive workouts."
 repository = "https://github.com/zotttttttt/svarog"
 readme = "README.md"
-keywords = ["cli", "tui", "exercise", "productivity", "codex"]
+keywords = ["cli", "tui", "exercise", "codex", "claude-code"]
 categories = ["command-line-utilities"]
 include = [
     "Cargo.toml",

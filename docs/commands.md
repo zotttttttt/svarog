@@ -8,6 +8,7 @@
 | --- | --- |
 | `svarog` / `svarog run` | Set up if necessary, then open the dashboard and collector |
 | `svarog session codex` | Open Codex and Svarog together in a tmux session |
+| `svarog session claude` | Open Claude Code and Svarog together in a tmux session |
 | `svarog status` | Print the current state and recommendation |
 | `svarog stop` | Stop Svarog runtimes and Svarog-created tmux sessions |
 | `svarog setup` | Repair or revisit setup, then open the dashboard |
@@ -17,9 +18,11 @@ Closing the dashboard stops its local event collector. `svarog stop` also
 closes coding-agent processes inside tmux sessions created by Svarog.
 
 While the dashboard is waiting, press `s` to edit the Forge archetype,
-recommender, notifications, daily forge ceiling, measurements, goals,
-equipment, work setup, limitations, exercise preferences, and a securely saved
-OpenAI API key. Profile and recommender changes remain staged until you press
+recommender, coding-agent choice, notifications, daily forge ceiling,
+measurements, goals, equipment, work setup, limitations, exercise preferences,
+and a securely saved OpenAI API key. Choose **All**, **Codex**, or **Claude
+Code** for the coding agent; applying that change reconciles only Svarog-owned
+hooks. Profile and recommender changes remain staged until you press
 Ctrl+S (or Command+S when supported by the terminal); Esc cancels those
 changes. Changing the recommender refreshes future forges; other Settings saves
 keep the compatible queue. Height, weight, age, and choice fields can be
@@ -43,6 +46,20 @@ recorded check-in in your selected unit system.
 
 After `svarog setup` completes, press Enter at the final prompt to open the
 dashboard immediately. `svarog setup --dry-run` prints its preview and exits.
+
+## Claude Code hook health
+
+`svarog status` reports when the selected Claude Code integration is missing or
+appears disabled. `disableAllHooks: true` in readable Claude settings disables
+the installed hooks. On macOS and Linux, Svarog also checks readable file-based
+managed settings for `allowManagedHooksOnly: true`; that policy can prevent
+user-level Svarog hooks from running.
+
+Some restrictions cannot be inspected locally: server- or MDM-managed policy,
+and a Claude Code invocation using safe or bare mode. Those modes can disable
+hooks for that run. Remove the disabling setting or policy restriction, then
+run `svarog setup` to repair the selected integration. These findings are
+warnings, so setup can still finish when policy is controlled outside Svarog.
 
 ## Dashboard controls
 
@@ -95,10 +112,10 @@ svarog setup --reset
 ```
 
 You must type `destroy all` before anything is removed. The installed binary
-and Codex integration files remain in place. Svarog also removes its saved
-OpenAI API key from the operating system credential store. If that store is
-unavailable, the data reset still completes and prints a warning explaining
-that the credential may need to be removed manually.
+and Codex and Claude Code integration files remain in place. Svarog also
+removes its saved OpenAI API key from the operating system credential store. If
+that store is unavailable, the data reset still completes and prints a warning
+explaining that the credential may need to be removed manually.
 
 ## Demo and safe setup checks
 
@@ -123,4 +140,14 @@ CODEX_HOME="$PWD/.svarog-dev/codex" \
 SVAROG_DAEMON_ADDR="127.0.0.1:18787" \
 SVAROG_MODE=dev \
 codex
+```
+
+To connect a Claude Code process explicitly to the development sandbox:
+
+```bash
+SVAROG_HOME="$PWD/.svarog-dev/svarog" \
+CLAUDE_CONFIG_DIR="$PWD/.svarog-dev/claude" \
+SVAROG_DAEMON_ADDR="127.0.0.1:18787" \
+SVAROG_MODE=dev \
+claude
 ```
