@@ -31,14 +31,15 @@ are advanced settings rather than onboarding questions:
 codex_command = "codex"
 claude_command = "claude"
 pi_command = "pi"
-coding_agents = ["codex", "pi"]
+hermes_command = "hermes"
+coding_agents = ["codex", "pi", "hermes"]
 ```
 
-`claude_command` and `pi_command` default to their standard executable names,
-including for older configurations. Set either to an absolute path or wrapper
-command when the executable is installed elsewhere. `coding_agents` accepts
-any non-empty combination of `codex`, `claude`, and `pi`; setup also accepts
-`all` as shorthand for all three.
+`claude_command`, `pi_command`, and `hermes_command` default to their standard
+executable names, including for older configurations. Set any of them to an
+absolute path or wrapper command when the executable is installed elsewhere.
+`coding_agents` accepts any non-empty combination of `codex`, `claude`, `pi`,
+and `hermes`; setup also accepts `all` as shorthand for all four.
 
 ## Forge archetypes
 

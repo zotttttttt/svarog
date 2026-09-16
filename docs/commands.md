@@ -10,6 +10,7 @@
 | `svarog session codex` | Open Codex and Svarog together in a tmux session |
 | `svarog session claude` | Open Claude Code and Svarog together in a tmux session |
 | `svarog session pi` | Open Pi and Svarog together in a tmux session |
+| `svarog session hermes` | Open Hermes Agent and Svarog together in a tmux session |
 | `svarog status` | Print the current state and recommendation |
 | `svarog stop` | Stop Svarog runtimes and Svarog-created tmux sessions |
 | `svarog setup` | Repair or revisit setup, then open the dashboard |
@@ -22,9 +23,9 @@ While the dashboard is waiting, press `s` to edit the Forge archetype,
 recommender, coding-agent choice, notifications, daily forge ceiling,
 measurements, goals, equipment, work setup, limitations, exercise preferences,
 and a securely saved OpenAI API key. Select `all` or any combination of
-`codex`, `claude`, and `pi`; applying that change reconciles only Svarog-owned
-hooks and extensions. Profile and recommender changes remain staged until you press
-Ctrl+S (or Command+S when supported by the terminal); Esc cancels those
+`codex`, `claude`, `pi`, and `hermes`; applying that change reconciles only
+Svarog-owned hooks and extensions. Profile and recommender changes remain
+staged until you press Ctrl+S (or Command+S when supported by the terminal); Esc cancels those
 changes. Changing the recommender refreshes future forges; other Settings saves
 keep the compatible queue. Height, weight, age, and choice fields can be
 adjusted with Left/Right, while Enter opens selectors and exact-value editors.
@@ -61,6 +62,17 @@ and a Claude Code invocation using safe or bare mode. Those modes can disable
 hooks for that run. Remove the disabling setting or policy restriction, then
 run `svarog setup` to repair the selected integration. These findings are
 warnings, so setup can still finish when policy is controlled outside Svarog.
+
+## Hermes Agent shell hook
+
+Selecting Hermes during setup installs Svarog's shell hook automatically in
+`$HERMES_HOME/config.yaml` and adds the hook's scoped approvals to
+`$HERMES_HOME/shell-hooks-allowlist.json` (`HERMES_HOME` defaults to
+`~/.hermes`). To install or repair that integration directly, run:
+
+```bash
+svarog hook hermes --install
+```
 
 ## Dashboard controls
 
@@ -113,8 +125,8 @@ svarog setup --reset
 ```
 
 You must type `destroy all` before anything is removed. The installed binary
-and Codex, Claude Code, and Pi integration files remain in place. Svarog also
-removes its saved OpenAI API key from the operating system credential store. If
+and Codex, Claude Code, Pi, and Hermes Agent integration files remain in place.
+Svarog also removes its saved OpenAI API key from the operating system credential store. If
 that store is unavailable, the data reset still completes and prints a warning
 explaining that the credential may need to be removed manually.
 
@@ -161,4 +173,14 @@ PI_CODING_AGENT_DIR="$PWD/.svarog-dev/pi" \
 SVAROG_DAEMON_ADDR="127.0.0.1:18787" \
 SVAROG_MODE=dev \
 pi
+```
+
+To connect a Hermes Agent process explicitly to the development sandbox:
+
+```bash
+SVAROG_HOME="$PWD/.svarog-dev/svarog" \
+HERMES_HOME="$PWD/.svarog-dev/hermes" \
+SVAROG_DAEMON_ADDR="127.0.0.1:18787" \
+SVAROG_MODE=dev \
+hermes
 ```

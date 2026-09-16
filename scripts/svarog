@@ -114,6 +114,7 @@ export SVAROG_HOME="$dev_root/svarog"
 export CODEX_HOME="$dev_root/codex"
 export CLAUDE_CONFIG_DIR="$dev_root/claude"
 export PI_CODING_AGENT_DIR="$dev_root/pi"
+export HERMES_HOME="$dev_root/hermes"
 export SVAROG_DAEMON_ADDR="${SVAROG_DAEMON_ADDR:-127.0.0.1:18787}"
 export SVAROG_DEV_LAUNCHER="$script_dir/svarog"
 

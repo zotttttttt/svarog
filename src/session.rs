@@ -7,7 +7,10 @@ use std::process::{Command, Stdio};
 pub fn run(agent: Agent, env: &RuntimeEnv) -> Result<()> {
     let paths = &env.paths;
     let config = load_or_default(paths)?;
-    if matches!(agent, Agent::Codex | Agent::Claude | Agent::Pi) {
+    if matches!(
+        agent,
+        Agent::Codex | Agent::Claude | Agent::Pi | Agent::Hermes
+    ) {
         let selection = config
             .agents
             .coding_agent
@@ -24,6 +27,9 @@ pub fn run(agent: Agent, env: &RuntimeEnv) -> Result<()> {
             }
             Agent::Pi => {
                 hooks::install_global_pi(env)?;
+            }
+            Agent::Hermes => {
+                hooks::install_global_hermes(env)?;
             }
             _ => unreachable!(),
         }
@@ -75,6 +81,7 @@ fn agent_command(agent: Agent, config: &crate::config::Config) -> String {
         Agent::Codex => config.agents.codex_command.clone(),
         Agent::Claude => config.agents.claude_command.clone(),
         Agent::Pi => config.agents.pi_command.clone(),
+        Agent::Hermes => config.agents.hermes_command.clone(),
         Agent::Droid => "droid".to_string(),
         Agent::FactoryDroid => "factory-droid".to_string(),
         Agent::OpenClaw => "openclaw".to_string(),
@@ -157,5 +164,16 @@ mod tests {
         config.agents.pi_command = "pi-custom --flag".into();
 
         assert_eq!(agent_command(Agent::Pi, &config), "pi-custom --flag");
+    }
+
+    #[test]
+    fn hermes_session_uses_the_configured_command() {
+        let mut config = crate::config::Config::default();
+        config.agents.hermes_command = "hermes-custom --flag".into();
+
+        assert_eq!(
+            agent_command(Agent::Hermes, &config),
+            "hermes-custom --flag"
+        );
     }
 }

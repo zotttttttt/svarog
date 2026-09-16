@@ -9,6 +9,7 @@ pub enum Agent {
     Codex,
     Claude,
     Pi,
+    Hermes,
     Droid,
     #[value(alias = "factory_droid")]
     #[serde(alias = "factory-droid")]
@@ -27,6 +28,7 @@ impl Agent {
             Agent::Codex => "codex",
             Agent::Claude => "claude",
             Agent::Pi => "pi",
+            Agent::Hermes => "hermes",
             Agent::Droid => "droid",
             Agent::FactoryDroid => "factory_droid",
             Agent::OpenClaw => "openclaw",
@@ -43,6 +45,7 @@ impl std::str::FromStr for Agent {
             "codex" => Ok(Agent::Codex),
             "claude" => Ok(Agent::Claude),
             "pi" => Ok(Agent::Pi),
+            "hermes" => Ok(Agent::Hermes),
             "droid" => Ok(Agent::Droid),
             "factory-droid" | "factory_droid" => Ok(Agent::FactoryDroid),
             "openclaw" | "open-claw" => Ok(Agent::OpenClaw),
