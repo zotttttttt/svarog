@@ -202,6 +202,7 @@ fn router(
         .route("/events", post(handle_event))
         .route("/hooks/codex", post(handle_codex_hook))
         .route("/hooks/claude", post(handle_claude_hook))
+        .route("/hooks/pi", post(handle_pi_hook))
         .layer(DefaultBodyLimit::max(64 * 1024))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -253,6 +254,13 @@ async fn handle_claude_hook(
     Json(payload): Json<LifecycleHookEvent>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     handle_lifecycle_hook(state, Agent::Claude, payload).await
+}
+
+async fn handle_pi_hook(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<LifecycleHookEvent>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    handle_lifecycle_hook(state, Agent::Pi, payload).await
 }
 
 async fn handle_lifecycle_hook(
@@ -539,6 +547,7 @@ mod tests {
             paths: Paths::from_root(root.join("svarog")),
             codex_home: root.join("codex"),
             claude_config_dir: root.join("claude"),
+            pi_config_dir: root.join("pi"),
             daemon_addr: "127.0.0.1:18787".parse().unwrap(),
             dry_run: false,
         }
@@ -1021,6 +1030,22 @@ mod tests {
         let prompt = codex_hook("UserPromptSubmit", Some("turn-1"));
         process_codex_hook(&env, prompt.clone()).unwrap();
         process_codex_hook(&env, prompt).unwrap();
+
+        let store = Store::open(&env.paths.database_file).unwrap();
+        assert_eq!(store.event_count().unwrap(), 1);
+        assert!(store.latest_open_recommendation().unwrap().is_some());
+    }
+
+    #[test]
+    fn duplicate_pi_prompt_is_one_opportunity() {
+        let env = test_env();
+        let mut config = Config::default();
+        config.recommender.backend = RecommenderBackend::Local;
+        crate::config::save(&env.paths, &config).unwrap();
+
+        let prompt = codex_hook("UserPromptSubmit", Some("pi-turn-1"));
+        process_lifecycle_hook(&env, Agent::Pi, prompt.clone()).unwrap();
+        process_lifecycle_hook(&env, Agent::Pi, prompt).unwrap();
 
         let store = Store::open(&env.paths.database_file).unwrap();
         assert_eq!(store.event_count().unwrap(), 1);

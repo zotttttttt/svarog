@@ -134,6 +134,7 @@ pub async fn run() -> Result<()> {
                 let path = match agent {
                     Agent::Codex => hooks::install_global_codex(&env)?,
                     Agent::Claude => hooks::install_global_claude(&env)?,
+                    Agent::Pi => hooks::install_global_pi(&env)?,
                     _ => hooks::install(&env, agent)?,
                 };
                 println!("Installed {} hook: {}", agent, path.display());
@@ -438,6 +439,7 @@ fn demo_root(env: &RuntimeEnv) -> Result<PathBuf> {
     if root.file_name().and_then(|name| name.to_str()) != Some(".svarog-dev")
         || env.codex_home.parent() != Some(root)
         || env.claude_config_dir.parent() != Some(root)
+        || env.pi_config_dir.parent() != Some(root)
     {
         bail!(
             "refusing to use an invalid demo sandbox: {}",
@@ -545,8 +547,13 @@ fn setup_dry_run(env: &RuntimeEnv) -> Result<()> {
         text(env.claude_config_dir.join("settings.json").display())
     );
     println!(
+        "{} {}",
+        muted("Would install Pi extension when selected:"),
+        text(env.pi_config_dir.join("extensions/svarog.ts").display())
+    );
+    println!(
         "{}",
-        muted("Would require an agent choice: All / Codex / Claude Code")
+        muted("Would require agent choices: all / codex / claude / pi")
     );
     println!(
         "{} {}",
@@ -764,7 +771,7 @@ fn print_setup_summary(config: &Config) {
     println!("{}", muted("Recommendation engine:"));
     println!("{}", text(config.recommender.backend.label()));
     println!();
-    println!("{}", muted("Coding agent:"));
+    println!("{}", muted("Coding agents:"));
     println!(
         "{}",
         text(
@@ -772,13 +779,15 @@ fn print_setup_summary(config: &Config) {
                 .agents
                 .coding_agent
                 .map(CodingAgentSelection::label)
-                .unwrap_or("not configured")
+                .unwrap_or_else(|| "not configured".to_string())
         )
     );
     println!();
     println!(
         "{}",
-        muted("Your coding agent may ask once to trust the Svarog hook. Use /hooks if prompted.")
+        muted(
+            "Codex or Claude Code may ask once to trust the Svarog hook. Use /hooks if prompted."
+        )
     );
     println!();
     println!("{}", ember("Happy forging."));
@@ -863,6 +872,7 @@ fn status(env: &RuntimeEnv) -> Result<()> {
     println!("Collector: {} (runs with `svarog run`)", env.daemon_addr);
     println!("Codex: {}", env.codex_home.display());
     println!("Claude Code: {}", env.claude_config_dir.display());
+    println!("Pi: {}", env.pi_config_dir.display());
     let config_exists = paths.config_file.exists();
     let db_exists = paths.database_file.exists();
     println!(
@@ -885,10 +895,10 @@ fn status(env: &RuntimeEnv) -> Result<()> {
         let config = config::load_or_default(paths)?;
         let selection = config.agents.coding_agent;
         println!(
-            "Coding agent: {}",
+            "Coding agents: {}",
             selection
                 .map(CodingAgentSelection::label)
-                .unwrap_or("not configured")
+                .unwrap_or_else(|| "not configured".to_string())
         );
         if let Some(selection) = selection {
             let integration = hooks::integration_status(env, selection)?;
@@ -1139,13 +1149,16 @@ fn prompt_string(label: &str, default: &str) -> Result<String> {
 }
 
 fn prompt_coding_agent() -> Result<CodingAgentSelection> {
-    print!("{}: ", text("Coding agent (All / Codex / Claude Code)"));
+    print!(
+        "{}: ",
+        text("Coding agents (all / codex / claude / pi; comma-separated)")
+    );
     io::stdout().flush()?;
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
     let value = input.trim();
     if value.is_empty() {
-        bail!("coding agent selection is required; choose All, Codex, or Claude Code");
+        bail!("coding agent selection is required; choose all or list codex, claude, and pi");
     }
     value.parse().map_err(anyhow::Error::msg)
 }
@@ -1419,6 +1432,7 @@ mod tests {
             paths: Paths::from_root(root.join("svarog")),
             codex_home: root.join("codex"),
             claude_config_dir: root.join("claude"),
+            pi_config_dir: root.join("pi"),
             daemon_addr: "127.0.0.1:18787".parse().unwrap(),
             dry_run: true,
         };
@@ -1530,6 +1544,7 @@ mod tests {
             paths: Paths::from_root(root.path().join("svarog")),
             codex_home: root.path().join("codex"),
             claude_config_dir: root.path().join("claude"),
+            pi_config_dir: root.path().join("pi"),
             daemon_addr: "127.0.0.1:8787".parse().unwrap(),
             dry_run: false,
         };
@@ -1557,6 +1572,7 @@ mod tests {
             paths: Paths::from_root(root.path().join("svarog")),
             codex_home: root.path().join("codex"),
             claude_config_dir: root.path().join("claude"),
+            pi_config_dir: root.path().join("pi"),
             daemon_addr: "127.0.0.1:8787".parse().unwrap(),
             dry_run: false,
         };
@@ -1623,6 +1639,7 @@ mod tests {
             paths: Paths::from_root(root.path().join("svarog")),
             codex_home: root.path().join("codex"),
             claude_config_dir: root.path().join("claude"),
+            pi_config_dir: root.path().join("pi"),
             daemon_addr: "127.0.0.1:8787".parse().unwrap(),
             dry_run: false,
         };
@@ -1684,6 +1701,7 @@ mod tests {
             paths: Paths::from_root(root.path().join("svarog")),
             codex_home: root.path().join("codex"),
             claude_config_dir: root.path().join("claude"),
+            pi_config_dir: root.path().join("pi"),
             daemon_addr: "127.0.0.1:8787".parse().unwrap(),
             dry_run: false,
         };

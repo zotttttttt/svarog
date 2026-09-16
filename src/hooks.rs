@@ -19,7 +19,10 @@ struct PreparedSettings {
     target: PathBuf,
     original: Option<Vec<u8>>,
     updated: Option<Vec<u8>>,
+    remove: bool,
 }
+
+const PI_EXTENSION_MARKER: &str = "// Managed by Svarog. Do not edit.";
 
 pub fn print(agent: Agent) {
     match agent {
@@ -30,6 +33,10 @@ pub fn print(agent: Agent) {
         Agent::Claude => {
             println!("# Claude Code lifecycle hooks read JSON on stdin");
             println!("svarog lifecycle-hook claude");
+        }
+        Agent::Pi => {
+            println!("# Pi lifecycle events are sent by the managed Svarog extension");
+            println!("svarog lifecycle-hook pi");
         }
         Agent::Droid => {
             println!("# Factory Droid / Droid lifecycle hook command");
@@ -81,6 +88,10 @@ pub fn install_global_claude(env: &RuntimeEnv) -> Result<PathBuf> {
     install_global(env, Agent::Claude)
 }
 
+pub fn install_global_pi(env: &RuntimeEnv) -> Result<PathBuf> {
+    install_global(env, Agent::Pi)
+}
+
 #[cfg(test)]
 fn install_codex_hook_config(codex_home: &Path, script: &Path) -> Result<PathBuf> {
     let path = codex_home.join("hooks.json");
@@ -94,6 +105,17 @@ fn install_codex_hook_config(codex_home: &Path, script: &Path) -> Result<PathBuf
 fn install_global(env: &RuntimeEnv, agent: Agent) -> Result<PathBuf> {
     let script = install(env, agent)?;
     let path = settings_path(env, agent)?;
+    if agent == Agent::Pi {
+        let (contents, _) = updated_pi_extension(&path, true, &script)?;
+        if let Some(contents) = contents {
+            let parent = path
+                .parent()
+                .with_context(|| format!("{} has no parent directory", path.display()))?;
+            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+            atomic_write_user_only(&path, &contents)?;
+        }
+        return Ok(path);
+    }
     if let Some(contents) = updated_settings(&path, agent, true, &script)? {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
@@ -106,6 +128,7 @@ fn install_global(env: &RuntimeEnv, agent: Agent) -> Result<PathBuf> {
 pub fn reconcile(env: &RuntimeEnv, selection: CodingAgentSelection) -> Result<()> {
     let codex_script = install(env, Agent::Codex)?;
     let claude_script = install(env, Agent::Claude)?;
+    let pi_script = install(env, Agent::Pi)?;
     let specs = [
         (Agent::Codex, selection.includes(Agent::Codex), codex_script),
         (
@@ -113,18 +136,24 @@ pub fn reconcile(env: &RuntimeEnv, selection: CodingAgentSelection) -> Result<()
             selection.includes(Agent::Claude),
             claude_script,
         ),
+        (Agent::Pi, selection.includes(Agent::Pi), pi_script),
     ];
     let mut prepared = Vec::new();
     for (agent, enabled, script) in specs {
         let path = settings_path(env, agent)?;
         let original = read_optional(&path)?;
-        let updated = updated_settings(&path, agent, enabled, &script)?;
+        let (updated, remove) = if agent == Agent::Pi {
+            updated_pi_extension(&path, enabled, &script)?
+        } else {
+            (updated_settings(&path, agent, enabled, &script)?, false)
+        };
         let target = resolve_write_target(&path)?;
         prepared.push(PreparedSettings {
             path,
             target,
             original,
             updated,
+            remove,
         });
     }
 
@@ -145,27 +174,42 @@ fn apply_prepared(
 ) -> Result<()> {
     let mut written = Vec::new();
     for (index, item) in prepared.iter().enumerate() {
-        let Some(updated) = &item.updated else {
-            continue;
-        };
-        if let Err(error) = write(&item.target, updated) {
-            let mut rollback_errors = Vec::new();
-            for index in written.into_iter().rev() {
-                if let Err(rollback_error) = restore(&prepared[index]) {
-                    rollback_errors.push(rollback_error.to_string());
+        let result = if item.remove {
+            match fs::remove_file(&item.target) {
+                Ok(()) => Ok(true),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+                Err(error) => {
+                    Err(error).with_context(|| format!("removing {}", item.path.display()))
                 }
             }
-            if rollback_errors.is_empty() {
-                return Err(
-                    error.context("reconciling coding-agent hooks; previous settings restored")
+        } else if let Some(updated) = &item.updated {
+            write(&item.target, updated).map(|_| true)
+        } else {
+            Ok(false)
+        };
+        let changed = match result {
+            Ok(changed) => changed,
+            Err(error) => {
+                let mut rollback_errors = Vec::new();
+                for index in written.into_iter().rev() {
+                    if let Err(rollback_error) = restore(&prepared[index]) {
+                        rollback_errors.push(rollback_error.to_string());
+                    }
+                }
+                if rollback_errors.is_empty() {
+                    return Err(
+                        error.context("reconciling coding-agent hooks; previous settings restored")
+                    );
+                }
+                bail!(
+                    "reconciling coding-agent hooks failed: {error}; rollback also failed: {}",
+                    rollback_errors.join("; ")
                 );
             }
-            bail!(
-                "reconciling coding-agent hooks failed: {error}; rollback also failed: {}",
-                rollback_errors.join("; ")
-            );
+        };
+        if changed {
+            written.push(index);
         }
-        written.push(index);
     }
     Ok(())
 }
@@ -182,7 +226,7 @@ fn restore_prepared(item: &PreparedSettings) -> Result<()> {
 }
 
 pub fn is_configured(env: &RuntimeEnv, selection: CodingAgentSelection) -> Result<bool> {
-    for agent in [Agent::Codex, Agent::Claude] {
+    for agent in [Agent::Codex, Agent::Claude, Agent::Pi] {
         let path = settings_path(env, agent)?;
         if selection.includes(agent) {
             let script = env
@@ -207,6 +251,16 @@ pub fn is_configured(env: &RuntimeEnv, selection: CodingAgentSelection) -> Resul
 }
 
 fn settings_are_current(path: &Path, agent: Agent, enabled: bool, script: &Path) -> Result<bool> {
+    if agent == Agent::Pi {
+        let (updated, remove) = updated_pi_extension(path, enabled, script)?;
+        if remove {
+            return Ok(false);
+        }
+        return match updated {
+            None => Ok(true),
+            Some(updated) => Ok(read_optional(path)?.as_deref() == Some(updated.as_slice())),
+        };
+    }
     let Some(updated) = updated_settings(path, agent, enabled, script)? else {
         return Ok(true);
     };
@@ -240,7 +294,43 @@ fn settings_path(env: &RuntimeEnv, agent: Agent) -> Result<PathBuf> {
     match agent {
         Agent::Codex => Ok(env.codex_home.join("hooks.json")),
         Agent::Claude => Ok(env.claude_config_dir.join("settings.json")),
+        Agent::Pi => Ok(env.pi_config_dir.join("extensions").join("svarog.ts")),
         _ => bail!("{agent} does not have a managed lifecycle integration"),
+    }
+}
+
+fn updated_pi_extension(
+    path: &Path,
+    enabled: bool,
+    script: &Path,
+) -> Result<(Option<Vec<u8>>, bool)> {
+    if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        bail!(
+            "{} is a symlink; remove it before installing the Svarog Pi extension",
+            path.display()
+        );
+    }
+    let original = read_optional(path)?;
+    let managed = original
+        .as_deref()
+        .is_some_and(|contents| String::from_utf8_lossy(contents).starts_with(PI_EXTENSION_MARKER));
+    if enabled {
+        if original.is_some() && !managed {
+            bail!(
+                "{} already exists and is not managed by Svarog",
+                path.display()
+            );
+        }
+        let updated = pi_extension(script).into_bytes();
+        if original.as_deref() == Some(updated.as_slice()) {
+            Ok((None, false))
+        } else {
+            Ok((Some(updated), false))
+        }
+    } else if managed {
+        Ok((None, true))
+    } else {
+        Ok((None, false))
     }
 }
 
@@ -324,6 +414,7 @@ fn agent_name(agent: Agent) -> &'static str {
     match agent {
         Agent::Codex => "Codex",
         Agent::Claude => "Claude Code",
+        Agent::Pi => "Pi",
         _ => "coding agent",
     }
 }
@@ -579,8 +670,7 @@ fn is_svarog_hook(value: &Value, agent: Agent) -> bool {
 
 fn hook_script(agent: Agent, env_pairs: &[(&'static str, String)], executable: &Path) -> String {
     let event = match agent {
-        Agent::Claude => "tool_start",
-        Agent::Codex => "tool_start",
+        Agent::Claude | Agent::Codex | Agent::Pi => "tool_start",
         Agent::Droid | Agent::FactoryDroid | Agent::OpenClaw => "task_start",
         Agent::Custom => "busy",
     };
@@ -589,7 +679,7 @@ fn hook_script(agent: Agent, env_pairs: &[(&'static str, String)], executable: &
         .map(|(key, value)| format!("export {key}={}", shell_quote(value)))
         .collect::<Vec<_>>()
         .join("\n");
-    if matches!(agent, Agent::Codex | Agent::Claude) {
+    if matches!(agent, Agent::Codex | Agent::Claude | Agent::Pi) {
         return format!(
             r#"#!/usr/bin/env sh
 set -eu
@@ -621,8 +711,96 @@ exit 0
     )
 }
 
+fn pi_extension(script: &Path) -> String {
+    let script = serde_json::to_string(&script.display().to_string()).unwrap();
+    format!(
+        r#"{marker}
+import {{ spawn }} from "node:child_process";
+import {{ randomUUID }} from "node:crypto";
+import type {{ ExtensionAPI, ExtensionContext }} from "@earendil-works/pi-coding-agent";
+
+const hook = {script};
+
+export default function (pi: ExtensionAPI) {{
+  const pendingTurns = new Set<string>();
+  let delivery: Promise<void> = Promise.resolve();
+
+  const payload = (
+    ctx: ExtensionContext,
+    hookEventName: string,
+    turnId?: string,
+    reason?: string,
+  ) => ({{
+    session_id: ctx.sessionManager.getSessionId(),
+    turn_id: turnId,
+    cwd: ctx.cwd,
+    hook_event_name: hookEventName,
+    source: "pi",
+    reason,
+  }});
+
+  const deliver = (value: object): Promise<void> => {{
+    delivery = delivery
+      .then(
+        () =>
+          new Promise<void>((resolve) => {{
+            let finished = false;
+            const child = spawn(hook, [], {{ stdio: ["pipe", "ignore", "ignore"] }});
+            const done = () => {{
+              if (!finished) {{
+                finished = true;
+                resolve();
+              }}
+            }};
+            child.once("error", done);
+            child.once("close", done);
+            child.stdin.on("error", done);
+            child.stdin.end(JSON.stringify(value));
+            const timer = setTimeout(() => {{
+              child.kill();
+              done();
+            }}, 1000);
+            timer.unref();
+          }}),
+      )
+      .catch(() => undefined);
+    return delivery;
+  }};
+
+  const stopPending = async (ctx: ExtensionContext, reason?: string) => {{
+    for (const turnId of pendingTurns) {{
+      await deliver(payload(ctx, "Stop", turnId, reason));
+    }}
+    pendingTurns.clear();
+  }};
+
+  pi.on("session_start", async (event, ctx) => {{
+    await deliver(payload(ctx, "SessionStart", undefined, event.reason));
+  }});
+
+  pi.on("before_agent_start", async (_event, ctx) => {{
+    const turnId = randomUUID();
+    pendingTurns.add(turnId);
+    await deliver(payload(ctx, "UserPromptSubmit", turnId));
+  }});
+
+  pi.on("agent_settled", async (_event, ctx) => {{
+    await stopPending(ctx, "settled");
+  }});
+
+  pi.on("session_shutdown", async (event, ctx) => {{
+    await stopPending(ctx, event.reason);
+    await deliver(payload(ctx, "SessionEnd", undefined, event.reason));
+  }});
+}}
+"#,
+        marker = PI_EXTENSION_MARKER,
+        script = script,
+    )
+}
+
 pub async fn ingest_lifecycle(env: &RuntimeEnv, agent: Agent) -> Result<()> {
-    if !matches!(agent, Agent::Codex | Agent::Claude) {
+    if !matches!(agent, Agent::Codex | Agent::Claude | Agent::Pi) {
         bail!("{agent} does not provide supported lifecycle hook input");
     }
     if std::env::var_os("SVAROG_RECOMMENDER").is_some() {
@@ -669,6 +847,7 @@ mod tests {
             paths: Paths::from_root(root.join("svarog")),
             codex_home: root.join("codex"),
             claude_config_dir: root.join("claude"),
+            pi_config_dir: root.join("pi"),
             daemon_addr: "127.0.0.1:18787".parse().unwrap(),
             dry_run: false,
         }
@@ -880,7 +1059,7 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_installs_both_agents_and_removes_only_deselected_hooks() {
+    fn reconcile_installs_all_agents_and_removes_only_deselected_hooks() {
         let root = tempdir().unwrap();
         let env = test_env(root.path());
         fs::create_dir_all(&env.codex_home).unwrap();
@@ -911,6 +1090,23 @@ mod tests {
             "startup|resume|clear|compact|fork"
         );
         assert_eq!(claude["hooks"]["SessionEnd"][0]["hooks"][0]["timeout"], 3);
+        let pi_path = env.pi_config_dir.join("extensions/svarog.ts");
+        let pi = fs::read_to_string(&pi_path).unwrap();
+        assert!(pi.starts_with(PI_EXTENSION_MARKER));
+        for event in [
+            "session_start",
+            "before_agent_start",
+            "agent_settled",
+            "session_shutdown",
+        ] {
+            assert!(pi.contains(event));
+        }
+        assert!(!pi.contains("_event.prompt"));
+        assert!(!pi.contains("_event.images"));
+        assert_eq!(
+            fs::metadata(&pi_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         assert!(is_configured(&env, CodingAgentSelection::All).unwrap());
 
         reconcile(&env, CodingAgentSelection::Claude).unwrap();
@@ -922,7 +1118,46 @@ mod tests {
             codex["hooks"]["Stop"][0]["hooks"][0]["command"],
             "echo keep"
         );
+        assert!(!pi_path.exists());
         assert!(is_configured(&env, CodingAgentSelection::Claude).unwrap());
+    }
+
+    #[test]
+    fn pi_install_preserves_unowned_extensions_and_rejects_name_collisions() {
+        let root = tempdir().unwrap();
+        let env = test_env(root.path());
+        let extensions = env.pi_config_dir.join("extensions");
+        fs::create_dir_all(&extensions).unwrap();
+        fs::write(extensions.join("mine.ts"), "export default () => {};").unwrap();
+        fs::write(extensions.join("svarog.ts"), "user-owned").unwrap();
+
+        let error = reconcile(&env, CodingAgentSelection::Pi).unwrap_err();
+
+        assert!(error.to_string().contains("not managed by Svarog"));
+        assert_eq!(
+            fs::read_to_string(extensions.join("svarog.ts")).unwrap(),
+            "user-owned"
+        );
+        assert_eq!(
+            fs::read_to_string(extensions.join("mine.ts")).unwrap(),
+            "export default () => {};"
+        );
+    }
+
+    #[test]
+    fn pi_install_rejects_a_symlinked_extension() {
+        let root = tempdir().unwrap();
+        let env = test_env(root.path());
+        let extensions = env.pi_config_dir.join("extensions");
+        fs::create_dir_all(&extensions).unwrap();
+        let target = root.path().join("target.ts");
+        fs::write(&target, "user-owned").unwrap();
+        std::os::unix::fs::symlink(&target, extensions.join("svarog.ts")).unwrap();
+
+        let error = install_global_pi(&env).unwrap_err();
+
+        assert!(error.to_string().contains("is a symlink"));
+        assert_eq!(fs::read_to_string(target).unwrap(), "user-owned");
     }
 
     #[test]
@@ -1043,12 +1278,14 @@ mod tests {
                 target: first.clone(),
                 original: Some(b"before".to_vec()),
                 updated: Some(b"after".to_vec()),
+                remove: false,
             },
             PreparedSettings {
                 path: second.clone(),
                 target: second.clone(),
                 original: Some(b"before".to_vec()),
                 updated: Some(b"after".to_vec()),
+                remove: false,
             },
         ];
         let mut writes = 0;
@@ -1078,6 +1315,7 @@ mod tests {
             target: PathBuf::from("first.json"),
             original: Some(b"before".to_vec()),
             updated: Some(b"after".to_vec()),
+            remove: false,
         };
         let prepared = [
             item,
@@ -1086,6 +1324,7 @@ mod tests {
                 target: PathBuf::from("second.json"),
                 original: None,
                 updated: Some(b"after".to_vec()),
+                remove: false,
             },
         ];
         let mut writes = 0;

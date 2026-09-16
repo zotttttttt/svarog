@@ -2183,14 +2183,13 @@ fn settings_lines_with_notification_reason(
             forge_frequency_label(settings.draft.preferences.forge_frequency),
         ),
         (
-            "Coding agent",
+            "Coding agents",
             settings
                 .draft
                 .agents
                 .coding_agent
                 .map(CodingAgentSelection::label)
-                .unwrap_or("not configured")
-                .to_string(),
+                .unwrap_or_else(|| "not configured".to_string()),
         ),
     ];
     let mut lines = vec![
@@ -2367,6 +2366,12 @@ fn begin_setting_edit(settings: &mut SettingsState) {
         13 => settings.draft.profile.injuries.join(", "),
         14 => settings.draft.profile.exercise_preferences.clone(),
         15 => String::new(),
+        18 => settings
+            .draft
+            .agents
+            .coding_agent
+            .map(CodingAgentSelection::label)
+            .unwrap_or_default(),
         _ => return,
     });
     settings.editing = true;
@@ -2722,6 +2727,13 @@ fn commit_setting_edit(settings: &mut SettingsState) -> Result<()> {
             } else {
                 value.into()
             }
+        }
+        18 => {
+            settings.draft.agents.coding_agent = Some(
+                value
+                    .parse::<CodingAgentSelection>()
+                    .map_err(anyhow::Error::msg)?,
+            )
         }
         _ => {}
     }
@@ -5073,6 +5085,7 @@ mod tests {
             paths: Paths::from_root(root.clone()),
             codex_home: root.join("codex"),
             claude_config_dir: root.join("claude"),
+            pi_config_dir: root.join("pi"),
             daemon_addr: "127.0.0.1:0".parse().unwrap(),
             dry_run: true,
         }

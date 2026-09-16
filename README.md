@@ -22,8 +22,8 @@
   <a href="https://github.com/zotttttttt/svarog/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-888888?style=flat-square&amp;labelColor=070808" alt="MIT license"></a>
 </p>
 
-Svarog is a local terminal dashboard that notices when Codex or Claude Code
-starts working and turns that wait into a tiny workout.
+Svarog is a local terminal dashboard that notices when Codex, Claude Code, or
+[Pi](https://pi.dev/) starts working and turns that wait into a tiny workout.
 
 Svarog adapts each forge to what you complete. It balances sides and recovery,
 adjusts reps to your performance, and backs off after fatigue, skips, or pain.
@@ -53,19 +53,20 @@ The installer selects the binary for your computer, verifies its embedded
 SHA-256 checksum, and installs it to `~/.local/bin`. If that directory is not on
 your `PATH`, it prints the exact line to add for future runs.
 
-On first run, choose **All**, **Codex**, or **Claude Code**, then accept the
-conservative defaults. Setup connects Svarog to the selected lifecycle hooks
-and opens the dashboard. Keep it open while you work in a selected coding-agent
-terminal. Each CLI may ask once to trust its hook; Claude Code hooks run after
+On first run, choose `all` or a comma-separated combination of `codex`,
+`claude`, and `pi`, then accept the conservative defaults. Setup connects
+Svarog to the selected lifecycle hooks and opens the dashboard. Keep it open
+while you work in a selected coding-agent terminal. Claude Code hooks run after
 you trust the workspace in an interactive session. `claude -p` does not show
 that workspace-trust prompt, so its configured hooks can run without that
-interactive confirmation.
+interactive confirmation. Pi loads Svarog automatically as a global extension.
 
 Prefer to open both tools together? With `tmux` installed, run:
 
 ```bash
 svarog session codex
 svarog session claude
+svarog session pi
 ```
 
 For provenance verification, Cargo, manual downloads, upgrades, and source

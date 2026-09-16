@@ -13,6 +13,7 @@ fn run_hook(args: &[&str], extra_env: Option<(&str, &str)>, input: &str) -> Outp
         .env("SVAROG_HOME", root.path().join("svarog"))
         .env("CODEX_HOME", root.path().join("codex"))
         .env("CLAUDE_CONFIG_DIR", root.path().join("claude"))
+        .env("PI_CODING_AGENT_DIR", root.path().join("pi"))
         .env("SVAROG_DAEMON_ADDR", "127.0.0.1:9")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -53,6 +54,23 @@ fn codex_hook_exits_cleanly_when_collector_is_unavailable() {
     let output = run_codex_hook(
         None,
         r#"{"session_id":"session-1","turn_id":"turn-1","cwd":"/work/svarog","hook_event_name":"UserPromptSubmit"}"#,
+    );
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "{}");
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("panicked"));
+}
+
+#[test]
+fn pi_hook_exits_cleanly_when_collector_is_unavailable() {
+    let output = run_hook(
+        &["lifecycle-hook", "pi"],
+        None,
+        r#"{"session_id":"session-1","turn_id":"turn-1","cwd":"/work/svarog","hook_event_name":"UserPromptSubmit","source":"pi"}"#,
     );
 
     assert!(
