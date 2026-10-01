@@ -1,6 +1,8 @@
 /target/
 /.factory/
 /.svarog-dev/
+/.svarog-runs/
+__pycache__/
 .env
 .env.*
 !.env.example
