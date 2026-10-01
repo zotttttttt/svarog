@@ -13,7 +13,7 @@ include = [
     "Cargo.toml",
     "Cargo.lock",
     "LICENSE",
-    "README.md",
+    "/README.md",
     "THIRD_PARTY_NOTICES.html",
     "about.hbs",
     "about.toml",
@@ -23,6 +23,9 @@ include = [
     "scripts/**",
     "src/**",
     "tests/**",
+    "!**/__pycache__/**",
+    "!**/*.pyc",
+    "!**/*.pyo",
 ]
 
 [[bin]]
