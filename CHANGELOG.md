@@ -2,6 +2,13 @@
 
 Notable changes to Svarog are recorded here by the automated release process.
 
+## [0.10.1](https://github.com/zotttttttt/svarog/compare/v0.10.0...v0.10.1) (2026-10-01)
+
+
+### Fixes
+
+* manage validation retention and preview storage cleanup ([#61](https://github.com/zotttttttt/svarog/issues/61)) ([05245f0](https://github.com/zotttttttt/svarog/commit/05245f09669924e221915dc1c621fe8c877104df))
+
 ## [0.10.0](https://github.com/zotttttttt/svarog/compare/v0.9.0...v0.10.0) (2026-09-16)
 
 
