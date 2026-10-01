@@ -21,6 +21,48 @@ production data, credentials, hooks, or daemon port.
 
 `tmux` is optional and only needed to test `svarog session`.
 
+## Storage-aware development commands
+
+The Python 3 standard-library command `scripts/dev-storage` can report and
+manage validation-run storage:
+
+```bash
+scripts/dev-storage report
+scripts/dev-storage run -- cargo test --locked
+scripts/dev-storage run --keep -- cargo clippy --all-targets --locked -- -D warnings
+scripts/dev-storage cleanup
+scripts/dev-storage cleanup --apply
+scripts/dev-storage cleanup --build-artifacts --apply
+```
+
+`report` is read-only. `run` executes the command from the repository and uses
+the shared Cargo target directory, so it does not copy build caches. It captures
+combined output in a private `.svarog-runs/run-*/output.log` and records the
+status, command, and elapsed time in `result.json`. The command receives
+`SVAROG_RUN_DIR`, pointing to a scratch work directory for that run.
+
+Successful runs are removed by default. Failed runs retain their scratch work,
+output, and result for seven days so traces, screenshots, and test-generated
+diagnostics remain available. Each `run` invocation prunes expired managed runs,
+including abandoned unlocked runs after seven days. Interrupted runs retain
+diagnostics. `--keep` preserves the entire run indefinitely, including after
+success. Cleanup previews expired managed runs by default; `cleanup --apply`
+prunes them manually when validation is idle. There is no background daemon.
+Build artifacts are only cleaned by explicitly running
+`cleanup --build-artifacts --apply`, which also opts into removing Cargo
+package, `flycheck0`, and cross-target release directories older than seven
+days. Native `target/debug` and `target/release` warm caches are preserved.
+
+Captured diagnostics can contain command output and arguments; do not pass
+secrets directly in command arguments or print them to output.
+
+The runner rejects symlink paths and uses locks to skip active managed runs and
+Cargo builds. Its cleanup is limited to managed run data and the opted-in build
+artifacts; it preserves `.svarog-dev`, source files, and global caches, and does
+not manage arbitrary roots or global installs. Ordinary direct Cargo commands
+remain supported; the runner is useful when you want captured logs and run
+results.
+
 ## Update a development install
 
 The project launcher detects source changes and offers to rebuild before it
@@ -44,6 +86,7 @@ Run the same checks as CI:
 cargo fmt --all -- --check
 cargo clippy --all-targets --locked -- -D warnings
 cargo test --locked
+python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
 Keep changes focused, add tests for behavior changes, and update the README

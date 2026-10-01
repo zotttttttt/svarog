@@ -1,0 +1,282 @@
+#!/usr/bin/env python3
+"""Local, conservative storage maintenance. Requires Python 3 on macOS/Linux."""
+
+import argparse
+import contextlib
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+REPO = Path(__file__).resolve().parent.parent
+WEEK = 7 * 24 * 60 * 60
+
+
+def checked(path, recursive=False):
+    """Reject symlinks, including ancestors, before reads or removals."""
+    path = Path(path)
+    relative = path.relative_to(REPO)
+    if ".." in relative.parts:
+        raise ValueError(f"path escape rejected: {path}")
+    for part in (REPO, *reversed(path.parents), path):
+        if part == REPO or REPO in part.parents:
+            if part.is_symlink():
+                raise ValueError(f"symlink rejected: {part}")
+    if recursive and path.exists():
+        for directory, dirs, files in os.walk(path, followlinks=False):
+            for name in dirs + files:
+                item = Path(directory) / name
+                mode = item.lstat().st_mode
+                if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
+                    raise ValueError(f"non-file artifact rejected: {item}")
+    return path
+
+
+def usage(path):
+    """Allocated bytes, newest modification, and file count; never follow links."""
+    checked(path, recursive=True)
+    total, newest, count = 0, 0, 0
+    seen = set()
+    if not path.exists():
+        return total, newest, count
+    for directory, dirs, files in os.walk(path):
+        for item in [Path(directory)] + [Path(directory) / name for name in files]:
+            info = item.stat(follow_symlinks=False)
+            identity = (info.st_dev, info.st_ino)
+            if identity not in seen:
+                total += info.st_blocks * 512
+                seen.add(identity)
+            newest = max(newest, info.st_mtime)
+            count += item.is_file()
+    return total, newest, count
+
+
+@contextlib.contextmanager
+def locked(path, create=False):
+    checked(path)
+    flags = os.O_RDWR | os.O_NOFOLLOW
+    if create:
+        flags |= os.O_CREAT
+    fd = os.open(path, flags, 0o600)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError(f"invalid lock: {path}")
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def write_result(run, result):
+    checked(run / "result.json")
+    temp = run / "result.tmp"
+    checked(temp)
+    with temp.open("x") as output:
+        json.dump(result, output, indent=2)
+        output.write("\n")
+    temp.replace(run / "result.json")
+
+
+def run_command(args):
+    command = args.command
+    if command[:1] == ["--"]:
+        command = command[1:]
+    if not command:
+        raise ValueError("run requires a command after --")
+    # Bound retention on every new validation invocation; no daemon is needed.
+    cleanup(argparse.Namespace(apply=True, build_artifacts=False))
+    root = checked(REPO / ".svarog-runs")
+    root.mkdir(mode=0o700, exist_ok=True)
+    # Serialize creation with cleanup; hold the per-run lock through finalization.
+    with locked(root / ".lock", create=True):
+        run = Path(tempfile.mkdtemp(prefix="run-", dir=root))
+        guard = locked(run / ".lock", create=True)
+        fd = guard.__enter__()
+        result = {"schema": 1, "status": "running", "keep": args.keep,
+                  "command": command, "started": time.time()}
+        write_result(run, result)
+    try:
+        work = run / "work"
+        work.mkdir(mode=0o700)
+        env = os.environ.copy()
+        # Reuse only the checkout build cache; never copy CARGO_HOME or credentials.
+        env["CARGO_TARGET_DIR"] = str(checked(REPO / "target"))
+        env["SVAROG_RUN_DIR"] = str(work)
+        started = time.monotonic()
+        print(f"Run diagnostics: {run}", flush=True)
+        with (run / "output.log").open("x") as output:
+            child = None
+
+            def interrupt(signum, _frame):
+                if child is not None and child.poll() is None:
+                    os.killpg(child.pid, signum)
+
+            previous = {sig: signal.signal(sig, interrupt)
+                        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+            try:
+                # Children retain the lock if the runner is killed abruptly.
+                child = subprocess.Popen(command, cwd=REPO, env=env, stdout=output,
+                                         stderr=subprocess.STDOUT, start_new_session=True,
+                                         pass_fds=(fd,))
+                code = child.wait()
+            except OSError as error:
+                output.write(f"Could not execute command: {error}\n")
+                code = 127
+            finally:
+                for sig, handler in previous.items():
+                    signal.signal(sig, handler)
+        result.update(status="success" if code == 0 else "failed", exit_code=code,
+                      finished=time.time(), elapsed_seconds=time.monotonic() - started)
+        write_result(run, result)
+        if not args.keep and code == 0:
+            checked(work, recursive=True)
+            shutil.rmtree(work)
+            checked(run, recursive=True)
+            shutil.rmtree(run)
+        print(f"Command exited {code} in {result['elapsed_seconds']:.2f}s; "
+              + ("temporary run removed" if code == 0 and not args.keep
+                 else f"diagnostics retained at {run}"))
+        return code if code >= 0 else 128 - code
+    finally:
+        guard.__exit__(None, None, None)
+
+
+def build_candidates():
+    target = checked(REPO / "target")
+    yield target / "package"
+    yield target / "flycheck0"
+    if target.exists():
+        for child in sorted(target.iterdir()):
+            if re.fullmatch(r"[a-z0-9_]+-(?:[a-z0-9_]+-)+[a-z0-9_]+", child.name):
+                checked(child)
+                if (child / "CACHEDIR.TAG").is_file():
+                    yield child / "release"
+
+
+def run_candidates():
+    root = checked(REPO / ".svarog-runs")
+    if root.exists():
+        for path in sorted(root.glob("run-*")):
+            checked(path, recursive=True)
+            if not path.is_dir():
+                continue
+            with (path / "result.json").open() as source:
+                result = json.load(source)
+            if result.get("schema") != 1 or result.get("status") not in (
+                    "running", "failed", "success") or type(result.get("keep")) is not bool:
+                raise ValueError(f"unrecognized run metadata: {path}")
+            yield path, result
+
+
+def report():
+    paths = [REPO / "target", REPO / ".svarog-runs", REPO / ".svarog-dev"]
+    target = checked(REPO / "target")
+    if target.exists():
+        paths[1:1] = sorted(p for p in target.iterdir() if p.is_dir() or p.is_symlink())
+    for path in paths:
+        size, newest, count = usage(path)
+        print(f"{path.relative_to(REPO)}: {size / 1024**2:.2f} MiB, {count} files")
+    for path, result in run_candidates():
+        print(f"{path.relative_to(REPO)}: {result['status']}, keep={result['keep']}")
+    print("External/global caches are outside cleanup scope; no caches are copied by run.")
+
+
+def cargo_locks(path):
+    # Cargo takes these profile locks, including for package verification builds.
+    target = REPO / "target"
+    profiles = [target / "debug", target / "release"]
+    if target.exists():
+        profiles.extend(p / "release" for p in target.iterdir()
+                        if re.fullmatch(r"[a-z0-9_]+-(?:[a-z0-9_]+-)+[a-z0-9_]+", p.name))
+    if path.name == "release":
+        profiles.append(path)
+    for profile in profiles:
+        checked(profile)
+        if profile.exists():
+            lock = checked(profile / ".cargo-lock")
+            if not lock.is_file():
+                raise ValueError(f"cannot establish Cargo inactivity: {profile}")
+            yield lock
+    if path.name == "package":
+        checked(path, recursive=True)
+        yield from path.rglob(".cargo-lock")
+
+
+def cleanup(args):
+    now = time.time()
+    candidates = []
+    for path, result in run_candidates():
+        if result["keep"]:
+            continue
+        stamp = result.get("finished", result.get("started"))
+        if not isinstance(stamp, (float, int)) or not 0 <= stamp <= now:
+            raise ValueError(f"invalid run timestamp: {path}")
+        # A killed runner may leave 'running' metadata, or surviving children
+        # may write diagnostics later. Retain those for seven days as well.
+        stamp = max(stamp, usage(path)[1])
+        if result["status"] == "success" or now - stamp >= WEEK:
+            candidates.append((path, "run"))
+    if args.build_artifacts:
+        candidates.extend((p, "build") for p in build_candidates() if p.exists())
+    # Refuse unsafe trees before making any deletions from this plan.
+    for path, _kind in candidates:
+        checked(path, recursive=True)
+    for path, kind in candidates:
+        try:
+            with contextlib.ExitStack() as stack:
+                if kind == "run":
+                    stack.enter_context(locked(path.parent / ".lock"))
+                    stack.enter_context(locked(path / ".lock"))
+                else:
+                    for lock in dict.fromkeys(cargo_locks(path)):
+                        stack.enter_context(locked(lock))
+                size, newest, count = usage(path)
+                if kind == "build" and now - newest < WEEK:
+                    print(f"SKIP recent: {path.relative_to(REPO)}")
+                    continue
+                print(f"{'DELETE' if args.apply else 'WOULD DELETE'} "
+                      f"{path.relative_to(REPO)} ({size / 1024**2:.2f} MiB)")
+                if args.apply:
+                    checked(path, recursive=True)
+                    shutil.rmtree(path)
+        except BlockingIOError:
+            print(f"SKIP active: {path.relative_to(REPO)}")
+    if not args.apply:
+        print("Preview only; use --apply to delete the listed artifacts.")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="action", required=True)
+    commands.add_parser("report", help="read-only allocated storage report")
+    run = commands.add_parser("run", help="run validation with managed diagnostics")
+    run.add_argument("--keep", action="store_true", help="keep the full run indefinitely")
+    run.add_argument("command", nargs=argparse.REMAINDER)
+    clean = commands.add_parser("cleanup", help="preview expired artifacts")
+    clean.add_argument("--apply", action="store_true")
+    clean.add_argument("--build-artifacts", action="store_true",
+                       help="include stale packages, flycheck, and cross-release builds")
+    args = parser.parse_args()
+    try:
+        if args.action == "run":
+            return run_command(args)
+        if args.action == "report":
+            report()
+        else:
+            cleanup(args)
+        return 0
+    except (OSError, ValueError, KeyError) as error:
+        print(f"Storage operation refused: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
