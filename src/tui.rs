@@ -1544,10 +1544,7 @@ fn handle_add_fuel_paste(ui: &mut TuiState, value: &str, area_width: u16, area_h
             return;
         }
         clipboard::PastedPaths::Unsupported(path) => {
-            state.feedback = Some(format!(
-                "{} is not a supported photo; use PNG, JPEG, HEIC, WebP, or GIF.",
-                path.file_name().unwrap_or_default().to_string_lossy()
-            ));
+            state.feedback = Some(unsupported_photo_message(&path));
             return;
         }
         clipboard::PastedPaths::NotPaths => {}
@@ -1587,6 +1584,13 @@ fn handle_settings_paste(ui: &mut TuiState, value: &str) {
     );
 }
 
+fn unsupported_photo_message(path: &Path) -> String {
+    format!(
+        "{} is not a supported photo; use PNG, JPEG, HEIC, WebP, or GIF.",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    )
+}
+
 fn attach_clipboard_image(state: &mut AddFuelState) {
     if state.images.len() >= fuel::MAX_FUEL_IMAGES {
         state.feedback = Some(format!(
@@ -1599,8 +1603,15 @@ fn attach_clipboard_image(state: &mut AddFuelState) {
         Ok(Some(clipboard::ClipboardImage::Temp(temp))) => {
             attach_fuel_image(state, temp.to_path_buf(), Some(temp));
         }
-        Ok(Some(clipboard::ClipboardImage::File(path))) => {
-            attach_fuel_image(state, path, None);
+        Ok(Some(clipboard::ClipboardImage::Files(paths))) => {
+            for path in paths {
+                if !attach_fuel_image(state, path, None) {
+                    break;
+                }
+            }
+        }
+        Ok(Some(clipboard::ClipboardImage::NotPhoto(path))) => {
+            state.feedback = Some(unsupported_photo_message(&path));
         }
         Ok(None) => state.feedback = Some("No image in the clipboard.".into()),
         Err(error) => state.feedback = Some(format!("Could not read the clipboard: {error:#}")),

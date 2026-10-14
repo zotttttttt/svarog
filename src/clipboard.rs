@@ -6,11 +6,13 @@ use std::process::{Command, Stdio};
 use tempfile::TempPath;
 
 /// An image taken from the clipboard: either raw image data saved to a
-/// temporary file, or a copied image file that already exists on disk.
+/// temporary file, or image files copied in a file manager.
 #[derive(Debug)]
 pub enum ClipboardImage {
     Temp(TempPath),
-    File(PathBuf),
+    Files(Vec<PathBuf>),
+    /// Copied files that include something other than a supported photo.
+    NotPhoto(PathBuf),
 }
 
 /// What a bracketed paste turned out to be.
@@ -30,7 +32,15 @@ write imageData to target
 close access target
 end run"#;
 
-const MACOS_FILE_SCRIPT: &str = r#"POSIX path of (the clipboard as «class furl»)"#;
+// Lists every file copied in Finder, one path per line.
+const MACOS_FILES_SCRIPT: &str = r#"ObjC.import('AppKit');
+function run() {
+  const options = $.NSDictionary.dictionaryWithObjectForKey(true, $.NSPasteboardURLReadingFileURLsOnlyKey);
+  const urls = $.NSPasteboard.generalPasteboard.readObjectsForClassesOptions($([$.NSURL]), options);
+  const paths = [];
+  for (let i = 0; i < urls.count; i++) paths.push(urls.objectAtIndex(i).path.js);
+  return paths.join('\n');
+}"#;
 
 pub fn read_image() -> Result<Option<ClipboardImage>> {
     if cfg!(target_os = "macos") {
@@ -41,6 +51,29 @@ pub fn read_image() -> Result<Option<ClipboardImage>> {
 }
 
 fn read_macos_image() -> Result<Option<ClipboardImage>> {
+    // Finder puts the copied file's icon on the clipboard as image data too, so
+    // copied files must be checked before image data.
+    let output = Command::new("osascript")
+        .args(["-l", "JavaScript", "-e", MACOS_FILES_SCRIPT])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .context("running osascript to read the clipboard")?;
+    if output.status.success() {
+        let copied = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(PathBuf::from)
+            .collect::<Vec<_>>();
+        if !copied.is_empty() {
+            return Ok(Some(match classify_paths(copied) {
+                PastedPaths::Images(paths) => ClipboardImage::Files(paths),
+                PastedPaths::Unsupported(path) => ClipboardImage::NotPhoto(path),
+                PastedPaths::NotPaths => return Ok(None),
+            }));
+        }
+    }
     let path = new_temp_png()?;
     let status = Command::new("osascript")
         .arg("-e")
@@ -54,20 +87,7 @@ fn read_macos_image() -> Result<Option<ClipboardImage>> {
     if status.success() && fs::metadata(&path).is_ok_and(|metadata| metadata.len() > 0) {
         return Ok(Some(ClipboardImage::Temp(path)));
     }
-    // A photo copied in Finder is a file reference rather than image data.
-    let output = Command::new("osascript")
-        .arg("-e")
-        .arg(MACOS_FILE_SCRIPT)
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .context("running osascript to read the clipboard")?;
-    if !output.status.success() {
-        return Ok(None);
-    }
-    let copied = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
-    Ok((copied.is_file() && fuel::is_fuel_image_path(&copied))
-        .then_some(ClipboardImage::File(copied)))
+    Ok(None)
 }
 
 fn read_linux_image() -> Result<Option<ClipboardImage>> {
@@ -144,13 +164,18 @@ pub fn pasted_paths(value: &str) -> PastedPaths {
     if words.is_empty() {
         return PastedPaths::NotPaths;
     }
-    let mut paths = Vec::with_capacity(words.len());
-    for word in words {
-        let path = path_from_word(&word);
-        if !path.is_absolute() || !path.is_file() {
-            return PastedPaths::NotPaths;
-        }
-        paths.push(path);
+    classify_paths(words.iter().map(|word| path_from_word(word)).collect())
+}
+
+/// Sorts existing files into photos or the first unsupported file. Anything
+/// that is not an existing absolute file path is treated as text.
+fn classify_paths(paths: Vec<PathBuf>) -> PastedPaths {
+    if paths.is_empty()
+        || paths
+            .iter()
+            .any(|path| !path.is_absolute() || !path.is_file())
+    {
+        return PastedPaths::NotPaths;
     }
     match paths.iter().find(|path| !fuel::is_fuel_image_path(path)) {
         Some(other) => PastedPaths::Unsupported(other.clone()),
