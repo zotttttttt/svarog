@@ -141,9 +141,8 @@ fn is_cautious_body_part(config: &Config, movement: &Movement) -> bool {
     movement.muscles.iter().any(|muscle| {
         config
             .profile
-            .cautious_body_parts
+            .injuries
             .iter()
-            .chain(config.profile.injuries.iter())
             .any(|cautious| cautious.eq_ignore_ascii_case(muscle))
     })
 }

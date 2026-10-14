@@ -649,20 +649,11 @@ fn collect_profile(config: &mut Config, paths: &config::Paths, all: bool) -> Res
             Ok(())
         },
     )?;
-    onboarding_step(
-        config,
-        paths,
-        config::STEP_CAUTIOUS_BODY_PARTS,
-        all,
-        |config| {
-            config.profile.cautious_body_parts =
-                prompt_list("Cautious body parts", &config.profile.cautious_body_parts)?;
-            Ok(())
-        },
-    )?;
     onboarding_step(config, paths, config::STEP_INJURIES, all, |config| {
-        config.profile.injuries =
-            prompt_list("Injuries or hard limitations", &config.profile.injuries)?;
+        config.profile.injuries = prompt_list(
+            "Injuries, limitations, or body parts to be careful with",
+            &config.profile.injuries,
+        )?;
         Ok(())
     })?;
     onboarding_step(

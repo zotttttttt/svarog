@@ -40,13 +40,13 @@ pub const STEP_AGE: &str = "profile.age";
 pub const STEP_GOALS: &str = "profile.goals";
 pub const STEP_EQUIPMENT: &str = "profile.equipment";
 pub const STEP_ARM_AVAILABILITY: &str = "profile.arm_availability";
-pub const STEP_CAUTIOUS_BODY_PARTS: &str = "profile.cautious_body_parts";
 pub const STEP_INJURIES: &str = "profile.injuries";
 pub const STEP_ARCHETYPE: &str = "forge.archetype";
 pub const STEP_DESKTOP_NOTIFICATIONS: &str = "preferences.desktop_notifications";
 pub const STEP_CODEX_COMMAND: &str = "agents.codex_command";
 pub const STEP_EXERCISE_PREFERENCES: &str = "profile.exercise_preferences";
 pub const STEP_CODING_AGENT: &str = "agents.coding_agent";
+const LEGACY_STEP_CAUTIOUS_BODY_PARTS: &str = "profile.cautious_body_parts";
 const LEGACY_STEP_WORK_SETUP: &str = "profile.work_setup";
 const LEGACY_STEP_RECOMMENDER_BACKEND: &str = "recommender.backend";
 const LEGACY_STEP_FORGE_INTENSITY: &str = "preferences.forge_intensity";
@@ -61,7 +61,7 @@ pub const ORIGINAL_ONBOARDING_STEPS: [&str; 14] = [
     STEP_EQUIPMENT,
     LEGACY_STEP_WORK_SETUP,
     STEP_ARM_AVAILABILITY,
-    STEP_CAUTIOUS_BODY_PARTS,
+    LEGACY_STEP_CAUTIOUS_BODY_PARTS,
     STEP_INJURIES,
     LEGACY_STEP_FORGE_INTENSITY,
     LEGACY_STEP_FORGE_FREQUENCY,
@@ -71,14 +71,13 @@ pub const ORIGINAL_ONBOARDING_STEPS: [&str; 14] = [
 ];
 
 // Add every new question here with a stable ID and increment the version above.
-pub const CURRENT_ONBOARDING_STEPS: [&str; 12] = [
+pub const CURRENT_ONBOARDING_STEPS: [&str; 11] = [
     STEP_HEIGHT,
     STEP_WEIGHT,
     STEP_AGE,
     STEP_GOALS,
     STEP_EQUIPMENT,
     STEP_ARM_AVAILABILITY,
-    STEP_CAUTIOUS_BODY_PARTS,
     STEP_INJURIES,
     STEP_DESKTOP_NOTIFICATIONS,
     STEP_CODING_AGENT,
@@ -143,6 +142,8 @@ pub struct Profile {
     /// Split one-sided movements into left/right sessions instead of doing both sides at once.
     #[serde(default = "default_true", alias = "one_hand_available")]
     pub alternate_sides: bool,
+    /// Legacy answer, merged into `injuries` on load.
+    #[serde(default, skip_serializing)]
     pub cautious_body_parts: Vec<String>,
     #[serde(default)]
     pub injuries: Vec<String>,
@@ -877,6 +878,16 @@ pub fn save(paths: &Paths, config: &Config) -> Result<()> {
 }
 
 fn normalize_loaded_config(config: &mut Config) {
+    for part in std::mem::take(&mut config.profile.cautious_body_parts) {
+        if !config
+            .profile
+            .injuries
+            .iter()
+            .any(|injury| injury.eq_ignore_ascii_case(&part))
+        {
+            config.profile.injuries.push(part);
+        }
+    }
     config.preferences.forge_frequency = config
         .preferences
         .forge_frequency
@@ -1214,6 +1225,33 @@ mod tests {
         let saved = fs::read_to_string(&paths.config_file).unwrap();
         assert!(saved.contains("alternate_sides = false"));
         assert!(!saved.contains("hand_available"));
+    }
+
+    #[test]
+    fn legacy_cautious_body_parts_merge_into_injuries() {
+        let root = tempdir().unwrap();
+        let paths = Paths::from_root(root.path().join("svarog"));
+        let mut value = toml::Value::try_from(Config::default()).unwrap();
+        let profile = value
+            .get_mut("profile")
+            .and_then(toml::Value::as_table_mut)
+            .unwrap();
+        profile.insert(
+            "cautious_body_parts".into(),
+            vec!["Lower back", "wrists"].into(),
+        );
+        profile.insert("injuries".into(), vec!["lower back"].into());
+        paths.ensure().unwrap();
+        fs::write(&paths.config_file, toml::to_string_pretty(&value).unwrap()).unwrap();
+
+        let loaded = load_or_default(&paths).unwrap();
+
+        assert_eq!(loaded.profile.injuries, vec!["lower back", "wrists"]);
+        assert!(loaded.profile.cautious_body_parts.is_empty());
+        save(&paths, &loaded).unwrap();
+        assert!(!fs::read_to_string(&paths.config_file)
+            .unwrap()
+            .contains("cautious_body_parts"));
     }
 
     #[test]

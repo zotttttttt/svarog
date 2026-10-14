@@ -76,7 +76,6 @@ struct ContextProfile {
     available_equipment: Vec<EquipmentCapability>,
     exercise_preferences: String,
     alternate_sides: bool,
-    cautious_body_parts: Vec<String>,
     injuries: Vec<String>,
     archetype: String,
     custom_archetype: Option<String>,
@@ -730,7 +729,6 @@ fn build_context(
             available_equipment,
             exercise_preferences: profile.exercise_preferences.clone(),
             alternate_sides: profile.alternate_sides,
-            cautious_body_parts: profile.cautious_body_parts.clone(),
             injuries: profile.injuries.clone(),
             archetype: config.forge.archetype.as_str().to_string(),
             custom_archetype: config.forge.custom_archetype.clone(),
@@ -1526,9 +1524,8 @@ fn conflicts_with_limitations(config: &Config, primary_muscle: &str, muscles: &[
         .collect::<Vec<_>>();
     config
         .profile
-        .cautious_body_parts
+        .injuries
         .iter()
-        .chain(config.profile.injuries.iter())
         .map(|item| item.to_lowercase())
         .any(|item| {
             targets

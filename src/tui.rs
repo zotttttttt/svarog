@@ -317,17 +317,17 @@ impl std::fmt::Debug for SettingsState {
     }
 }
 
-const SETTINGS_ROWS: usize = 18;
+const SETTINGS_ROWS: usize = 17;
 
 fn settings_row_order(settings: &SettingsState) -> Vec<usize> {
     let mut rows = Vec::with_capacity(SETTINGS_ROWS);
     rows.extend([0, 1]);
     if settings.draft.recommender.backend == RecommenderBackend::OpenaiKeyring {
-        rows.push(14);
+        rows.push(13);
     }
-    rows.extend([2, 17, 3, 16]);
-    rows.extend(4..14);
-    rows.push(15);
+    rows.extend([2, 16, 3, 15]);
+    rows.extend(4..13);
+    rows.push(14);
     rows
 }
 
@@ -2147,10 +2147,6 @@ fn settings_lines_with_notification_reason(
                 "both sides at once".into()
             },
         ),
-        (
-            "Cautious body parts",
-            profile.cautious_body_parts.join(", "),
-        ),
         ("Injuries / limitations", profile.injuries.join(", ")),
         ("Exercise preferences", profile.exercise_preferences.clone()),
         (
@@ -2262,7 +2258,7 @@ fn settings_lines_with_notification_reason(
             Line::from(Span::styled("[enter/y] Remove key  [esc] Cancel", muted())),
         ]);
     } else if settings.editing {
-        let displayed_edit_value = if settings.row == 14 {
+        let displayed_edit_value = if settings.row == 13 {
             "•".repeat(settings.edit_value.chars().count())
         } else {
             settings.edit_value.to_string()
@@ -2282,7 +2278,7 @@ fn settings_lines_with_notification_reason(
                 accent(),
             )),
             Line::from(Span::styled(
-                if settings.row == 14 {
+                if settings.row == 13 {
                     "[enter] Save key  [esc] Cancel edit"
                 } else {
                     "[enter] Set field  [esc] Cancel edit"
@@ -2361,11 +2357,10 @@ fn begin_setting_edit(settings: &mut SettingsState) {
             .unwrap_or_default(),
         8 => settings.draft.profile.goals.join(", "),
         9 => settings.draft.profile.equipment_text.clone(),
-        11 => settings.draft.profile.cautious_body_parts.join(", "),
-        12 => settings.draft.profile.injuries.join(", "),
-        13 => settings.draft.profile.exercise_preferences.clone(),
-        14 => String::new(),
-        17 => settings
+        11 => settings.draft.profile.injuries.join(", "),
+        12 => settings.draft.profile.exercise_preferences.clone(),
+        13 => String::new(),
+        16 => settings
             .draft
             .agents
             .coding_agent
@@ -2718,16 +2713,15 @@ fn commit_setting_edit(settings: &mut SettingsState) -> Result<()> {
                 value.into()
             }
         }
-        11 => settings.draft.profile.cautious_body_parts = comma_list(value),
-        12 => settings.draft.profile.injuries = comma_list(value),
-        13 => {
+        11 => settings.draft.profile.injuries = comma_list(value),
+        12 => {
             settings.draft.profile.exercise_preferences = if value.is_empty() {
                 "automatic".into()
             } else {
                 value.into()
             }
         }
-        17 => {
+        16 => {
             settings.draft.agents.coding_agent = Some(
                 value
                     .parse::<CodingAgentSelection>()
@@ -2959,7 +2953,7 @@ fn handle_settings_key(
                 settings.edit_value = Zeroizing::new(String::new());
             }
             KeyCode::Enter => {
-                if settings.row == 14 {
+                if settings.row == 13 {
                     if save_openai_key_edit(settings, &env.paths)? {
                         ui.saved_openai_key_available = Some(true);
                     }
@@ -3023,7 +3017,7 @@ fn handle_settings_key(
         }
         KeyCode::Up => move_settings_focus(settings, false),
         KeyCode::Down => move_settings_focus(settings, true),
-        KeyCode::Delete if settings.row == 14 && settings.saved_openai_key_present => {
+        KeyCode::Delete if settings.row == 13 && settings.saved_openai_key_present => {
             settings.confirming_openai_key_delete = true;
             settings.error = None;
         }
@@ -3063,7 +3057,7 @@ fn handle_settings_key(
                             .max(1)
                     }
                 }
-                16 => {
+                15 => {
                     settings.draft.preferences.forge_frequency = if forward {
                         settings
                             .draft
@@ -3080,7 +3074,7 @@ fn handle_settings_key(
                             .max(config::MIN_FORGE_FREQUENCY)
                     }
                 }
-                17 => {
+                16 => {
                     settings.draft.agents.coding_agent = Some(
                         settings
                             .draft
@@ -3116,7 +3110,7 @@ fn handle_settings_key(
             settings.archetype_original = Some(settings.draft.forge.clone());
             settings.selecting_archetype = true;
         }
-        KeyCode::Enter if settings.row == 15 => {
+        KeyCode::Enter if settings.row == 14 => {
             settings.error = None;
             if settings.development || settings.available_update.is_some() {
                 settings.confirming_update = true;
@@ -4388,7 +4382,7 @@ mod tests {
         let root = tempdir().unwrap().keep();
         let env = test_env(root);
         let mut settings = settings_state();
-        settings.row = 16;
+        settings.row = 15;
         let mut ui = TuiState {
             settings: Some(settings),
             ..TuiState::default()
@@ -4417,7 +4411,7 @@ mod tests {
         let root = tempdir().unwrap();
         let env = test_env(root.path().to_path_buf());
         let mut settings = settings_state();
-        settings.row = 15;
+        settings.row = 14;
         settings.development = true;
         let rendered = settings_lines(&settings, false, 120, 40)
             .into_iter()
@@ -4453,7 +4447,7 @@ mod tests {
             })))
             .unwrap();
         let mut settings = settings_state();
-        settings.row = 15;
+        settings.row = 14;
         settings.update_check = Some(receiver);
         settings.update_status = Some("Checking for updates…".into());
         let mut ui = TuiState {
@@ -4510,7 +4504,7 @@ mod tests {
         let env = test_env(root.path().to_path_buf());
         let (_sender, receiver) = std::sync::mpsc::channel();
         let mut settings = settings_state();
-        settings.row = 15;
+        settings.row = 14;
         let mut ui = TuiState {
             settings: Some(settings),
             scheduled_update_check: Some(receiver),
@@ -4591,7 +4585,7 @@ mod tests {
 
         settings.row = 1;
         move_settings_focus(&mut settings, true);
-        assert_eq!(settings.row, 14);
+        assert_eq!(settings.row, 13);
         move_settings_focus(&mut settings, true);
         assert_eq!(settings.row, 2);
 
@@ -4706,7 +4700,7 @@ mod tests {
     fn saved_openai_key_editor_masks_and_saves_the_secret_immediately() {
         let mut settings = settings_state();
         settings.draft.recommender.backend = RecommenderBackend::OpenaiKeyring;
-        settings.row = 14;
+        settings.row = 13;
         begin_setting_edit(&mut settings);
         settings.edit_value = Zeroizing::new("sk-never-render-this".into());
         settings.edit_cursor = settings.edit_value.chars().count();
@@ -4741,7 +4735,7 @@ mod tests {
         let env = test_env(root);
         let mut settings = settings_state();
         settings.draft.recommender.backend = RecommenderBackend::OpenaiKeyring;
-        settings.row = 14;
+        settings.row = 13;
         settings.saved_openai_key_present = true;
         let mut ui = TuiState {
             settings: Some(settings),
@@ -4786,7 +4780,7 @@ mod tests {
     #[test]
     fn credential_store_failures_preserve_safe_retry_state() {
         let mut saving = settings_state();
-        saving.row = 14;
+        saving.row = 13;
         begin_setting_edit(&mut saving);
         saving.edit_value = Zeroizing::new("sk-retry-secret".into());
         saving.edit_cursor = saving.edit_value.chars().count();
@@ -4862,7 +4856,7 @@ mod tests {
             .join("\n");
         assert!(top.contains("› Forge archetype"));
 
-        settings.row = 13;
+        settings.row = 12;
         let bottom = settings_lines(&settings, false, 60, 10)
             .into_iter()
             .map(|line| line.to_string())
@@ -6822,7 +6816,7 @@ mod tests {
     fn bracketed_paste_keeps_settings_text_entry_working() {
         let mut settings = settings_state();
         settings.editing = true;
-        settings.row = 13;
+        settings.row = 12;
         let mut ui = TuiState {
             settings: Some(settings),
             ..TuiState::default()
