@@ -2,6 +2,13 @@
 
 Notable changes to Svarog are recorded here by the automated release process.
 
+## [0.10.2](https://github.com/zotttttttt/svarog/compare/v0.10.1...v0.10.2) (2026-10-14)
+
+
+### Fixes
+
+* **deps:** bump rustls and quinn-proto for RustSec advisories ([#64](https://github.com/zotttttttt/svarog/issues/64)) ([9177b60](https://github.com/zotttttttt/svarog/commit/9177b6091a9f0afa9b982a419df22cc969723441))
+
 ## [0.10.1](https://github.com/zotttttttt/svarog/compare/v0.10.0...v0.10.1) (2026-10-01)
 
 
