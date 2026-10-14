@@ -1,5 +1,6 @@
 mod archetypes;
 mod cli;
+mod clipboard;
 mod collector_auth;
 mod config;
 mod daemon;
