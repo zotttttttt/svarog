@@ -24,8 +24,12 @@ const YESTERDAY_INFERENCE_CUTOFF_HOUR: u32 = 4;
 pub const MAX_FUEL_INPUT_CHARS: usize = 2_000;
 pub const MAX_FUEL_IMAGES: usize = 10;
 const MAX_FUEL_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
+/// Upper bound for all prepared photos in one request; only reachable when no
+/// conversion tool is installed and originals are sent unchanged.
+const MAX_PREPARED_IMAGES_BYTES: u64 = 40 * 1024 * 1024;
 const MAX_IMAGE_MEALS: usize = 12;
 const MAX_IMAGE_INGREDIENTS: usize = 40;
+const MAX_IMAGE_TIME_HINT_CHARS: usize = 100;
 pub const FUEL_IMAGE_EXTENSIONS: [&str; 7] = ["png", "jpg", "jpeg", "webp", "gif", "heic", "heif"];
 /// Photos are re-encoded as JPEGs no larger than this on the long side.
 const MAX_IMAGE_SIDE_PX: u32 = 1080;
@@ -143,6 +147,7 @@ struct FuelImageDescription {
 #[derive(Debug, Deserialize)]
 struct FuelImageMeal {
     name: String,
+    time_hint: String,
     ingredients: Vec<FuelImageIngredient>,
 }
 
@@ -175,7 +180,10 @@ pub fn parse_fuel_with_images(
     if cancel.load(Ordering::Acquire) {
         bail!("meal parsing was cancelled");
     }
-    let synthetic = synthetic_fuel_input(input, &description)?;
+    // The note is already folded into the description: quantity hints are
+    // applied to the grams and date or time words are kept per meal, so it is
+    // not passed on again where "ate half" would be applied twice.
+    let synthetic = synthetic_fuel_input(&description)?;
     parse_fuel(store, config, paths, &synthetic, cancel)
 }
 
@@ -203,7 +211,7 @@ fn describe_fuel_images(
     let mut config = config.clone();
     config.recommender.timeout_ms = config.recommender.timeout_ms.max(MIN_IMAGE_TIMEOUT_MS);
     let staging = tempfile::tempdir().context("staging meal photos")?;
-    let prepared = prepare_fuel_images(images, staging.path())?;
+    let prepared = prepare_fuel_images(images, staging.path(), &cancel)?;
     let description: FuelImageDescription = match config.recommender.backend {
         RecommenderBackend::Codex => recommender::call_codex_json_for_model_with_images(
             store,
@@ -236,9 +244,16 @@ fn describe_fuel_images(
 /// characters would otherwise confuse Codex's `--image` parsing), re-encoding
 /// each as a JPEG of at most `MAX_IMAGE_SIDE_PX`. Without a conversion tool,
 /// photos other than HEIC are sent as they are.
-fn prepare_fuel_images(images: &[PathBuf], staging: &Path) -> Result<Vec<PathBuf>> {
+fn prepare_fuel_images(
+    images: &[PathBuf],
+    staging: &Path,
+    cancel: &AtomicBool,
+) -> Result<Vec<PathBuf>> {
     let mut prepared = Vec::with_capacity(images.len());
     for (index, image) in images.iter().enumerate() {
+        if cancel.load(Ordering::Acquire) {
+            bail!("meal parsing was cancelled");
+        }
         let extension = fuel_image_extension(image)?;
         check_fuel_image_size(image)?;
         let jpeg = staging.join(format!("photo-{}.jpg", index + 1));
@@ -260,6 +275,20 @@ fn prepare_fuel_images(images: &[PathBuf], staging: &Path) -> Result<Vec<PathBuf
         fs::copy(image, &destination)
             .with_context(|| format!("reading photo {}", image.display()))?;
         prepared.push(destination);
+    }
+    let total = prepared
+        .iter()
+        .map(|path| {
+            fs::metadata(path)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0)
+        })
+        .sum::<u64>();
+    if total > MAX_PREPARED_IMAGES_BYTES {
+        bail!(
+            "these photos add up to more than {} MB; attach fewer, or install ImageMagick so Svarog can shrink them",
+            MAX_PREPARED_IMAGES_BYTES / 1024 / 1024
+        );
     }
     Ok(prepared)
 }
@@ -435,6 +464,12 @@ fn validate_image_description(description: &FuelImageDescription) -> Result<()> 
         if meal.name.trim().is_empty() {
             bail!("photo reader returned a meal without a name");
         }
+        if meal.time_hint.chars().count() > MAX_IMAGE_TIME_HINT_CHARS {
+            bail!(
+                "photo reader returned an overly long time for {}",
+                meal.name
+            );
+        }
         for ingredient in &meal.ingredients {
             if ingredient.name.trim().is_empty()
                 || !ingredient.grams.is_finite()
@@ -450,7 +485,9 @@ fn validate_image_description(description: &FuelImageDescription) -> Result<()> 
     Ok(())
 }
 
-fn synthetic_fuel_input(note: &str, description: &FuelImageDescription) -> Result<String> {
+/// Renders the photo description as a timeline the text parser already
+/// understands, one line per meal.
+fn synthetic_fuel_input(description: &FuelImageDescription) -> Result<String> {
     let meals = description
         .meals
         .iter()
@@ -466,24 +503,23 @@ fn synthetic_fuel_input(note: &str, description: &FuelImageDescription) -> Resul
                     )
                 })
                 .collect::<Vec<_>>();
-            if ingredients.is_empty() {
+            let food = if ingredients.is_empty() {
                 meal.name.trim().to_string()
             } else {
                 format!("{} ({})", meal.name.trim(), ingredients.join(", "))
+            };
+            match meal.time_hint.trim() {
+                "" => food,
+                time => format!("{time} - {food}"),
             }
         })
         .collect::<Vec<_>>()
-        .join("; ");
-    let mut text = String::new();
-    let note = note.trim();
-    if !note.is_empty() {
-        text.push_str(note);
-        text.push('\n');
-    }
-    text.push_str("From photos, estimated weights: ");
-    text.push_str(&meals);
+        .join("\n");
+    let text = format!(
+        "Meals read from photos. Gram amounts are the final totals eaten, already combined across photos.\n{meals}"
+    );
     let notes = description.notes.trim();
-    let with_notes = format!("{text}\nPhoto notes: {notes}");
+    let with_notes = format!("{text}\nPhoto notes (context only, not additional food): {notes}");
     if !notes.is_empty() && with_notes.chars().count() <= MAX_FUEL_INPUT_CHARS {
         return Ok(with_notes);
     }
@@ -660,9 +696,10 @@ fn fuel_images_schema() -> serde_json::Value {
                 "items": {
                     "type": "object",
                     "additionalProperties": false,
-                    "required": ["name", "ingredients"],
+                    "required": ["name", "time_hint", "ingredients"],
                     "properties": {
                         "name": { "type": "string" },
+                        "time_hint": { "type": "string" },
                         "ingredients": {
                             "type": "array",
                             "maxItems": MAX_FUEL_ITEMS,
@@ -932,6 +969,7 @@ mod tests {
                 .iter()
                 .map(|(name, ingredients)| FuelImageMeal {
                     name: (*name).into(),
+                    time_hint: String::new(),
                     ingredients: ingredients
                         .iter()
                         .map(|(name, grams)| FuelImageIngredient {
@@ -959,6 +997,10 @@ mod tests {
         assert_eq!(
             meal["properties"]["ingredients"]["items"]["required"],
             json!(["name", "grams"])
+        );
+        assert_eq!(
+            meal["required"],
+            json!(["name", "time_hint", "ingredients"])
         );
     }
 
@@ -1011,13 +1053,25 @@ mod tests {
         let photo = root.path().join("plate, top.png");
         fs::write(&photo, TINY_PNG).unwrap();
 
-        let prepared = prepare_fuel_images(&[photo], staging.path()).unwrap();
+        let prepared =
+            prepare_fuel_images(&[photo], staging.path(), &AtomicBool::new(false)).unwrap();
 
         assert_eq!(prepared.len(), 1);
         assert!(prepared[0].starts_with(staging.path()));
         let name = prepared[0].file_name().unwrap().to_str().unwrap();
         assert!(name == "photo-1.jpg" || name == "photo-1.png", "{name}");
         assert!(fuel_image_data_url(&prepared[0]).is_ok());
+    }
+
+    #[test]
+    fn photo_preparation_stops_when_cancelled() {
+        let root = tempfile::tempdir().unwrap();
+        let photo = root.path().join("plate.png");
+        fs::write(&photo, TINY_PNG).unwrap();
+
+        let error = prepare_fuel_images(&[photo], root.path(), &AtomicBool::new(true)).unwrap_err();
+
+        assert!(error.to_string().contains("cancelled"));
     }
 
     #[test]
@@ -1072,7 +1126,8 @@ mod tests {
             .unwrap();
         assert!(status.success());
 
-        let prepared = prepare_fuel_images(&[heic, large], staging.path()).unwrap();
+        let prepared =
+            prepare_fuel_images(&[heic, large], staging.path(), &AtomicBool::new(false)).unwrap();
 
         assert_eq!(
             prepared,
@@ -1089,24 +1144,27 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_input_keeps_the_note_and_lists_grams() {
-        let description = image_description(
+    fn synthetic_input_is_a_timeline_of_final_amounts() {
+        let mut description = image_description(
             &[
                 ("Caesar salad", &[("romaine", 80.4), ("chicken", 120.0)]),
                 ("Latte", &[("whole milk", 250.0)]),
             ],
             "dressing amount is a guess",
         );
+        description.meals[0].time_hint = " yesterday lunch ".into();
 
-        let text = synthetic_fuel_input(" yesterday lunch ", &description).unwrap();
+        let text = synthetic_fuel_input(&description).unwrap();
 
         assert_eq!(
             text,
-            "yesterday lunch\nFrom photos, estimated weights: Caesar salad (romaine 80 g, chicken 120 g); Latte (whole milk 250 g)\nPhoto notes: dressing amount is a guess"
+            "Meals read from photos. Gram amounts are the final totals eaten, already combined across photos.\n\
+             yesterday lunch - Caesar salad (romaine 80 g, chicken 120 g)\n\
+             Latte (whole milk 250 g)\n\
+             Photo notes (context only, not additional food): dressing amount is a guess"
         );
-        let without_note =
-            synthetic_fuel_input("", &image_description(&[("Apple", &[])], "")).unwrap();
-        assert_eq!(without_note, "From photos, estimated weights: Apple");
+        let apple = synthetic_fuel_input(&image_description(&[("Apple", &[])], "")).unwrap();
+        assert!(apple.ends_with("photos.\nApple"));
     }
 
     #[test]
@@ -1117,11 +1175,9 @@ mod tests {
             &[("Bowl", &ingredients[..0])],
             &"n".repeat(MAX_FUEL_INPUT_CHARS),
         );
-        assert!(!synthetic_fuel_input("", &fits)
-            .unwrap()
-            .contains("Photo notes"));
+        assert!(!synthetic_fuel_input(&fits).unwrap().contains("Photo notes"));
         let too_long = image_description(&[("Bowl", &ingredients)], "");
-        assert!(synthetic_fuel_input("dinner", &too_long).is_err());
+        assert!(synthetic_fuel_input(&too_long).is_err());
     }
 
     #[test]
@@ -1153,10 +1209,11 @@ while [ "$#" -gt 0 ]; do
 done
 if [ "$images" -gt 0 ]; then
   printf 'images %s\n' "$images" >> "__LOG__"
-  printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"{\"meals\":[{\"name\":\"Omelette\",\"ingredients\":[{\"name\":\"egg\",\"grams\":100}]}],\"notes\":\"\"}"}}'
+  printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"{\"meals\":[{\"name\":\"Omelette\",\"time_hint\":\"8am\",\"ingredients\":[{\"name\":\"egg\",\"grams\":100}]}],\"notes\":\"\"}"}}'
 else
   case "$prompt" in
-    *"breakfast"*"From photos, estimated weights: Omelette (egg 100 g)"*) printf 'text ok\n' >> "__LOG__" ;;
+    *"ate half"*) printf 'note repeated\n' >> "__LOG__" ;;
+    *"8am - Omelette (egg 100 g)"*) printf 'text ok\n' >> "__LOG__" ;;
     *) printf 'text missing\n' >> "__LOG__" ;;
   esac
   printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"{\"date\":null,\"multiple_dates\":false,\"events\":[{\"time\":\"08:00\",\"inherit_previous_time\":false,\"source_text\":\"omelette, egg 100 g\",\"items\":[{\"name\":\"Omelette\",\"quantity\":100,\"unit\":\"g\",\"calories\":150,\"protein_g\":12,\"carbohydrates_g\":1,\"fat_g\":10,\"fiber_g\":0,\"sugar_g\":1,\"sodium_mg\":140,\"potassium_mg\":130,\"assumptions\":[]}]}]}"}}'
@@ -1181,7 +1238,7 @@ fi
             &store,
             &config,
             &paths,
-            "breakfast",
+            "breakfast at 8am, ate half",
             &[photo.clone(), photo],
             Arc::new(AtomicBool::new(false)),
         )

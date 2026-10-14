@@ -9,7 +9,8 @@ Rules:
 - List the visible or clearly implied ingredients of each meal, including cooking oils, sauces, dressings, and toppings that materially change nutrition.
 - Estimate `grams` for each ingredient as the amount actually consumed, using plate, utensil, packaging, and hand sizes for scale. Use milliliters as grams for drinks.
 - When a label, menu, receipt, or package shows a brand, weight, or nutrition facts, prefer those over visual estimates and mention them in `notes`.
-- The user's note in Context JSON may name the meal, say how much was eaten (for example "ate half"), or give a time. Apply quantity hints to the grams. Do not repeat time hints in meal names.
+- The user's note in Context JSON may name the meal, say how much was eaten (for example "ate half"), add food that is not pictured, or give a date or time. Apply quantity hints to the grams; the grams must be the final amount eaten. Add food described only in the note as its own meal or ingredient.
+- Set each meal's `time_hint` to the date or time words from the user's note that apply to that meal, copied as written (for example "yesterday 8pm" or "lunch"). Use an empty string when the note gives none. Never put quantities in `time_hint`, and do not repeat time hints in meal names.
 - Use `notes` for short uncertainty or assumption remarks that matter for nutrition; use an empty string when there are none.
 - Return no more than 12 meals and no more than 40 ingredients in total.
 - Never invent meals that are not shown in the photos or described in the user's note.
