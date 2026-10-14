@@ -4,10 +4,13 @@ use crate::prompt_templates::PromptRenderer;
 use crate::recommender;
 use crate::storage::Store;
 use anyhow::{bail, Context, Result};
+use base64::Engine as _;
 use chrono::{DateTime, Days, Local, NaiveDate, NaiveTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::sync::atomic::AtomicBool;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 pub const FUEL_MODEL: &str = "gpt-5.6-luna";
@@ -19,6 +22,11 @@ const MAX_EVENT_SOURCE_CHARS: usize = 500;
 const MAX_SUGAR_CARB_ROUNDING_GAP_G: f64 = 1.0;
 const YESTERDAY_INFERENCE_CUTOFF_HOUR: u32 = 4;
 pub const MAX_FUEL_INPUT_CHARS: usize = 2_000;
+pub const MAX_FUEL_IMAGES: usize = 10;
+const MAX_FUEL_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
+const MAX_IMAGE_MEALS: usize = 12;
+const MAX_IMAGE_INGREDIENTS: usize = 40;
+pub const FUEL_IMAGE_EXTENSIONS: [&str; 5] = ["png", "jpg", "jpeg", "webp", "gif"];
 
 #[derive(Debug, Clone)]
 pub struct FuelParseOutcome {
@@ -119,6 +127,250 @@ pub fn parse_fuel(
         provider,
         model: FUEL_MODEL,
     })
+}
+
+#[derive(Debug, Deserialize)]
+struct FuelImageDescription {
+    meals: Vec<FuelImageMeal>,
+    notes: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct FuelImageMeal {
+    name: String,
+    ingredients: Vec<FuelImageIngredient>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FuelImageIngredient {
+    name: String,
+    grams: f64,
+}
+
+#[derive(Serialize)]
+struct FuelImagesPromptContext<'a> {
+    user_note: &'a str,
+    image_count: usize,
+}
+
+/// Parses a meal from text, optionally reading attached photos first. Photos are
+/// turned into a text description that goes through the regular text parser.
+pub fn parse_fuel_with_images(
+    store: &Store,
+    config: &Config,
+    paths: &Paths,
+    input: &str,
+    images: &[PathBuf],
+    cancel: Arc<AtomicBool>,
+) -> Result<FuelParseOutcome> {
+    if images.is_empty() {
+        return parse_fuel(store, config, paths, input, cancel);
+    }
+    let description = describe_fuel_images(store, config, paths, input, images, cancel.clone())?;
+    if cancel.load(Ordering::Acquire) {
+        bail!("meal parsing was cancelled");
+    }
+    let synthetic = synthetic_fuel_input(input, &description)?;
+    parse_fuel(store, config, paths, &synthetic, cancel)
+}
+
+fn describe_fuel_images(
+    store: &Store,
+    config: &Config,
+    paths: &Paths,
+    note: &str,
+    images: &[PathBuf],
+    cancel: Arc<AtomicBool>,
+) -> Result<FuelImageDescription> {
+    if images.len() > MAX_FUEL_IMAGES {
+        bail!("attach no more than {MAX_FUEL_IMAGES} photos per meal");
+    }
+    let note = note.trim();
+    if note.chars().count() > MAX_FUEL_INPUT_CHARS {
+        bail!("meal or drink description is limited to {MAX_FUEL_INPUT_CHARS} characters");
+    }
+    let context = FuelImagesPromptContext {
+        user_note: note,
+        image_count: images.len(),
+    };
+    let prompt = PromptRenderer::new(&paths.config_dir).fuel_images(&context)?;
+    let schema = fuel_images_schema();
+    let description: FuelImageDescription = match config.recommender.backend {
+        RecommenderBackend::Codex => {
+            // Copy into neutral names so paths with commas or odd characters
+            // survive Codex's `--image` argument parsing.
+            let staging = tempfile::tempdir().context("staging meal photos")?;
+            let mut staged = Vec::with_capacity(images.len());
+            for (index, image) in images.iter().enumerate() {
+                let extension = fuel_image_extension(image)?;
+                check_fuel_image_size(image)?;
+                let destination = staging
+                    .path()
+                    .join(format!("photo-{}.{extension}", index + 1));
+                fs::copy(image, &destination)
+                    .with_context(|| format!("reading photo {}", image.display()))?;
+                staged.push(destination);
+            }
+            recommender::call_codex_json_for_model_with_images(
+                store,
+                config,
+                &prompt,
+                &staged,
+                &schema,
+                FUEL_MODEL,
+                cancel.as_ref(),
+            )
+            .context("reading meal photos with Codex")?
+        }
+        RecommenderBackend::OpenaiEnv | RecommenderBackend::OpenaiKeyring => {
+            let mut data_urls = Vec::with_capacity(images.len());
+            for image in images {
+                data_urls.push(fuel_image_data_url(image)?);
+            }
+            let body = openai_fuel_images_request_body(config, &prompt, &data_urls, schema);
+            recommender::call_openai_json_cancellable(store, config, paths, body, cancel)
+                .context("reading meal photos with OpenAI")?
+        }
+        RecommenderBackend::Local => {
+            bail!("reading meal photos needs Codex or an OpenAI backend")
+        }
+    };
+    validate_image_description(&description)?;
+    Ok(description)
+}
+
+pub fn is_fuel_image_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            FUEL_IMAGE_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str())
+        })
+}
+
+fn fuel_image_extension(path: &Path) -> Result<String> {
+    if !is_fuel_image_path(path) {
+        bail!(
+            "{} is not a supported photo; use PNG, JPEG, WebP, or GIF",
+            path.display()
+        );
+    }
+    Ok(path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase())
+}
+
+fn check_fuel_image_size(path: &Path) -> Result<()> {
+    let size = fs::metadata(path)
+        .with_context(|| format!("reading photo {}", path.display()))?
+        .len();
+    if size > MAX_FUEL_IMAGE_BYTES {
+        bail!(
+            "{} is larger than {} MB",
+            path.display(),
+            MAX_FUEL_IMAGE_BYTES / 1024 / 1024
+        );
+    }
+    Ok(())
+}
+
+fn fuel_image_data_url(path: &Path) -> Result<String> {
+    let mime = match fuel_image_extension(path)?.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        _ => "image/gif",
+    };
+    check_fuel_image_size(path)?;
+    let bytes = fs::read(path).with_context(|| format!("reading photo {}", path.display()))?;
+    Ok(format!(
+        "data:{mime};base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    ))
+}
+
+fn validate_image_description(description: &FuelImageDescription) -> Result<()> {
+    if description.meals.is_empty() {
+        let notes = description.notes.trim();
+        if notes.is_empty() {
+            bail!("no food or drink was recognized in the photos");
+        }
+        bail!("no food or drink was recognized in the photos: {notes}");
+    }
+    if description.meals.len() > MAX_IMAGE_MEALS {
+        bail!("photo reader returned more than {MAX_IMAGE_MEALS} meals");
+    }
+    let ingredients: usize = description
+        .meals
+        .iter()
+        .map(|meal| meal.ingredients.len())
+        .sum();
+    if ingredients > MAX_IMAGE_INGREDIENTS {
+        bail!("photo reader returned more than {MAX_IMAGE_INGREDIENTS} ingredients");
+    }
+    for meal in &description.meals {
+        if meal.name.trim().is_empty() {
+            bail!("photo reader returned a meal without a name");
+        }
+        for ingredient in &meal.ingredients {
+            if ingredient.name.trim().is_empty()
+                || !ingredient.grams.is_finite()
+                || ingredient.grams < 0.0
+            {
+                bail!(
+                    "photo reader returned an invalid ingredient for {}",
+                    meal.name
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn synthetic_fuel_input(note: &str, description: &FuelImageDescription) -> Result<String> {
+    let meals = description
+        .meals
+        .iter()
+        .map(|meal| {
+            let ingredients = meal
+                .ingredients
+                .iter()
+                .map(|ingredient| {
+                    format!(
+                        "{} {} g",
+                        ingredient.name.trim(),
+                        ingredient.grams.round().max(1.0)
+                    )
+                })
+                .collect::<Vec<_>>();
+            if ingredients.is_empty() {
+                meal.name.trim().to_string()
+            } else {
+                format!("{} ({})", meal.name.trim(), ingredients.join(", "))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    let mut text = String::new();
+    let note = note.trim();
+    if !note.is_empty() {
+        text.push_str(note);
+        text.push('\n');
+    }
+    text.push_str("From photos, estimated weights: ");
+    text.push_str(&meals);
+    let notes = description.notes.trim();
+    let with_notes = format!("{text}\nPhoto notes: {notes}");
+    if !notes.is_empty() && with_notes.chars().count() <= MAX_FUEL_INPUT_CHARS {
+        return Ok(with_notes);
+    }
+    if text.chars().count() > MAX_FUEL_INPUT_CHARS {
+        bail!(
+            "the photos describe more food than fits in one entry; try fewer photos or split the meal"
+        );
+    }
+    Ok(text)
 }
 
 fn resolve_timeline_at(
@@ -243,6 +495,69 @@ fn openai_fuel_request_body(
                 "strict": true,
                 "schema": schema
             }
+        }
+    })
+}
+
+fn openai_fuel_images_request_body(
+    config: &Config,
+    prompt: &str,
+    data_urls: &[String],
+    schema: serde_json::Value,
+) -> serde_json::Value {
+    let mut content = vec![json!({ "type": "input_text", "text": prompt })];
+    content.extend(
+        data_urls
+            .iter()
+            .map(|url| json!({ "type": "input_image", "image_url": url, "detail": "auto" })),
+    );
+    json!({
+        "model": FUEL_MODEL,
+        "reasoning": { "effort": config.recommender.openai.reasoning_effort },
+        "input": [{ "role": "user", "content": content }],
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "svarog_fuel_images",
+                "strict": true,
+                "schema": schema
+            }
+        }
+    })
+}
+
+fn fuel_images_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["meals", "notes"],
+        "properties": {
+            "meals": {
+                "type": "array",
+                "maxItems": MAX_IMAGE_MEALS,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["name", "ingredients"],
+                    "properties": {
+                        "name": { "type": "string" },
+                        "ingredients": {
+                            "type": "array",
+                            "maxItems": MAX_FUEL_ITEMS,
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": ["name", "grams"],
+                                "properties": {
+                                    "name": { "type": "string" },
+                                    "grams": { "type": "number" }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "notes": { "type": "string" }
         }
     })
 }
@@ -487,6 +802,182 @@ mod tests {
         assert_eq!(body["model"], FUEL_MODEL);
         assert_eq!(body["text"]["format"]["strict"], true);
         assert_eq!(body["text"]["format"]["type"], "json_schema");
+    }
+
+    fn image_description(meals: &[(&str, &[(&str, f64)])], notes: &str) -> FuelImageDescription {
+        FuelImageDescription {
+            meals: meals
+                .iter()
+                .map(|(name, ingredients)| FuelImageMeal {
+                    name: (*name).into(),
+                    ingredients: ingredients
+                        .iter()
+                        .map(|(name, grams)| FuelImageIngredient {
+                            name: (*name).into(),
+                            grams: *grams,
+                        })
+                        .collect(),
+                })
+                .collect(),
+            notes: notes.into(),
+        }
+    }
+
+    #[test]
+    fn image_schema_is_strict_and_bounded() {
+        let schema = fuel_images_schema();
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["properties"]["meals"]["maxItems"], 12);
+        let meal = &schema["properties"]["meals"]["items"];
+        assert_eq!(meal["additionalProperties"], false);
+        assert_eq!(
+            meal["properties"]["ingredients"]["items"]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            meal["properties"]["ingredients"]["items"]["required"],
+            json!(["name", "grams"])
+        );
+    }
+
+    #[test]
+    fn openai_image_payload_sends_every_photo_to_luna() {
+        let config = Config::default();
+        let urls = vec![
+            "data:image/png;base64,AAAA".to_string(),
+            "data:image/jpeg;base64,BBBB".to_string(),
+        ];
+        let body = openai_fuel_images_request_body(&config, "photos", &urls, fuel_images_schema());
+
+        assert_eq!(body["model"], FUEL_MODEL);
+        assert_eq!(body["text"]["format"]["strict"], true);
+        let content = body["input"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 3);
+        assert_eq!(content[0]["type"], "input_text");
+        assert_eq!(content[0]["text"], "photos");
+        assert_eq!(content[1]["type"], "input_image");
+        assert_eq!(content[1]["image_url"], urls[0]);
+        assert_eq!(content[2]["image_url"], urls[1]);
+    }
+
+    #[test]
+    fn image_data_url_uses_the_photo_type_and_rejects_other_files() {
+        let root = tempfile::tempdir().unwrap();
+        let photo = root.path().join("Lunch.JPG");
+        fs::write(&photo, [1u8, 2, 3]).unwrap();
+        assert_eq!(
+            fuel_image_data_url(&photo).unwrap(),
+            "data:image/jpeg;base64,AQID"
+        );
+        let text = root.path().join("notes.txt");
+        fs::write(&text, "x").unwrap();
+        assert!(fuel_image_data_url(&text).is_err());
+        assert!(fuel_image_data_url(&root.path().join("missing.png")).is_err());
+    }
+
+    #[test]
+    fn synthetic_input_keeps_the_note_and_lists_grams() {
+        let description = image_description(
+            &[
+                ("Caesar salad", &[("romaine", 80.4), ("chicken", 120.0)]),
+                ("Latte", &[("whole milk", 250.0)]),
+            ],
+            "dressing amount is a guess",
+        );
+
+        let text = synthetic_fuel_input(" yesterday lunch ", &description).unwrap();
+
+        assert_eq!(
+            text,
+            "yesterday lunch\nFrom photos, estimated weights: Caesar salad (romaine 80 g, chicken 120 g); Latte (whole milk 250 g)\nPhoto notes: dressing amount is a guess"
+        );
+        let without_note =
+            synthetic_fuel_input("", &image_description(&[("Apple", &[])], "")).unwrap();
+        assert_eq!(without_note, "From photos, estimated weights: Apple");
+    }
+
+    #[test]
+    fn synthetic_input_drops_notes_then_fails_when_too_long() {
+        let long_name = "x".repeat(MAX_FUEL_INPUT_CHARS - 40);
+        let ingredients = [(long_name.as_str(), 10.0)];
+        let fits = image_description(
+            &[("Bowl", &ingredients[..0])],
+            &"n".repeat(MAX_FUEL_INPUT_CHARS),
+        );
+        assert!(!synthetic_fuel_input("", &fits)
+            .unwrap()
+            .contains("Photo notes"));
+        let too_long = image_description(&[("Bowl", &ingredients)], "");
+        assert!(synthetic_fuel_input("dinner", &too_long).is_err());
+    }
+
+    #[test]
+    fn image_description_needs_food() {
+        let empty = image_description(&[], "a photo of a cat");
+        let error = validate_image_description(&empty).unwrap_err();
+        assert!(error.to_string().contains("a photo of a cat"));
+        let negative = image_description(&[("Soup", &[("broth", -1.0)])], "");
+        assert!(validate_image_description(&negative).is_err());
+        let fine = image_description(&[("Soup", &[("broth", 300.0)])], "");
+        assert!(validate_image_description(&fine).is_ok());
+    }
+
+    #[test]
+    fn photos_are_read_then_parsed_as_text_through_codex() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let command = root.path().join("fake-codex.sh");
+        let log = root.path().join("prompts.log");
+        let script = r#"#!/bin/sh
+images=0
+prompt=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --image) shift; images=$((images + 1)) ;;
+    *) prompt="$1" ;;
+  esac
+  shift
+done
+if [ "$images" -gt 0 ]; then
+  printf 'images %s\n' "$images" >> "__LOG__"
+  printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"{\"meals\":[{\"name\":\"Omelette\",\"ingredients\":[{\"name\":\"egg\",\"grams\":100}]}],\"notes\":\"\"}"}}'
+else
+  case "$prompt" in
+    *"breakfast"*"From photos, estimated weights: Omelette (egg 100 g)"*) printf 'text ok\n' >> "__LOG__" ;;
+    *) printf 'text missing\n' >> "__LOG__" ;;
+  esac
+  printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"{\"date\":null,\"multiple_dates\":false,\"events\":[{\"time\":\"08:00\",\"inherit_previous_time\":false,\"source_text\":\"omelette, egg 100 g\",\"items\":[{\"name\":\"Omelette\",\"quantity\":100,\"unit\":\"g\",\"calories\":150,\"protein_g\":12,\"carbohydrates_g\":1,\"fat_g\":10,\"fiber_g\":0,\"sugar_g\":1,\"sodium_mg\":140,\"potassium_mg\":130,\"assumptions\":[]}]}]}"}}'
+fi
+"#
+        .replace("__LOG__", &log.display().to_string());
+        fs::write(&command, script).unwrap();
+        let mut permissions = fs::metadata(&command).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&command, permissions).unwrap();
+        let photo = root.path().join("plate, top.png");
+        fs::write(&photo, [0u8; 8]).unwrap();
+        let mut config = Config::default();
+        config.recommender.backend = RecommenderBackend::Codex;
+        config.recommender.codex.command = command.display().to_string();
+        config.recommender.codex.args.clear();
+        config.recommender.timeout_ms = 5_000;
+        let paths = Paths::from_root(root.path().join("svarog"));
+        let store = Store::open(&root.path().join("test.sqlite3")).unwrap();
+
+        let outcome = parse_fuel_with_images(
+            &store,
+            &config,
+            &paths,
+            "breakfast",
+            &[photo.clone(), photo],
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+
+        assert_eq!(fs::read_to_string(log).unwrap(), "images 2\ntext ok\n");
+        assert_eq!(outcome.events.len(), 1);
+        assert_eq!(outcome.events[0].parsed.items[0].name, "Omelette");
+        assert_eq!(outcome.model, FUEL_MODEL);
     }
 
     #[test]

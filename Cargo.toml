@@ -41,6 +41,7 @@ disabled-strategies = ["quick-install"]
 [dependencies]
 anyhow = "1"
 axum = { version = "0.7", default-features = false, features = ["http1", "json", "tokio"] }
+base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29"
