@@ -83,6 +83,8 @@ pub enum RecommendationSide {
     Left,
     Right,
     Bilateral,
+    /// A one-sided movement done on both sides within a single session.
+    Both,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -460,6 +462,7 @@ impl Recommendation {
         match self.side {
             Some(RecommendationSide::Left) => format!("{} (left side)", self.movement_name),
             Some(RecommendationSide::Right) => format!("{} (right side)", self.movement_name),
+            Some(RecommendationSide::Both) => format!("{} (both sides)", self.movement_name),
             Some(RecommendationSide::Bilateral) | None => self.movement_name.clone(),
         }
     }

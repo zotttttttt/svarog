@@ -17,9 +17,15 @@ Rules:
 - Recent completed exercises are reference data for recovery and repetition avoidance only. They are not a whitelist and must not bias the batch away from safe catalog movements the user can do now.
 - Prefer safety, available equipment, user preferences, recovery, and then variety—in that order.
 - For bilateral equipment movements, target equipment sessions 2, 4, 6, 8, and 10 when enough compatible movements exist.
+{%- if context.profile.alternate_sides | default(true) %}
 - For unilateral equipment movements, keep the first two sessions general or bodyweight, then use consecutive opposite-side pairs for the remaining equipment sessions: right then left, or left then right.
-- Include the `side` field for unilateral movements and use `bilateral` for bilateral movements.
+- Set `side` to `left` or `right` for unilateral movements and use `bilateral` for bilateral movements.
 - Do not repeat a primary muscle within this batch unless the two adjacent recommendations are an intentional opposite-side pair of the same unilateral movement.
+{%- else %}
+- The user prefers to do both sides of a unilateral movement within one session. Set `side` to `both` for unilateral movements, size reps and duration to cover both sides, and never split one movement into left and right sessions.
+- Use `bilateral` as the `side` for bilateral movements.
+- Do not repeat a primary muscle within this batch.
+{%- endif %}
 - The daily-set limit controls when Svarog offers a session; do not shorten this future batch because today's limit was reached.
 - Return only JSON matching the output schema supplied by Svarog. No markdown.
 - Use recent outcomes' prescribed and performed repetitions to adapt conservatively. Reduced repetitions and skips must prevent immediate increases; a user exceeding the prescription is only gradual positive evidence.

@@ -140,9 +140,9 @@ pub struct Profile {
     pub equipment_text: String,
     #[serde(default = "default_exercise_preferences")]
     pub exercise_preferences: String,
-    pub one_hand_available: bool,
-    #[serde(default = "default_true")]
-    pub two_hand_available: bool,
+    /// Split one-sided movements into left/right sessions instead of doing both sides at once.
+    #[serde(default = "default_true", alias = "one_hand_available")]
+    pub alternate_sides: bool,
     pub cautious_body_parts: Vec<String>,
     #[serde(default)]
     pub injuries: Vec<String>,
@@ -462,8 +462,7 @@ impl Default for Config {
                 goals: vec!["consistent movement".to_string()],
                 equipment_text: default_equipment_text(),
                 exercise_preferences: default_exercise_preferences(),
-                one_hand_available: true,
-                two_hand_available: true,
+                alternate_sides: true,
                 cautious_body_parts: Vec::new(),
                 injuries: Vec::new(),
             },
@@ -1191,6 +1190,30 @@ mod tests {
         assert!(!fs::read_to_string(&paths.config_file)
             .unwrap()
             .contains("work_setup"));
+    }
+
+    #[test]
+    fn legacy_arm_availability_answer_maps_to_alternate_sides() {
+        let root = tempdir().unwrap();
+        let paths = Paths::from_root(root.path().join("svarog"));
+        let mut value = toml::Value::try_from(Config::default()).unwrap();
+        let profile = value
+            .get_mut("profile")
+            .and_then(toml::Value::as_table_mut)
+            .unwrap();
+        profile.remove("alternate_sides");
+        profile.insert("one_hand_available".into(), false.into());
+        profile.insert("two_hand_available".into(), true.into());
+        paths.ensure().unwrap();
+        fs::write(&paths.config_file, toml::to_string_pretty(&value).unwrap()).unwrap();
+
+        let loaded = load_or_default(&paths).unwrap();
+
+        assert!(!loaded.profile.alternate_sides);
+        save(&paths, &loaded).unwrap();
+        let saved = fs::read_to_string(&paths.config_file).unwrap();
+        assert!(saved.contains("alternate_sides = false"));
+        assert!(!saved.contains("hand_available"));
     }
 
     #[test]

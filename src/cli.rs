@@ -642,12 +642,10 @@ fn collect_profile(config: &mut Config, paths: &config::Paths, all: bool) -> Res
         config::STEP_ARM_AVAILABILITY,
         all,
         |config| {
-            let alternate_arms = prompt_bool(
-                "Alternate arms between forging sessions?",
-                config.profile.one_hand_available,
+            config.profile.alternate_sides = prompt_bool(
+                "Split one-sided exercises into left and right sessions?\n(n = both sides in one session)",
+                config.profile.alternate_sides,
             )?;
-            config.profile.one_hand_available = alternate_arms;
-            config.profile.two_hand_available = !alternate_arms;
             Ok(())
         },
     )?;

@@ -2140,11 +2140,11 @@ fn settings_lines_with_notification_reason(
         ("Goals", profile.goals.join(", ")),
         ("Equipment", profile.equipment_text.clone()),
         (
-            "Arm availability",
-            if profile.one_hand_available {
-                "alternate arms".into()
+            "One-sided exercises",
+            if profile.alternate_sides {
+                "alternate sessions".into()
             } else {
-                "both hands".into()
+                "both sides at once".into()
             },
         ),
         (
@@ -3106,10 +3106,8 @@ fn handle_settings_key(
                 }
                 5..=7 => adjust_measurement(settings, forward),
                 10 => {
-                    settings.draft.profile.one_hand_available =
-                        !settings.draft.profile.one_hand_available;
-                    settings.draft.profile.two_hand_available =
-                        !settings.draft.profile.one_hand_available;
+                    settings.draft.profile.alternate_sides =
+                        !settings.draft.profile.alternate_sides;
                 }
                 _ => {}
             }

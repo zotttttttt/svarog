@@ -1,5 +1,8 @@
 use crate::config::Config;
-use crate::models::{AgentEvent, AppStateKind, Movement, MovementStatus, Recommendation};
+use crate::models::{
+    AgentEvent, AppStateKind, Movement, MovementSidedness, MovementStatus, Recommendation,
+    RecommendationSide,
+};
 use crate::storage::{Store, MUSCLE_COOLDOWN_MINUTES};
 use anyhow::Result;
 use chrono::Utc;
@@ -79,7 +82,9 @@ pub fn recommend(
         estimated_seconds: movement.estimated_seconds,
         agent: event.agent,
         project: event.project.clone(),
-        side: None,
+        side: (movement.sidedness == MovementSidedness::Unilateral
+            && !config.profile.alternate_sides)
+            .then_some(RecommendationSide::Both),
         created_at: Utc::now(),
     }))
 }
