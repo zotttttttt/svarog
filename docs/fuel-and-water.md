@@ -36,7 +36,11 @@ anything is saved.
   works for an image file copied in Finder. On Linux it needs `wl-paste`
   (Wayland) or `xclip` (X11).
 - Drag image files into the terminal, or paste their paths, to attach them.
-- Supported formats are PNG, JPEG, WebP, and GIF, up to 20 MB each.
+- Supported formats are PNG, JPEG, HEIC, WebP, and GIF, up to 20 MB each.
+  Before sending, each photo is converted to a JPEG no larger than 1080 px on
+  its long side, using `sips` on macOS or ImageMagick (or libheif for HEIC) on
+  Linux. Without those tools, HEIC photos can't be sent and other photos are
+  sent unchanged.
 - Press Backspace while the text box is empty to remove the last photo.
 
 Any text you type goes along as a note, for example `yesterday dinner, ate

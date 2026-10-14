@@ -1545,7 +1545,7 @@ fn handle_add_fuel_paste(ui: &mut TuiState, value: &str, area_width: u16, area_h
         }
         clipboard::PastedPaths::Unsupported(path) => {
             state.feedback = Some(format!(
-                "{} is not a supported photo; use PNG, JPEG, WebP, or GIF.",
+                "{} is not a supported photo; use PNG, JPEG, HEIC, WebP, or GIF.",
                 path.file_name().unwrap_or_default().to_string_lossy()
             ));
             return;

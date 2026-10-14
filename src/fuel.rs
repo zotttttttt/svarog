@@ -26,7 +26,12 @@ pub const MAX_FUEL_IMAGES: usize = 10;
 const MAX_FUEL_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
 const MAX_IMAGE_MEALS: usize = 12;
 const MAX_IMAGE_INGREDIENTS: usize = 40;
-pub const FUEL_IMAGE_EXTENSIONS: [&str; 5] = ["png", "jpg", "jpeg", "webp", "gif"];
+pub const FUEL_IMAGE_EXTENSIONS: [&str; 7] = ["png", "jpg", "jpeg", "webp", "gif", "heic", "heif"];
+/// Photos are re-encoded as JPEGs no larger than this on the long side.
+const MAX_IMAGE_SIDE_PX: u32 = 1080;
+/// Reading several photos takes longer than parsing text, so the photo step
+/// gets at least this long regardless of the recommender timeout.
+const MIN_IMAGE_TIMEOUT_MS: u64 = 180_000;
 
 #[derive(Debug, Clone)]
 pub struct FuelParseOutcome {
@@ -195,40 +200,28 @@ fn describe_fuel_images(
     };
     let prompt = PromptRenderer::new(&paths.config_dir).fuel_images(&context)?;
     let schema = fuel_images_schema();
+    let mut config = config.clone();
+    config.recommender.timeout_ms = config.recommender.timeout_ms.max(MIN_IMAGE_TIMEOUT_MS);
+    let staging = tempfile::tempdir().context("staging meal photos")?;
+    let prepared = prepare_fuel_images(images, staging.path())?;
     let description: FuelImageDescription = match config.recommender.backend {
-        RecommenderBackend::Codex => {
-            // Copy into neutral names so paths with commas or odd characters
-            // survive Codex's `--image` argument parsing.
-            let staging = tempfile::tempdir().context("staging meal photos")?;
-            let mut staged = Vec::with_capacity(images.len());
-            for (index, image) in images.iter().enumerate() {
-                let extension = fuel_image_extension(image)?;
-                check_fuel_image_size(image)?;
-                let destination = staging
-                    .path()
-                    .join(format!("photo-{}.{extension}", index + 1));
-                fs::copy(image, &destination)
-                    .with_context(|| format!("reading photo {}", image.display()))?;
-                staged.push(destination);
-            }
-            recommender::call_codex_json_for_model_with_images(
-                store,
-                config,
-                &prompt,
-                &staged,
-                &schema,
-                FUEL_MODEL,
-                cancel.as_ref(),
-            )
-            .context("reading meal photos with Codex")?
-        }
+        RecommenderBackend::Codex => recommender::call_codex_json_for_model_with_images(
+            store,
+            &config,
+            &prompt,
+            &prepared,
+            &schema,
+            FUEL_MODEL,
+            cancel.as_ref(),
+        )
+        .context("reading meal photos with Codex")?,
         RecommenderBackend::OpenaiEnv | RecommenderBackend::OpenaiKeyring => {
-            let mut data_urls = Vec::with_capacity(images.len());
-            for image in images {
+            let mut data_urls = Vec::with_capacity(prepared.len());
+            for image in &prepared {
                 data_urls.push(fuel_image_data_url(image)?);
             }
-            let body = openai_fuel_images_request_body(config, &prompt, &data_urls, schema);
-            recommender::call_openai_json_cancellable(store, config, paths, body, cancel)
+            let body = openai_fuel_images_request_body(&config, &prompt, &data_urls, schema);
+            recommender::call_openai_json_cancellable(store, &config, paths, body, cancel)
                 .context("reading meal photos with OpenAI")?
         }
         RecommenderBackend::Local => {
@@ -237,6 +230,134 @@ fn describe_fuel_images(
     };
     validate_image_description(&description)?;
     Ok(description)
+}
+
+/// Copies photos into `staging` under neutral names (paths with commas or odd
+/// characters would otherwise confuse Codex's `--image` parsing), re-encoding
+/// each as a JPEG of at most `MAX_IMAGE_SIDE_PX`. Without a conversion tool,
+/// photos other than HEIC are sent as they are.
+fn prepare_fuel_images(images: &[PathBuf], staging: &Path) -> Result<Vec<PathBuf>> {
+    let mut prepared = Vec::with_capacity(images.len());
+    for (index, image) in images.iter().enumerate() {
+        let extension = fuel_image_extension(image)?;
+        check_fuel_image_size(image)?;
+        let jpeg = staging.join(format!("photo-{}.jpg", index + 1));
+        let heic = matches!(extension.as_str(), "heic" | "heif");
+        match convert_to_jpeg(image, &jpeg) {
+            Ok(true) => {
+                prepared.push(jpeg);
+                continue;
+            }
+            Ok(false) if heic => bail!(
+                "{} is a HEIC photo; converting it needs sips (macOS) or ImageMagick or libheif (Linux)",
+                image.display()
+            ),
+            Err(error) if heic => return Err(error),
+            // The backend can still read the original PNG, JPEG, WebP, or GIF.
+            Ok(false) | Err(_) => {}
+        }
+        let destination = staging.join(format!("photo-{}.{extension}", index + 1));
+        fs::copy(image, &destination)
+            .with_context(|| format!("reading photo {}", image.display()))?;
+        prepared.push(destination);
+    }
+    Ok(prepared)
+}
+
+/// Returns false when no conversion tool is installed.
+fn convert_to_jpeg(input: &Path, output: &Path) -> Result<bool> {
+    // `sips -Z` also enlarges, so only pass it for photos that need shrinking.
+    let sips_downscale = cfg!(target_os = "macos")
+        && sips_long_side(input).is_none_or(|side| side > MAX_IMAGE_SIDE_PX);
+    for arguments in image_conversion_commands(input, output, sips_downscale) {
+        let result = std::process::Command::new(&arguments[0])
+            .args(&arguments[1..])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .output();
+        let result = match result {
+            Ok(result) => result,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("running {}", arguments[0]));
+            }
+        };
+        if !result.status.success() || !output.is_file() {
+            bail!(
+                "could not convert photo {} with {}: {}",
+                input.display(),
+                arguments[0],
+                String::from_utf8_lossy(&result.stderr).trim()
+            );
+        }
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn sips_long_side(input: &Path) -> Option<u32> {
+    let output = std::process::Command::new("sips")
+        .args(["-g", "pixelWidth", "-g", "pixelHeight"])
+        .arg(input)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|output| output.status.success())?;
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let (key, value) = line.trim().split_once(':')?;
+            matches!(key, "pixelWidth" | "pixelHeight")
+                .then(|| value.trim().parse::<u32>().ok())
+                .flatten()
+        })
+        .max()
+}
+
+fn image_conversion_commands(
+    input: &Path,
+    output: &Path,
+    sips_downscale: bool,
+) -> Vec<Vec<String>> {
+    let input = input.display().to_string();
+    let output = output.display().to_string();
+    let max = MAX_IMAGE_SIDE_PX.to_string();
+    let mut sips = vec!["sips".into(), "-s".into(), "format".into(), "jpeg".into()];
+    sips.extend(["-s".into(), "formatOptions".into(), "85".into()]);
+    if sips_downscale {
+        sips.extend(["-Z".into(), max.clone()]);
+    }
+    sips.extend([input.clone(), "--out".into(), output.clone()]);
+    let imagemagick = |binary: &str| -> Vec<String> {
+        vec![
+            binary.into(),
+            input.clone(),
+            "-auto-orient".into(),
+            "-resize".into(),
+            format!("{max}x{max}>"),
+            "-quality".into(),
+            "85".into(),
+            format!("jpeg:{output}"),
+        ]
+    };
+    let mut commands = Vec::new();
+    if cfg!(target_os = "macos") {
+        commands.push(sips);
+    }
+    commands.push(imagemagick("magick"));
+    if !cfg!(target_os = "macos") {
+        // On macOS `convert` is not ImageMagick's, so only try it elsewhere.
+        commands.push(imagemagick("convert"));
+    }
+    commands.push(vec![
+        "heif-convert".into(),
+        "-q".into(),
+        "85".into(),
+        input,
+        output,
+    ]);
+    commands
 }
 
 pub fn is_fuel_image_path(path: &Path) -> bool {
@@ -250,7 +371,7 @@ pub fn is_fuel_image_path(path: &Path) -> bool {
 fn fuel_image_extension(path: &Path) -> Result<String> {
     if !is_fuel_image_path(path) {
         bail!(
-            "{} is not a supported photo; use PNG, JPEG, WebP, or GIF",
+            "{} is not a supported photo; use PNG, JPEG, HEIC, WebP, or GIF",
             path.display()
         );
     }
@@ -261,7 +382,7 @@ fn fuel_image_extension(path: &Path) -> Result<String> {
         .to_ascii_lowercase())
 }
 
-fn check_fuel_image_size(path: &Path) -> Result<()> {
+fn check_fuel_image_size(path: &Path) -> Result<u64> {
     let size = fs::metadata(path)
         .with_context(|| format!("reading photo {}", path.display()))?
         .len();
@@ -272,7 +393,7 @@ fn check_fuel_image_size(path: &Path) -> Result<()> {
             MAX_FUEL_IMAGE_BYTES / 1024 / 1024
         );
     }
-    Ok(())
+    Ok(size)
 }
 
 fn fuel_image_data_url(path: &Path) -> Result<String> {
@@ -280,7 +401,8 @@ fn fuel_image_data_url(path: &Path) -> Result<String> {
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
         "webp" => "image/webp",
-        _ => "image/gif",
+        "gif" => "image/gif",
+        other => bail!("{other} photos must be converted before upload"),
     };
     check_fuel_image_size(path)?;
     let bytes = fs::read(path).with_context(|| format!("reading photo {}", path.display()))?;
@@ -875,6 +997,97 @@ mod tests {
         assert!(fuel_image_data_url(&root.path().join("missing.png")).is_err());
     }
 
+    const TINY_PNG: [u8; 73] = [
+        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 4, 0, 0, 0, 4, 8, 2,
+        0, 0, 0, 38, 147, 9, 41, 0, 0, 0, 16, 73, 68, 65, 84, 120, 156, 99, 248, 223, 192, 0, 71,
+        12, 196, 113, 0, 126, 162, 23, 241, 93, 161, 96, 5, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66,
+        96, 130,
+    ];
+
+    #[test]
+    fn photos_are_staged_under_neutral_names() {
+        let root = tempfile::tempdir().unwrap();
+        let staging = tempfile::tempdir().unwrap();
+        let photo = root.path().join("plate, top.png");
+        fs::write(&photo, TINY_PNG).unwrap();
+
+        let prepared = prepare_fuel_images(&[photo], staging.path()).unwrap();
+
+        assert_eq!(prepared.len(), 1);
+        assert!(prepared[0].starts_with(staging.path()));
+        let name = prepared[0].file_name().unwrap().to_str().unwrap();
+        assert!(name == "photo-1.jpg" || name == "photo-1.png", "{name}");
+        assert!(fuel_image_data_url(&prepared[0]).is_ok());
+    }
+
+    #[test]
+    fn conversion_caps_the_long_side_without_enlarging() {
+        let input = Path::new("/in.heic");
+        let output = Path::new("/out.jpg");
+        let small = image_conversion_commands(input, output, false);
+        let large = image_conversion_commands(input, output, true);
+        let magick = |commands: &[Vec<String>]| {
+            commands
+                .iter()
+                .find(|command| command[0] == "magick")
+                .cloned()
+                .unwrap()
+        };
+        assert!(magick(&small).contains(&"1080x1080>".to_string()));
+        assert_eq!(magick(&large).last().unwrap(), "jpeg:/out.jpg");
+        assert_eq!(small.last().unwrap()[0], "heif-convert");
+        if cfg!(target_os = "macos") {
+            assert_eq!(small[0][0], "sips");
+            assert!(!small[0].contains(&"-Z".to_string()));
+            assert!(large[0].contains(&"-Z".to_string()));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn photos_become_jpegs_capped_at_1080_px() {
+        let root = tempfile::tempdir().unwrap();
+        let staging = tempfile::tempdir().unwrap();
+        let png = root.path().join("source.png");
+        let heic = root.path().join("IMG_0001.HEIC");
+        fs::write(&png, TINY_PNG).unwrap();
+        let status = std::process::Command::new("sips")
+            .args(["-s", "format", "heic"])
+            .arg(&png)
+            .arg("--out")
+            .arg(&heic)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let large = root.path().join("large.png");
+        let status = std::process::Command::new("sips")
+            .args(["-z", "1500", "2400"])
+            .arg(&png)
+            .arg("--out")
+            .arg(&large)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let prepared = prepare_fuel_images(&[heic, large], staging.path()).unwrap();
+
+        assert_eq!(
+            prepared,
+            vec![
+                staging.path().join("photo-1.jpg"),
+                staging.path().join("photo-2.jpg")
+            ]
+        );
+        assert!(fuel_image_data_url(&prepared[0])
+            .unwrap()
+            .starts_with("data:image/jpeg;base64,"));
+        assert_eq!(sips_long_side(&prepared[0]), Some(4));
+        assert_eq!(sips_long_side(&prepared[1]), Some(1080));
+    }
+
     #[test]
     fn synthetic_input_keeps_the_note_and_lists_grams() {
         let description = image_description(
@@ -955,7 +1168,7 @@ fi
         permissions.set_mode(0o755);
         fs::set_permissions(&command, permissions).unwrap();
         let photo = root.path().join("plate, top.png");
-        fs::write(&photo, [0u8; 8]).unwrap();
+        fs::write(&photo, TINY_PNG).unwrap();
         let mut config = Config::default();
         config.recommender.backend = RecommenderBackend::Codex;
         config.recommender.codex.command = command.display().to_string();
