@@ -187,7 +187,7 @@ reset behavior, and isolated demo mode.
 | [Commands](docs/commands.md) | Dashboard controls, CLI commands, demo mode, and reset |
 | [Customization](docs/customization.md) | Forge archetypes, profile settings, config, and prompt overrides |
 | [Recommenders](docs/recommenders.md) | Local, Codex, OpenAI, API keys, queues, and fallback |
-| [Fuel and water](docs/fuel-and-water.md) | Meal logging, nutrition estimates, dates, and hydration |
+| [Fuel and water](docs/fuel-and-water.md) | Meal logging from text or photos, nutrition estimates, dates, and hydration |
 | [Data and privacy](docs/data-and-privacy.md) | Stored data, network boundaries, credentials, and deletion |
 
 ## Built with

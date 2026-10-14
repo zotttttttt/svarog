@@ -61,6 +61,11 @@ cooldown state. Exercise instructions and reference images stay local. Remote
 recommenders receive only compact catalog metadata, and every response is
 validated locally.
 
+Meal photos you attach in Add fuel are sent to the selected Codex or OpenAI
+backend only when you submit that meal. Svarog stores only the generated text
+description; clipboard captures are kept in temporary files that are deleted
+once the meal is saved or the screen is closed.
+
 An OpenAI API key can be read from the configured environment variable or saved
 through Settings. Saved keys are protected by macOS Keychain or Linux Secret
 Service and are never written to Svarog's config file or database. While the
