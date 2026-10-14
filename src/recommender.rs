@@ -371,7 +371,8 @@ fn local_queue(
         if used_muscles.contains(&movement.primary_muscle) {
             continue;
         }
-        if movement.estimated_seconds + 15 > event.expected_duration_sec {
+        let (side, estimated_seconds) = local_side_and_seconds(config, &movement);
+        if estimated_seconds + 15 > event.expected_duration_sec {
             continue;
         }
         if conflicts_with_limitations(config, &movement.primary_muscle, &movement.muscles) {
@@ -387,10 +388,10 @@ fn local_queue(
             muscles: movement.muscles,
             reps,
             weight_kg: None,
-            estimated_seconds: movement.estimated_seconds,
+            estimated_seconds,
             agent: event.agent,
             project: event.project.clone(),
-            side: None,
+            side,
             created_at: Utc::now(),
         });
         if recommendations.len() >= needed as usize {
@@ -398,6 +399,22 @@ fn local_queue(
         }
     }
     Ok(recommendations)
+}
+
+/// Side and duration for a locally chosen movement. Without alternating sides, a
+/// one-sided movement covers both sides in one session and takes twice as long.
+pub(crate) fn local_side_and_seconds(
+    config: &Config,
+    movement: &Movement,
+) -> (Option<RecommendationSide>, u32) {
+    if movement.sidedness == MovementSidedness::Unilateral && !config.profile.alternate_sides {
+        (
+            Some(RecommendationSide::Both),
+            movement.estimated_seconds.saturating_mul(2),
+        )
+    } else {
+        (None, movement.estimated_seconds)
+    }
 }
 
 pub(crate) fn archetype_score(config: &Config, entry: &ExerciseCatalogEntry) -> u32 {
