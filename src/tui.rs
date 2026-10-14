@@ -2776,15 +2776,16 @@ fn remove_saved_openai_key_with(
     Ok(())
 }
 
-/// Applies Settings synchronously. Changing the recommender backend is the only
-/// Settings change that replaces the future-forge queue; all other changes keep
-/// compatible queued work in place.
+/// Applies Settings synchronously. Changing the recommender backend or the
+/// alternate-sides preference replaces the future-forge queue, because queued
+/// sides would no longer match; all other changes keep compatible queued work.
 fn apply_settings(
     env: &RuntimeEnv,
     draft: &Config,
 ) -> Result<Option<Receiver<QueueRegenerationResult>>> {
     let previous = config::load_or_default(&env.paths)?;
-    let recommender_changed = previous.recommender.backend != draft.recommender.backend;
+    let regenerate_queue = previous.recommender.backend != draft.recommender.backend
+        || previous.profile.alternate_sides != draft.profile.alternate_sides;
     let agent_changed = previous.agents.coding_agent != draft.agents.coding_agent;
     if agent_changed {
         let selection = draft
@@ -2832,7 +2833,7 @@ fn apply_settings(
             )),
         };
     }
-    Ok(recommender_changed.then(|| daemon::regenerate_queue_after_settings(env)))
+    Ok(regenerate_queue.then(|| daemon::regenerate_queue_after_settings(env)))
 }
 
 fn handle_settings_key(
@@ -5142,6 +5143,22 @@ mod tests {
         let receiver = apply_settings(&env, &Config::default()).unwrap();
         assert!(receiver
             .expect("backend changes should regenerate future forges")
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .is_ok());
+    }
+
+    #[test]
+    fn settings_apply_with_alternate_sides_change_regenerates_queue() {
+        let root = tempdir().unwrap().keep();
+        let env = test_env(root);
+        config::save(&env.paths, &Config::default()).unwrap();
+        let mut draft = Config::default();
+        draft.profile.alternate_sides = false;
+
+        let receiver = apply_settings(&env, &draft).unwrap();
+        assert!(receiver
+            .expect("alternate-sides changes should regenerate future forges")
             .recv_timeout(Duration::from_secs(5))
             .unwrap()
             .is_ok());
