@@ -39,7 +39,6 @@ pub const STEP_WEIGHT: &str = "profile.weight_kg";
 pub const STEP_AGE: &str = "profile.age";
 pub const STEP_GOALS: &str = "profile.goals";
 pub const STEP_EQUIPMENT: &str = "profile.equipment";
-pub const STEP_WORK_SETUP: &str = "profile.work_setup";
 pub const STEP_ARM_AVAILABILITY: &str = "profile.arm_availability";
 pub const STEP_CAUTIOUS_BODY_PARTS: &str = "profile.cautious_body_parts";
 pub const STEP_INJURIES: &str = "profile.injuries";
@@ -48,6 +47,7 @@ pub const STEP_DESKTOP_NOTIFICATIONS: &str = "preferences.desktop_notifications"
 pub const STEP_CODEX_COMMAND: &str = "agents.codex_command";
 pub const STEP_EXERCISE_PREFERENCES: &str = "profile.exercise_preferences";
 pub const STEP_CODING_AGENT: &str = "agents.coding_agent";
+const LEGACY_STEP_WORK_SETUP: &str = "profile.work_setup";
 const LEGACY_STEP_RECOMMENDER_BACKEND: &str = "recommender.backend";
 const LEGACY_STEP_FORGE_INTENSITY: &str = "preferences.forge_intensity";
 const LEGACY_STEP_FORGE_FREQUENCY: &str = "preferences.forge_frequency";
@@ -59,7 +59,7 @@ pub const ORIGINAL_ONBOARDING_STEPS: [&str; 14] = [
     STEP_AGE,
     STEP_GOALS,
     STEP_EQUIPMENT,
-    STEP_WORK_SETUP,
+    LEGACY_STEP_WORK_SETUP,
     STEP_ARM_AVAILABILITY,
     STEP_CAUTIOUS_BODY_PARTS,
     STEP_INJURIES,
@@ -71,13 +71,12 @@ pub const ORIGINAL_ONBOARDING_STEPS: [&str; 14] = [
 ];
 
 // Add every new question here with a stable ID and increment the version above.
-pub const CURRENT_ONBOARDING_STEPS: [&str; 13] = [
+pub const CURRENT_ONBOARDING_STEPS: [&str; 12] = [
     STEP_HEIGHT,
     STEP_WEIGHT,
     STEP_AGE,
     STEP_GOALS,
     STEP_EQUIPMENT,
-    STEP_WORK_SETUP,
     STEP_ARM_AVAILABILITY,
     STEP_CAUTIOUS_BODY_PARTS,
     STEP_INJURIES,
@@ -141,8 +140,6 @@ pub struct Profile {
     pub equipment_text: String,
     #[serde(default = "default_exercise_preferences")]
     pub exercise_preferences: String,
-    #[serde(default = "default_work_setup")]
-    pub work_setup: String,
     pub one_hand_available: bool,
     #[serde(default = "default_true")]
     pub two_hand_available: bool,
@@ -465,7 +462,6 @@ impl Default for Config {
                 goals: vec!["consistent movement".to_string()],
                 equipment_text: default_equipment_text(),
                 exercise_preferences: default_exercise_preferences(),
-                work_setup: default_work_setup(),
                 one_hand_available: true,
                 two_hand_available: true,
                 cautious_body_parts: Vec::new(),
@@ -533,10 +529,6 @@ impl Default for Recommender {
             },
         }
     }
-}
-
-fn default_work_setup() -> String {
-    "sitting".to_string()
 }
 
 fn default_equipment_text() -> String {
@@ -1173,6 +1165,32 @@ mod tests {
                 .model,
             "custom-openai-model"
         );
+    }
+
+    #[test]
+    fn removed_work_setup_answer_is_ignored_without_reopening_onboarding() {
+        let root = tempdir().unwrap();
+        let paths = Paths::from_root(root.path().join("svarog"));
+        let mut config = Config::default();
+        for step in CURRENT_ONBOARDING_STEPS {
+            config.onboarding.mark_completed(step);
+        }
+        let mut value = toml::Value::try_from(&config).unwrap();
+        value
+            .get_mut("profile")
+            .and_then(toml::Value::as_table_mut)
+            .unwrap()
+            .insert("work_setup".into(), "standing".into());
+        paths.ensure().unwrap();
+        fs::write(&paths.config_file, toml::to_string_pretty(&value).unwrap()).unwrap();
+
+        let loaded = load_or_default(&paths).unwrap();
+
+        assert!(loaded.onboarding.is_complete());
+        save(&paths, &loaded).unwrap();
+        assert!(!fs::read_to_string(&paths.config_file)
+            .unwrap()
+            .contains("work_setup"));
     }
 
     #[test]

@@ -636,18 +636,6 @@ fn collect_profile(config: &mut Config, paths: &config::Paths, all: bool) -> Res
         )?;
         Ok(())
     })?;
-    onboarding_step(config, paths, config::STEP_WORK_SETUP, all, |config| {
-        let sitting = prompt_bool(
-            "Do you usually sit while agents run?\n(n = standing)",
-            config.profile.work_setup != "standing",
-        )?;
-        config.profile.work_setup = if sitting {
-            "sitting".to_string()
-        } else {
-            "standing".to_string()
-        };
-        Ok(())
-    })?;
     onboarding_step(
         config,
         paths,
