@@ -92,7 +92,7 @@ fn read_macos_image() -> Result<Option<ClipboardImage>> {
 
 fn read_linux_image() -> Result<Option<ClipboardImage>> {
     let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
-    let (list, read) = linux_commands(wayland);
+    let list = linux_list_command(wayland);
     let types = match Command::new(list[0])
         .args(&list[1..])
         .stdin(Stdio::null())
@@ -112,44 +112,90 @@ fn read_linux_image() -> Result<Option<ClipboardImage>> {
         }
         Err(error) => return Err(error).context("listing clipboard types"),
     };
-    if !String::from_utf8_lossy(&types.stdout)
-        .lines()
-        .any(|line| line.trim() == "image/png")
-    {
+    let types = String::from_utf8_lossy(&types.stdout).into_owned();
+    let types = types.lines().map(str::trim).collect::<Vec<_>>();
+    // Files copied in a file manager come first, like Finder on macOS.
+    if types.contains(&"text/uri-list") {
+        let uris = read_linux_type(wayland, "text/uri-list")?;
+        let copied = String::from_utf8_lossy(&uris)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(path_from_word)
+            .collect::<Vec<_>>();
+        if !copied.is_empty() {
+            return Ok(Some(match classify_paths(copied) {
+                PastedPaths::Images(paths) => ClipboardImage::Files(paths),
+                PastedPaths::Unsupported(path) => ClipboardImage::NotPhoto(path),
+                PastedPaths::NotPaths => return Ok(None),
+            }));
+        }
+    }
+    let Some((mime, extension)) = linux_image_type(&types) else {
+        return Ok(None);
+    };
+    let bytes = read_linux_type(wayland, mime)?;
+    if bytes.is_empty() {
         return Ok(None);
     }
-    let output = Command::new(read[0])
+    let path = new_temp_image(extension)?;
+    fs::write(&path, bytes).context("saving the clipboard image")?;
+    Ok(Some(ClipboardImage::Temp(path)))
+}
+
+fn read_linux_type(wayland: bool, mime: &str) -> Result<Vec<u8>> {
+    let read = linux_read_command(wayland, mime);
+    let output = Command::new(&read[0])
         .args(&read[1..])
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()
-        .context("reading the clipboard image")?;
-    if !output.status.success() || output.stdout.is_empty() {
-        return Ok(None);
-    }
-    let path = new_temp_png()?;
-    fs::write(&path, output.stdout).context("saving the clipboard image")?;
-    Ok(Some(ClipboardImage::Temp(path)))
+        .context("reading the clipboard")?;
+    Ok(if output.status.success() {
+        output.stdout
+    } else {
+        Vec::new()
+    })
 }
 
-fn linux_commands(wayland: bool) -> (&'static [&'static str], &'static [&'static str]) {
+fn linux_image_type(types: &[&str]) -> Option<(&'static str, &'static str)> {
+    [
+        ("image/png", "png"),
+        ("image/jpeg", "jpg"),
+        ("image/webp", "webp"),
+    ]
+    .into_iter()
+    .find(|(mime, _)| types.contains(mime))
+}
+
+fn linux_list_command(wayland: bool) -> &'static [&'static str] {
     if wayland {
-        (
-            &["wl-paste", "--list-types"],
-            &["wl-paste", "--no-newline", "--type", "image/png"],
-        )
+        &["wl-paste", "--list-types"]
     } else {
-        (
-            &["xclip", "-selection", "clipboard", "-t", "TARGETS", "-o"],
-            &["xclip", "-selection", "clipboard", "-t", "image/png", "-o"],
-        )
+        &["xclip", "-selection", "clipboard", "-t", "TARGETS", "-o"]
     }
+}
+
+fn linux_read_command(wayland: bool, mime: &str) -> Vec<String> {
+    let arguments: &[&str] = if wayland {
+        &["wl-paste", "--no-newline", "--type", mime]
+    } else {
+        &["xclip", "-selection", "clipboard", "-t", mime, "-o"]
+    };
+    arguments
+        .iter()
+        .map(|argument| argument.to_string())
+        .collect()
 }
 
 fn new_temp_png() -> Result<TempPath> {
+    new_temp_image("png")
+}
+
+fn new_temp_image(extension: &str) -> Result<TempPath> {
     Ok(tempfile::Builder::new()
         .prefix("svarog-meal-")
-        .suffix(".png")
+        .suffix(&format!(".{extension}"))
         .tempfile()
         .context("creating a file for the clipboard image")?
         .into_temp_path())
@@ -270,10 +316,36 @@ mod tests {
 
     #[test]
     fn linux_uses_wl_paste_on_wayland_and_xclip_otherwise() {
-        assert_eq!(linux_commands(true).0[0], "wl-paste");
-        assert!(linux_commands(true).1.contains(&"image/png"));
-        assert_eq!(linux_commands(false).0[0], "xclip");
-        assert!(linux_commands(false).1.contains(&"image/png"));
+        assert_eq!(linux_list_command(true)[0], "wl-paste");
+        assert_eq!(
+            linux_read_command(true, "image/jpeg"),
+            ["wl-paste", "--no-newline", "--type", "image/jpeg"]
+        );
+        assert_eq!(linux_list_command(false)[0], "xclip");
+        assert_eq!(
+            linux_read_command(false, "text/uri-list"),
+            [
+                "xclip",
+                "-selection",
+                "clipboard",
+                "-t",
+                "text/uri-list",
+                "-o"
+            ]
+        );
+    }
+
+    #[test]
+    fn linux_prefers_png_then_jpeg_then_webp() {
+        assert_eq!(
+            linux_image_type(&["text/plain", "image/jpeg", "image/png"]),
+            Some(("image/png", "png"))
+        );
+        assert_eq!(
+            linux_image_type(&["image/webp", "image/jpeg"]),
+            Some(("image/jpeg", "jpg"))
+        );
+        assert_eq!(linux_image_type(&["text/plain"]), None);
     }
 
     #[test]

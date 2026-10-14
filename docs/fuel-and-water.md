@@ -32,8 +32,8 @@ lists each meal's ingredients with estimated grams, and then sends that list
 through the same text parser described above, so you review the result before
 anything is saved.
 
-- Press `Ctrl+V` in the meal box to attach a copied image. On macOS this also
-  works for an image file copied in Finder. On Linux it needs `wl-paste`
+- Press `Ctrl+V` in the meal box to attach a copied image, or image files
+  copied in Finder or a Linux file manager. On Linux it needs `wl-paste`
   (Wayland) or `xclip` (X11).
 - Drag image files into the terminal, or paste their paths, to attach them.
 - Supported formats are PNG, JPEG, HEIC, WebP, and GIF, up to 20 MB each.

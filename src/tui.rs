@@ -1434,13 +1434,18 @@ fn handle_add_fuel_key(
             state.scroll = focus_scroll_hint(state, area_width);
         }
         KeyCode::Enter if state.focus == AddFuelFocus::Meal => start_fuel_parse(state, env),
+        // AltGr arrives as Ctrl+Alt on some layouts and must still type.
         KeyCode::Char('v')
-            if state.focus == AddFuelFocus::Meal && modifiers.contains(KeyModifiers::CONTROL) =>
+            if state.focus == AddFuelFocus::Meal
+                && modifiers.contains(KeyModifiers::CONTROL)
+                && !modifiers.contains(KeyModifiers::ALT) =>
         {
             attach_clipboard_image(state);
         }
         KeyCode::Char(_)
-            if state.focus == AddFuelFocus::Meal && modifiers.contains(KeyModifiers::CONTROL) => {}
+            if state.focus == AddFuelFocus::Meal
+                && modifiers.contains(KeyModifiers::CONTROL)
+                && !modifiers.contains(KeyModifiers::ALT) => {}
         KeyCode::Backspace
             if state.focus == AddFuelFocus::Meal
                 && state.input.is_empty()
