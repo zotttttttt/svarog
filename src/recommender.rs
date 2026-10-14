@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::io::{Read, Write};
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -808,6 +808,7 @@ where
         store,
         config,
         prompt,
+        &[],
         schema_file.path(),
         model,
         deadline,
@@ -819,6 +820,7 @@ where
                 store,
                 config,
                 prompt,
+                &[],
                 schema_file.path(),
                 None,
                 deadline,
@@ -847,6 +849,21 @@ pub(crate) fn call_codex_json_for_model<T>(
 where
     T: for<'de> Deserialize<'de>,
 {
+    call_codex_json_for_model_with_images(store, config, prompt, &[], schema, model, cancel)
+}
+
+pub(crate) fn call_codex_json_for_model_with_images<T>(
+    store: &Store,
+    config: &Config,
+    prompt: &str,
+    images: &[PathBuf],
+    schema: &serde_json::Value,
+    model: &str,
+    cancel: &AtomicBool,
+) -> Result<T>
+where
+    T: for<'de> Deserialize<'de>,
+{
     let mut schema_file = tempfile::NamedTempFile::new().context("creating Codex output schema")?;
     serde_json::to_writer(&mut schema_file, schema).context("writing Codex output schema")?;
     schema_file
@@ -857,6 +874,7 @@ where
         store,
         config,
         prompt,
+        images,
         schema_file.path(),
         Some(model),
         deadline,
@@ -872,10 +890,12 @@ enum CodexAttempt<T> {
     EarlyFailure(String),
 }
 
+#[allow(clippy::too_many_arguments)]
 fn call_codex_json_attempt<T>(
     store: &Store,
     config: &Config,
     prompt: &str,
+    images: &[PathBuf],
     schema_path: &Path,
     model: Option<&str>,
     deadline: Instant,
@@ -904,6 +924,13 @@ where
     command.arg("--output-schema").arg(schema_path);
     if let Some(model) = model {
         command.arg("--model").arg(model);
+    }
+    // `--image` takes multiple values, so end option parsing before the prompt.
+    for image in images {
+        command.arg("--image").arg(image);
+    }
+    if !images.is_empty() {
+        command.arg("--");
     }
     let mut child = command
         .arg(prompt)
@@ -2166,6 +2193,51 @@ sleep 30
                 .recommender_token_usage_summary_for(RecommenderTokenProvider::Codex)
                 .unwrap(),
             RecommenderTokenUsageSummary::default()
+        );
+    }
+
+    #[test]
+    fn codex_json_passes_each_image_before_the_prompt() {
+        let root = tempdir().unwrap();
+        let command = root.path().join("fake-image-codex.sh");
+        let log = root.path().join("args.log");
+        let script = r#"#!/bin/sh
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --image) shift; printf 'image %s\n' "$1" >> "__LOG__" ;;
+    --) shift; printf 'prompt %s\n' "$1" >> "__LOG__" ;;
+  esac
+  shift
+done
+printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"{\"recommendations\":[]}"}}'
+"#
+        .replace("__LOG__", &log.display().to_string());
+        fs::write(&command, script).unwrap();
+        let mut permissions = fs::metadata(&command).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&command, permissions).unwrap();
+        let mut config = Config::default();
+        config.recommender.codex.command = command.display().to_string();
+        config.recommender.codex.args.clear();
+        config.recommender.timeout_ms = 5_000;
+        let store = test_store();
+        let images = vec![PathBuf::from("/tmp/a.png"), PathBuf::from("/tmp/b.jpg")];
+
+        let batch: LlmRecommendationBatch = call_codex_json_for_model_with_images(
+            &store,
+            &config,
+            "describe",
+            &images,
+            &recommendation_queue_schema(QUEUE_TARGET),
+            "gpt-5.6-luna",
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+
+        assert!(batch.recommendations.is_empty());
+        assert_eq!(
+            fs::read_to_string(log).unwrap(),
+            "image /tmp/a.png\nimage /tmp/b.jpg\nprompt describe\n"
         );
     }
 
