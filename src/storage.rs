@@ -1627,6 +1627,14 @@ impl Store {
         Ok(())
     }
 
+    pub fn mark_forge_reminded(&self, now: DateTime<Utc>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE app_state SET last_forge_at = ?1 WHERE id = 1",
+            [now.to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
     /// Latest moment that resets the idle forge timer: a surfaced forge, a
     /// recorded outcome, or a counted agent event.
     pub fn last_forge_activity_at(&self) -> Result<Option<DateTime<Utc>>> {

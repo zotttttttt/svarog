@@ -370,7 +370,8 @@ fn process_event_with_notifier(
 }
 
 /// Fires a forge from an agent tool call when no forge has been surfaced, answered, or
-/// prompted for `idle_forge_minutes` while the agent keeps working.
+/// prompted for `idle_forge_minutes` while the agent keeps working. A forge that is
+/// still open after that long is re-announced instead.
 fn process_idle_check_with_notifier(
     env: &RuntimeEnv,
     agent: Agent,
@@ -398,6 +399,15 @@ fn process_idle_check_with_notifier(
         .last_forge_activity_at()?
         .is_some_and(|last| now - last < Duration::minutes(i64::from(idle_minutes)))
     {
+        return Ok(not_recommended);
+    }
+    if let Some(open) = store.latest_open_recommendation()? {
+        notifier(
+            config.preferences.desktop_notifications,
+            "Svarog",
+            &format!("Still waiting: {} {}", open.reps, open.display_name()),
+        );
+        store.mark_forge_reminded(now)?;
         return Ok(not_recommended);
     }
     ensure_exercise_pool(&store, &config)?;
@@ -1189,7 +1199,7 @@ mod tests {
         assert!(idle_check(&env, now));
         let store = Store::open(&env.paths.database_file).unwrap();
         assert_eq!(store.event_count().unwrap(), 0);
-        assert!(!idle_check(&env, now + chrono::Duration::minutes(31)));
+        assert!(!idle_check(&env, now + chrono::Duration::minutes(10)));
 
         skip_open_forge(&store);
         assert!(!idle_check(
@@ -1201,6 +1211,33 @@ mod tests {
             chrono::Utc::now() + chrono::Duration::minutes(31)
         ));
         assert_eq!(store.event_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn idle_check_reminds_about_an_unanswered_forge_once_per_interval() {
+        let env = idle_env(30);
+        let start = chrono::Utc::now();
+        assert!(idle_check(&env, start));
+        let reminders = std::cell::RefCell::new(Vec::new());
+        let notifier = |_: bool, _: &str, message: &str| {
+            reminders.borrow_mut().push(message.to_string());
+            true
+        };
+        let check = |now| {
+            process_idle_check_with_notifier(&env, Agent::Claude, None, now, &notifier)
+                .unwrap()
+                .recommended
+        };
+
+        assert!(!check(start + chrono::Duration::minutes(10)));
+        assert!(reminders.borrow().is_empty());
+        assert!(!check(start + chrono::Duration::minutes(31)));
+        assert_eq!(reminders.borrow().len(), 1);
+        assert!(reminders.borrow()[0].starts_with("Still waiting: "));
+        assert!(!check(start + chrono::Duration::minutes(45)));
+        assert_eq!(reminders.borrow().len(), 1);
+        assert!(!check(start + chrono::Duration::minutes(62)));
+        assert_eq!(reminders.borrow().len(), 2);
     }
 
     #[test]
