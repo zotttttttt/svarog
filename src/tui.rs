@@ -325,7 +325,7 @@ fn settings_row_order(settings: &SettingsState) -> Vec<usize> {
     if settings.draft.recommender.backend == RecommenderBackend::OpenaiKeyring {
         rows.push(15);
     }
-    rows.extend([2, 18, 3, 17]);
+    rows.extend([2, 18, 3, 17, 19]);
     rows.extend(4..15);
     rows.push(16);
     rows
@@ -2191,6 +2191,10 @@ fn settings_lines_with_notification_reason(
                 .map(CodingAgentSelection::label)
                 .unwrap_or_else(|| "not configured".to_string()),
         ),
+        (
+            "Idle forge",
+            idle_forge_label(settings.draft.preferences.idle_forge_minutes),
+        ),
     ];
     let mut lines = vec![
         with_demo(Line::from(Span::styled("Settings", text_bold())), demo),
@@ -2324,6 +2328,32 @@ fn forge_frequency_label(frequency: u32) -> String {
     }
 }
 
+fn idle_forge_label(minutes: u32) -> String {
+    if minutes == 0 {
+        "Off".to_string()
+    } else if config::IDLE_FORGE_PRESETS.contains(&minutes) {
+        format!("After {minutes} min of agent work")
+    } else {
+        format!("After {minutes} min of agent work (custom)")
+    }
+}
+
+fn next_idle_forge_preset(minutes: u32, forward: bool) -> u32 {
+    let presets = config::IDLE_FORGE_PRESETS;
+    if forward {
+        presets
+            .into_iter()
+            .find(|preset| *preset > minutes)
+            .unwrap_or(presets[presets.len() - 1])
+    } else {
+        presets
+            .into_iter()
+            .rev()
+            .find(|preset| *preset < minutes)
+            .unwrap_or(presets[0])
+    }
+}
+
 fn fitted_modal_lines(lines: Vec<Line<'static>>, height: usize) -> Vec<Line<'static>> {
     lines.into_iter().take(height.max(1)).collect()
 }
@@ -2372,6 +2402,7 @@ fn begin_setting_edit(settings: &mut SettingsState) {
             .coding_agent
             .map(CodingAgentSelection::label)
             .unwrap_or_default(),
+        19 => settings.draft.preferences.idle_forge_minutes.to_string(),
         _ => return,
     });
     settings.editing = true;
@@ -2735,6 +2766,22 @@ fn commit_setting_edit(settings: &mut SettingsState) -> Result<()> {
                     .map_err(anyhow::Error::msg)?,
             )
         }
+        19 => {
+            let minutes = value
+                .parse::<u32>()
+                .context("idle forge must be a whole number of minutes")?;
+            if minutes != 0
+                && !(config::MIN_IDLE_FORGE_MINUTES..=config::MAX_IDLE_FORGE_MINUTES)
+                    .contains(&minutes)
+            {
+                anyhow::bail!(
+                    "idle forge must be 0 (off) or {}-{} minutes",
+                    config::MIN_IDLE_FORGE_MINUTES,
+                    config::MAX_IDLE_FORGE_MINUTES
+                );
+            }
+            settings.draft.preferences.idle_forge_minutes = minutes;
+        }
         _ => {}
     }
     settings.editing = false;
@@ -3080,6 +3127,12 @@ fn handle_settings_key(
                             .saturating_sub(1)
                             .max(config::MIN_FORGE_FREQUENCY)
                     }
+                }
+                19 => {
+                    settings.draft.preferences.idle_forge_minutes = next_idle_forge_preset(
+                        settings.draft.preferences.idle_forge_minutes,
+                        forward,
+                    );
                 }
                 18 => {
                     settings.draft.agents.coding_agent = Some(
@@ -4421,6 +4474,51 @@ mod tests {
         let settings = ui.settings.as_ref().unwrap();
         assert_eq!(settings.draft.preferences.forge_frequency, 12);
         assert_eq!(forge_frequency_label(12), "Every 12 prompts");
+    }
+
+    #[test]
+    fn settings_idle_forge_cycles_presets_and_accepts_custom_minutes() {
+        let root = tempdir().unwrap().keep();
+        let env = test_env(root);
+        let mut settings = settings_state();
+        settings.row = 19;
+        let mut ui = TuiState {
+            settings: Some(settings),
+            ..TuiState::default()
+        };
+        let minutes = |ui: &TuiState| {
+            ui.settings
+                .as_ref()
+                .unwrap()
+                .draft
+                .preferences
+                .idle_forge_minutes
+        };
+
+        assert_eq!(minutes(&ui), 30);
+        handle_settings_key(&mut ui, KeyCode::Right, KeyModifiers::NONE, &env).unwrap();
+        assert_eq!(minutes(&ui), 45);
+        for _ in 0..5 {
+            handle_settings_key(&mut ui, KeyCode::Left, KeyModifiers::NONE, &env).unwrap();
+        }
+        assert_eq!(minutes(&ui), 0);
+        assert_eq!(idle_forge_label(0), "Off");
+
+        let settings = ui.settings.as_mut().unwrap();
+        begin_setting_edit(settings);
+        settings.edit_value = Zeroizing::new("20".into());
+        commit_setting_edit(settings).unwrap();
+        assert_eq!(minutes(&ui), 20);
+        assert_eq!(idle_forge_label(20), "After 20 min of agent work (custom)");
+        handle_settings_key(&mut ui, KeyCode::Right, KeyModifiers::NONE, &env).unwrap();
+        assert_eq!(minutes(&ui), 30);
+        assert_eq!(idle_forge_label(30), "After 30 min of agent work");
+
+        let settings = ui.settings.as_mut().unwrap();
+        begin_setting_edit(settings);
+        settings.edit_value = Zeroizing::new("2".into());
+        assert!(commit_setting_edit(settings).is_err());
+        assert_eq!(settings.draft.preferences.idle_forge_minutes, 30);
     }
 
     #[test]
