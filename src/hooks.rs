@@ -348,9 +348,10 @@ fn settings_path(env: &RuntimeEnv, agent: Agent) -> Result<PathBuf> {
     }
 }
 
-const HERMES_EVENTS: [(&str, u64); 4] = [
+const HERMES_EVENTS: [(&str, u64); 5] = [
     ("on_session_start", 5),
     ("pre_llm_call", 5),
+    ("post_tool_call", 2),
     ("on_session_end", 5),
     ("on_session_finalize", 3),
 ];
@@ -781,6 +782,7 @@ fn validate_hook_shape(root: &Value, path: &Path) -> Result<()> {
         "Stop",
         "SessionEnd",
         "PreToolUse",
+        "PostToolUse",
     ] {
         if hooks.get(event).is_some_and(|entries| !entries.is_array()) {
             bail!("{}.hooks.{event} must contain a JSON array", path.display());
@@ -975,6 +977,18 @@ fn ensure_svarog_hook(root: &mut Value, agent: Agent, script: &Path) {
         ("SessionEnd", "", 3),
     ] {
         ensure_agent_event_hook(hooks, agent, event, matcher, timeout, &command);
+    }
+    ensure_agent_event_hook(hooks, agent, "PostToolUse", "", 2, &command);
+    if let Some(hook) = hooks["PostToolUse"]
+        .as_array_mut()
+        .and_then(|entries| entries.last_mut())
+        .and_then(|entry| entry["hooks"][0].as_object_mut())
+    {
+        // Fires after every tool call; keep it silent and, where supported, off the critical path.
+        hook.remove("statusMessage");
+        if agent == Agent::Claude {
+            hook.insert("async".to_string(), json!(true));
+        }
     }
     remove_svarog_hook(hooks, agent, "PreToolUse");
 }
@@ -1173,6 +1187,11 @@ export default function (pi: ExtensionAPI) {{
     await deliver(payload(ctx, "UserPromptSubmit", turnId));
   }});
 
+  pi.on("tool_execution_end", (_event, ctx) => {{
+    const turnId = [...pendingTurns].pop();
+    void deliver(payload(ctx, "PostToolUse", turnId));
+  }});
+
   pi.on("agent_settled", async (_event, ctx) => {{
     await stopPending(ctx, "settled");
   }});
@@ -1235,6 +1254,7 @@ fn parse_lifecycle_payload(agent: Agent, input: &str) -> Result<LifecycleHookEve
     let hook_event_name = match event {
         "on_session_start" => "SessionStart",
         "pre_llm_call" => "UserPromptSubmit",
+        "post_tool_call" => "PostToolUse",
         "on_session_end" => "Stop",
         "on_session_finalize" => "SessionEnd",
         _ => bail!("unsupported Hermes lifecycle event"),
@@ -1335,6 +1355,13 @@ mod tests {
         assert_eq!(value["hooks"]["SessionEnd"][0]["hooks"][0]["timeout"], 3);
         assert_eq!(value["hooks"]["Stop"][1]["hooks"][0]["timeout"], 5);
         assert!(value["hooks"].get("PreToolUse").is_none());
+        let tool_hook = &value["hooks"]["PostToolUse"][0]["hooks"][0];
+        assert!(tool_hook["command"]
+            .as_str()
+            .unwrap()
+            .contains("codex-event.sh"));
+        assert!(tool_hook.get("async").is_none());
+        assert!(tool_hook.get("statusMessage").is_none());
         assert_eq!(
             fs::metadata(codex_home.join("hooks.json"))
                 .unwrap()
@@ -1516,6 +1543,7 @@ mod tests {
         let cases = [
             ("on_session_start", "SessionStart", None),
             ("pre_llm_call", "UserPromptSubmit", Some("turn-1")),
+            ("post_tool_call", "PostToolUse", Some("turn-1")),
             ("on_session_end", "Stop", Some("turn-1")),
             ("on_session_finalize", "SessionEnd", None),
         ];
@@ -1581,7 +1609,7 @@ mod tests {
             assert!(config.contains(event));
         }
         let allowlist: Value = serde_json::from_slice(&first_allowlist).unwrap();
-        assert_eq!(allowlist["approvals"].as_array().unwrap().len(), 5);
+        assert_eq!(allowlist["approvals"].as_array().unwrap().len(), 6);
         assert!(allowlist["approvals"]
             .as_array()
             .unwrap()
@@ -1817,12 +1845,17 @@ mod tests {
             "startup|resume|clear|compact|fork"
         );
         assert_eq!(claude["hooks"]["SessionEnd"][0]["hooks"][0]["timeout"], 3);
+        let claude_tool_hook = &claude["hooks"]["PostToolUse"][0];
+        assert!(claude_tool_hook.get("matcher").is_none());
+        assert_eq!(claude_tool_hook["hooks"][0]["async"], true);
+        assert!(claude_tool_hook["hooks"][0].get("statusMessage").is_none());
         let pi_path = env.pi_config_dir.join("extensions/svarog.ts");
         let pi = fs::read_to_string(&pi_path).unwrap();
         assert!(pi.starts_with(PI_EXTENSION_MARKER));
         for event in [
             "session_start",
             "before_agent_start",
+            "tool_execution_end",
             "agent_settled",
             "session_shutdown",
         ] {

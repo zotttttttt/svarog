@@ -326,7 +326,7 @@ impl LifecycleHookEvent {
         validate_optional_text("reason", self.reason.as_deref(), 1024)?;
         if !matches!(
             self.hook_event_name.as_str(),
-            "SessionStart" | "UserPromptSubmit" | "Stop" | "SessionEnd"
+            "SessionStart" | "UserPromptSubmit" | "PostToolUse" | "Stop" | "SessionEnd"
         ) {
             bail!("unsupported coding-agent lifecycle event");
         }
