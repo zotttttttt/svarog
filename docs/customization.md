@@ -23,6 +23,15 @@ notification behavior, recommender selection, timeouts, fallback behavior, and
 the Codex/OpenAI model configuration. Forge frequency defaults to every prompt
 and can be changed from Settings without repeating setup.
 
+Idle forge adds a forge when an agent keeps working through a long task. Every
+tool call the agent finishes is a check-in: if no forge has been shown or
+answered, and no prompt was sent, for the configured number of minutes, Svarog
+offers one. It never fires while agents are idle. Pick 15, 30, 45, or 60
+minutes or Off with ←/→ in Settings, or press Enter to type a custom value of
+5–480 minutes (`0` turns it off). It defaults to 30 minutes and is stored as
+`preferences.idle_forge_minutes`. The daily forge ceiling and fatigue pauses
+still apply.
+
 The `[agents]` section also accepts command overrides for tmux sessions. These
 are advanced settings rather than onboarding questions:
 
