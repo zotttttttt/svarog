@@ -1,4 +1,5 @@
 use crate::cli;
+use crate::clipboard;
 use crate::config::{
     self, CodingAgentSelection, Config, Forge, Paths, RecommenderBackend, RuntimeEnv, RuntimeMode,
     UnitSystem,
@@ -32,7 +33,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Terminal;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::Arc;
@@ -253,6 +254,7 @@ struct AddFuelState {
     focus: AddFuelFocus,
     input: String,
     cursor: usize,
+    images: Vec<FuelImage>,
     parsed: Option<FuelParseOutcome>,
     parsing: Option<FuelParseJob>,
     parsing_started_at: Option<Instant>,
@@ -267,6 +269,13 @@ struct AddFuelState {
     backend: RecommenderBackend,
     local_date: chrono::NaiveDate,
     feedback: Option<String>,
+}
+
+#[derive(Debug)]
+struct FuelImage {
+    path: PathBuf,
+    // Deletes a clipboard capture once the image is removed or saved.
+    _temp: Option<tempfile::TempPath>,
 }
 
 #[derive(Debug)]
@@ -1149,6 +1158,7 @@ fn open_add_fuel(env: &RuntimeEnv, store: &Store) -> Result<AddFuelState> {
         focus: AddFuelFocus::Meal,
         input: String::new(),
         cursor: 0,
+        images: Vec::new(),
         parsed: None,
         parsing: None,
         parsing_started_at: None,
@@ -1245,10 +1255,15 @@ fn start_fuel_parse(state: &mut AddFuelState, env: &RuntimeEnv) {
         return;
     }
     let input = state.input.trim().to_string();
-    if input.is_empty() {
-        state.feedback = Some("Describe a meal or drink first.".into());
+    if input.is_empty() && state.images.is_empty() {
+        state.feedback = Some("Describe a meal or drink, or paste a photo, first.".into());
         return;
     }
+    let images = state
+        .images
+        .iter()
+        .map(|image| image.path.clone())
+        .collect::<Vec<_>>();
     let paths = env.paths.clone();
     let config = match config::load_or_default(&paths) {
         Ok(config) => config,
@@ -1264,7 +1279,16 @@ fn start_fuel_parse(state: &mut AddFuelState, env: &RuntimeEnv) {
     let worker_cancel = cancel.clone();
     let worker = std::thread::spawn(move || {
         let result = Store::open(&paths.database_file)
-            .and_then(|store| fuel::parse_fuel(&store, &config, &paths, &input, worker_cancel))
+            .and_then(|store| {
+                fuel::parse_fuel_with_images(
+                    &store,
+                    &config,
+                    &paths,
+                    &input,
+                    &images,
+                    worker_cancel,
+                )
+            })
             .map_err(|error| format!("{error:#}"));
         let _ = sender.send((request_id, result));
     });
@@ -1283,9 +1307,11 @@ fn focus_scroll_hint(state: &AddFuelState, area_width: u16) -> usize {
         AddFuelFocus::Meal => 0,
         AddFuelFocus::Water => {
             3 + editor_visual_line_count(&state.input, editor_content_width(area_width))
+                + usize::from(!state.images.is_empty())
         }
         AddFuelFocus::Recent => {
             10 + editor_visual_line_count(&state.input, editor_content_width(area_width))
+                + usize::from(!state.images.is_empty())
                 + state.selected_recent
         }
     }
@@ -1294,7 +1320,7 @@ fn focus_scroll_hint(state: &AddFuelState, area_width: u16) -> usize {
 fn handle_add_fuel_key(
     ui: &mut TuiState,
     code: KeyCode,
-    _modifiers: KeyModifiers,
+    modifiers: KeyModifiers,
     env: &RuntimeEnv,
     store: &Store,
     area_width: u16,
@@ -1335,6 +1361,7 @@ fn handle_add_fuel_key(
                         state.parsed = None;
                         state.input.clear();
                         state.cursor = 0;
+                        state.images.clear();
                         state.recent = store.recent_fuel_entries(5).unwrap_or_default();
                         state.nutrition = store.nutrition_totals_today().unwrap_or_default();
                         state.selected_recent = 0;
@@ -1407,6 +1434,26 @@ fn handle_add_fuel_key(
             state.scroll = focus_scroll_hint(state, area_width);
         }
         KeyCode::Enter if state.focus == AddFuelFocus::Meal => start_fuel_parse(state, env),
+        // AltGr arrives as Ctrl+Alt on some layouts and must still type.
+        KeyCode::Char('v')
+            if state.focus == AddFuelFocus::Meal
+                && modifiers.contains(KeyModifiers::CONTROL)
+                && !modifiers.contains(KeyModifiers::ALT) =>
+        {
+            attach_clipboard_image(state);
+        }
+        KeyCode::Char(_)
+            if state.focus == AddFuelFocus::Meal
+                && modifiers.contains(KeyModifiers::CONTROL)
+                && !modifiers.contains(KeyModifiers::ALT) => {}
+        KeyCode::Backspace
+            if state.focus == AddFuelFocus::Meal
+                && state.input.is_empty()
+                && !state.images.is_empty() =>
+        {
+            state.images.pop();
+            state.feedback = None;
+        }
         KeyCode::Backspace if state.focus == AddFuelFocus::Meal => {
             backspace_at_cursor(&mut state.input, &mut state.cursor);
             keep_meal_cursor_visible(state, area_width, area_height);
@@ -1487,6 +1534,26 @@ fn handle_add_fuel_paste(ui: &mut TuiState, value: &str, area_width: u16, area_h
     {
         return;
     }
+    if value.trim().is_empty() {
+        // Some terminals send an empty paste when the clipboard holds only an image.
+        attach_clipboard_image(state);
+        return;
+    }
+    match clipboard::pasted_paths(value) {
+        clipboard::PastedPaths::Images(paths) => {
+            for path in paths {
+                if !attach_fuel_image(state, path, None) {
+                    break;
+                }
+            }
+            return;
+        }
+        clipboard::PastedPaths::Unsupported(path) => {
+            state.feedback = Some(unsupported_photo_message(&path));
+            return;
+        }
+        clipboard::PastedPaths::NotPaths => {}
+    }
     let normalized = value
         .replace("\r\n", "\n")
         .replace('\r', "\n")
@@ -1520,6 +1587,57 @@ fn handle_settings_paste(ui: &mut TuiState, value: &str) {
         &mut settings.edit_cursor,
         &accepted,
     );
+}
+
+fn unsupported_photo_message(path: &Path) -> String {
+    format!(
+        "{} is not a supported photo; use PNG, JPEG, HEIC, WebP, or GIF.",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    )
+}
+
+fn attach_clipboard_image(state: &mut AddFuelState) {
+    if state.images.len() >= fuel::MAX_FUEL_IMAGES {
+        state.feedback = Some(format!(
+            "A meal can have up to {} photos.",
+            fuel::MAX_FUEL_IMAGES
+        ));
+        return;
+    }
+    match clipboard::read_image() {
+        Ok(Some(clipboard::ClipboardImage::Temp(temp))) => {
+            attach_fuel_image(state, temp.to_path_buf(), Some(temp));
+        }
+        Ok(Some(clipboard::ClipboardImage::Files(paths))) => {
+            for path in paths {
+                if !attach_fuel_image(state, path, None) {
+                    break;
+                }
+            }
+        }
+        Ok(Some(clipboard::ClipboardImage::NotPhoto(path))) => {
+            state.feedback = Some(unsupported_photo_message(&path));
+        }
+        Ok(None) => state.feedback = Some("No image in the clipboard.".into()),
+        Err(error) => state.feedback = Some(format!("Could not read the clipboard: {error:#}")),
+    }
+}
+
+fn attach_fuel_image(
+    state: &mut AddFuelState,
+    path: PathBuf,
+    temp: Option<tempfile::TempPath>,
+) -> bool {
+    if state.images.len() >= fuel::MAX_FUEL_IMAGES {
+        state.feedback = Some(format!(
+            "A meal can have up to {} photos.",
+            fuel::MAX_FUEL_IMAGES
+        ));
+        return false;
+    }
+    state.images.push(FuelImage { path, _temp: temp });
+    state.feedback = None;
+    true
 }
 
 fn insert_fuel_text(state: &mut AddFuelState, value: &str) {
@@ -1572,6 +1690,20 @@ fn add_fuel_lines(
         Line::from(Span::styled("Meals or drinks", text_bold())),
     ];
     lines.extend(meal_editor_lines(state, area_width));
+    if !state.images.is_empty() {
+        let mut spans = (1..=state.images.len())
+            .map(|number| Span::styled(format!("[Photo #{number}] "), accent()))
+            .collect::<Vec<_>>();
+        spans.push(Span::styled(
+            format!(
+                "{}/{} · [backspace] Remove last",
+                state.images.len(),
+                fuel::MAX_FUEL_IMAGES
+            ),
+            muted(),
+        ));
+        lines.push(Line::from(spans));
+    }
     lines.extend([
         Line::from(Span::styled(
             if state.backend == RecommenderBackend::Local {
@@ -1582,7 +1714,7 @@ fn add_fuel_lines(
                 )
             } else {
                 format!(
-                    "[enter] Log that fuel · {}/{}",
+                    "[enter] Log that fuel · [ctrl+v] Add photo · {}/{}",
                     state.input.chars().count(),
                     fuel::MAX_FUEL_INPUT_CHARS
                 )
@@ -1650,7 +1782,11 @@ fn add_fuel_lines(
             .unwrap_or(0);
         lines.push(queue_regeneration_loader_line(frame));
         lines.push(Line::from(Span::styled(
-            "Estimating nutrition with Luna…  [esc] Cancel",
+            if state.images.is_empty() {
+                "Estimating nutrition with Luna…  [esc] Cancel"
+            } else {
+                "Reading photos and estimating nutrition with Luna…  [esc] Cancel"
+            },
             muted(),
         )));
     } else if state.confirming_delete {
@@ -4316,6 +4452,7 @@ mod tests {
             focus: AddFuelFocus::Meal,
             input: String::new(),
             cursor: 0,
+            images: Vec::new(),
             parsed: None,
             parsing: None,
             parsing_started_at: None,
@@ -6545,6 +6682,7 @@ mod tests {
             focus: AddFuelFocus::Water,
             input: "coffee with milk".into(),
             cursor: 16,
+            images: Vec::new(),
             parsed: None,
             parsing: None,
             parsing_started_at: None,
@@ -6576,7 +6714,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(rendered.contains("coffee with milk"));
-        assert!(rendered.contains("[enter] Log that fuel · 16/2000"));
+        assert!(rendered.contains("[enter] Log that fuel · [ctrl+v] Add photo · 16/2000"));
         assert!(rendered.contains("200 ml  [+/-] 200 ml"));
         assert!(rendered.contains("Today’s fuel\n120 kcal · P 3.0g · C 14.0g · F 5.0g · S 8.0g"));
         assert!(rendered.contains("Recent fuel"));
@@ -6741,6 +6879,133 @@ mod tests {
                 .contains("needs Codex or an OpenAI backend"));
             assert_eq!(ui.add_fuel.as_ref().unwrap().input, "meal");
         }
+    }
+
+    #[test]
+    fn add_fuel_paste_attaches_dropped_photos_instead_of_text() {
+        let root = tempdir().unwrap();
+        let photo = root.path().join("my lunch.png");
+        std::fs::write(&photo, "x").unwrap();
+        let mut ui = TuiState {
+            add_fuel: Some(add_fuel_state_for_test()),
+            ..TuiState::default()
+        };
+
+        let dropped = photo.display().to_string().replace(' ', "\\ ");
+        handle_add_fuel_paste(&mut ui, &dropped, 80, 24);
+
+        let state = ui.add_fuel.as_ref().unwrap();
+        assert!(state.input.is_empty());
+        assert_eq!(state.images.len(), 1);
+        assert_eq!(state.images[0].path, photo);
+        let rendered = add_fuel_lines(state, false, 80, 24)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("[Photo #1]"));
+        assert!(rendered.contains("1/10"));
+
+        let notes = root.path().join("notes.txt");
+        std::fs::write(&notes, "x").unwrap();
+        handle_add_fuel_paste(&mut ui, &notes.display().to_string(), 80, 24);
+        let state = ui.add_fuel.as_ref().unwrap();
+        assert_eq!(state.images.len(), 1);
+        assert!(state.input.is_empty());
+        assert!(state
+            .feedback
+            .as_deref()
+            .unwrap()
+            .contains("not a supported photo"));
+    }
+
+    #[test]
+    fn add_fuel_caps_photos_and_backspace_removes_the_last_one() {
+        let root = tempdir().unwrap().keep();
+        let env = test_env(root.clone());
+        let store = Store::open(&root.join("svarog.sqlite3")).unwrap();
+        let mut paths = Vec::new();
+        for index in 0..=fuel::MAX_FUEL_IMAGES {
+            let photo = root.join(format!("photo-{index}.jpg"));
+            std::fs::write(&photo, "x").unwrap();
+            paths.push(photo.display().to_string());
+        }
+        let mut ui = TuiState {
+            add_fuel: Some(add_fuel_state_for_test()),
+            ..TuiState::default()
+        };
+
+        handle_add_fuel_paste(&mut ui, &paths.join("\n"), 80, 24);
+
+        let state = ui.add_fuel.as_ref().unwrap();
+        assert_eq!(state.images.len(), fuel::MAX_FUEL_IMAGES);
+        assert!(state
+            .feedback
+            .as_deref()
+            .unwrap()
+            .contains("up to 10 photos"));
+
+        handle_add_fuel_key(
+            &mut ui,
+            KeyCode::Backspace,
+            KeyModifiers::NONE,
+            &env,
+            &store,
+            80,
+            24,
+        );
+        assert_eq!(
+            ui.add_fuel.as_ref().unwrap().images.len(),
+            fuel::MAX_FUEL_IMAGES - 1
+        );
+    }
+
+    #[test]
+    fn add_fuel_photos_alone_can_be_submitted_and_ctrl_keys_do_not_type() {
+        let root = tempdir().unwrap().keep();
+        let env = test_env(root.clone());
+        let store = Store::open(&root.join("svarog.sqlite3")).unwrap();
+        let photo = root.join("plate.png");
+        std::fs::write(&photo, "x").unwrap();
+        let mut state = add_fuel_state_for_test();
+        state.backend = RecommenderBackend::Local;
+        state.images.push(FuelImage {
+            path: photo,
+            _temp: None,
+        });
+        let mut ui = TuiState {
+            add_fuel: Some(state),
+            ..TuiState::default()
+        };
+
+        handle_add_fuel_key(
+            &mut ui,
+            KeyCode::Char('x'),
+            KeyModifiers::CONTROL,
+            &env,
+            &store,
+            80,
+            24,
+        );
+        assert!(ui.add_fuel.as_ref().unwrap().input.is_empty());
+
+        handle_add_fuel_key(
+            &mut ui,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+            &env,
+            &store,
+            80,
+            24,
+        );
+        assert!(ui
+            .add_fuel
+            .as_ref()
+            .unwrap()
+            .feedback
+            .as_deref()
+            .unwrap()
+            .contains("needs Codex or an OpenAI backend"));
     }
 
     #[test]
