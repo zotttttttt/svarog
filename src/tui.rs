@@ -1,4 +1,5 @@
 use crate::cli;
+use crate::clipboard;
 use crate::config::{
     self, CodingAgentSelection, Config, Forge, Paths, RecommenderBackend, RuntimeEnv, RuntimeMode,
     UnitSystem,
@@ -32,7 +33,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Terminal;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::Arc;
@@ -253,6 +254,7 @@ struct AddFuelState {
     focus: AddFuelFocus,
     input: String,
     cursor: usize,
+    images: Vec<FuelImage>,
     parsed: Option<FuelParseOutcome>,
     parsing: Option<FuelParseJob>,
     parsing_started_at: Option<Instant>,
@@ -267,6 +269,13 @@ struct AddFuelState {
     backend: RecommenderBackend,
     local_date: chrono::NaiveDate,
     feedback: Option<String>,
+}
+
+#[derive(Debug)]
+struct FuelImage {
+    path: PathBuf,
+    // Deletes a clipboard capture once the image is removed or saved.
+    _temp: Option<tempfile::TempPath>,
 }
 
 #[derive(Debug)]
@@ -317,17 +326,17 @@ impl std::fmt::Debug for SettingsState {
     }
 }
 
-const SETTINGS_ROWS: usize = 19;
+const SETTINGS_ROWS: usize = 18;
 
 fn settings_row_order(settings: &SettingsState) -> Vec<usize> {
     let mut rows = Vec::with_capacity(SETTINGS_ROWS);
     rows.extend([0, 1]);
     if settings.draft.recommender.backend == RecommenderBackend::OpenaiKeyring {
-        rows.push(15);
+        rows.push(13);
     }
-    rows.extend([2, 18, 3, 17, 19]);
-    rows.extend(4..15);
-    rows.push(16);
+    rows.extend([2, 16, 3, 15, 17]);
+    rows.extend(4..13);
+    rows.push(14);
     rows
 }
 
@@ -1149,6 +1158,7 @@ fn open_add_fuel(env: &RuntimeEnv, store: &Store) -> Result<AddFuelState> {
         focus: AddFuelFocus::Meal,
         input: String::new(),
         cursor: 0,
+        images: Vec::new(),
         parsed: None,
         parsing: None,
         parsing_started_at: None,
@@ -1245,10 +1255,15 @@ fn start_fuel_parse(state: &mut AddFuelState, env: &RuntimeEnv) {
         return;
     }
     let input = state.input.trim().to_string();
-    if input.is_empty() {
-        state.feedback = Some("Describe a meal or drink first.".into());
+    if input.is_empty() && state.images.is_empty() {
+        state.feedback = Some("Describe a meal or drink, or paste a photo, first.".into());
         return;
     }
+    let images = state
+        .images
+        .iter()
+        .map(|image| image.path.clone())
+        .collect::<Vec<_>>();
     let paths = env.paths.clone();
     let config = match config::load_or_default(&paths) {
         Ok(config) => config,
@@ -1264,7 +1279,16 @@ fn start_fuel_parse(state: &mut AddFuelState, env: &RuntimeEnv) {
     let worker_cancel = cancel.clone();
     let worker = std::thread::spawn(move || {
         let result = Store::open(&paths.database_file)
-            .and_then(|store| fuel::parse_fuel(&store, &config, &paths, &input, worker_cancel))
+            .and_then(|store| {
+                fuel::parse_fuel_with_images(
+                    &store,
+                    &config,
+                    &paths,
+                    &input,
+                    &images,
+                    worker_cancel,
+                )
+            })
             .map_err(|error| format!("{error:#}"));
         let _ = sender.send((request_id, result));
     });
@@ -1283,9 +1307,11 @@ fn focus_scroll_hint(state: &AddFuelState, area_width: u16) -> usize {
         AddFuelFocus::Meal => 0,
         AddFuelFocus::Water => {
             3 + editor_visual_line_count(&state.input, editor_content_width(area_width))
+                + usize::from(!state.images.is_empty())
         }
         AddFuelFocus::Recent => {
             10 + editor_visual_line_count(&state.input, editor_content_width(area_width))
+                + usize::from(!state.images.is_empty())
                 + state.selected_recent
         }
     }
@@ -1294,7 +1320,7 @@ fn focus_scroll_hint(state: &AddFuelState, area_width: u16) -> usize {
 fn handle_add_fuel_key(
     ui: &mut TuiState,
     code: KeyCode,
-    _modifiers: KeyModifiers,
+    modifiers: KeyModifiers,
     env: &RuntimeEnv,
     store: &Store,
     area_width: u16,
@@ -1335,6 +1361,7 @@ fn handle_add_fuel_key(
                         state.parsed = None;
                         state.input.clear();
                         state.cursor = 0;
+                        state.images.clear();
                         state.recent = store.recent_fuel_entries(5).unwrap_or_default();
                         state.nutrition = store.nutrition_totals_today().unwrap_or_default();
                         state.selected_recent = 0;
@@ -1407,6 +1434,26 @@ fn handle_add_fuel_key(
             state.scroll = focus_scroll_hint(state, area_width);
         }
         KeyCode::Enter if state.focus == AddFuelFocus::Meal => start_fuel_parse(state, env),
+        // AltGr arrives as Ctrl+Alt on some layouts and must still type.
+        KeyCode::Char('v')
+            if state.focus == AddFuelFocus::Meal
+                && modifiers.contains(KeyModifiers::CONTROL)
+                && !modifiers.contains(KeyModifiers::ALT) =>
+        {
+            attach_clipboard_image(state);
+        }
+        KeyCode::Char(_)
+            if state.focus == AddFuelFocus::Meal
+                && modifiers.contains(KeyModifiers::CONTROL)
+                && !modifiers.contains(KeyModifiers::ALT) => {}
+        KeyCode::Backspace
+            if state.focus == AddFuelFocus::Meal
+                && state.input.is_empty()
+                && !state.images.is_empty() =>
+        {
+            state.images.pop();
+            state.feedback = None;
+        }
         KeyCode::Backspace if state.focus == AddFuelFocus::Meal => {
             backspace_at_cursor(&mut state.input, &mut state.cursor);
             keep_meal_cursor_visible(state, area_width, area_height);
@@ -1487,6 +1534,26 @@ fn handle_add_fuel_paste(ui: &mut TuiState, value: &str, area_width: u16, area_h
     {
         return;
     }
+    if value.trim().is_empty() {
+        // Some terminals send an empty paste when the clipboard holds only an image.
+        attach_clipboard_image(state);
+        return;
+    }
+    match clipboard::pasted_paths(value) {
+        clipboard::PastedPaths::Images(paths) => {
+            for path in paths {
+                if !attach_fuel_image(state, path, None) {
+                    break;
+                }
+            }
+            return;
+        }
+        clipboard::PastedPaths::Unsupported(path) => {
+            state.feedback = Some(unsupported_photo_message(&path));
+            return;
+        }
+        clipboard::PastedPaths::NotPaths => {}
+    }
     let normalized = value
         .replace("\r\n", "\n")
         .replace('\r', "\n")
@@ -1520,6 +1587,57 @@ fn handle_settings_paste(ui: &mut TuiState, value: &str) {
         &mut settings.edit_cursor,
         &accepted,
     );
+}
+
+fn unsupported_photo_message(path: &Path) -> String {
+    format!(
+        "{} is not a supported photo; use PNG, JPEG, HEIC, WebP, or GIF.",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    )
+}
+
+fn attach_clipboard_image(state: &mut AddFuelState) {
+    if state.images.len() >= fuel::MAX_FUEL_IMAGES {
+        state.feedback = Some(format!(
+            "A meal can have up to {} photos.",
+            fuel::MAX_FUEL_IMAGES
+        ));
+        return;
+    }
+    match clipboard::read_image() {
+        Ok(Some(clipboard::ClipboardImage::Temp(temp))) => {
+            attach_fuel_image(state, temp.to_path_buf(), Some(temp));
+        }
+        Ok(Some(clipboard::ClipboardImage::Files(paths))) => {
+            for path in paths {
+                if !attach_fuel_image(state, path, None) {
+                    break;
+                }
+            }
+        }
+        Ok(Some(clipboard::ClipboardImage::NotPhoto(path))) => {
+            state.feedback = Some(unsupported_photo_message(&path));
+        }
+        Ok(None) => state.feedback = Some("No image in the clipboard.".into()),
+        Err(error) => state.feedback = Some(format!("Could not read the clipboard: {error:#}")),
+    }
+}
+
+fn attach_fuel_image(
+    state: &mut AddFuelState,
+    path: PathBuf,
+    temp: Option<tempfile::TempPath>,
+) -> bool {
+    if state.images.len() >= fuel::MAX_FUEL_IMAGES {
+        state.feedback = Some(format!(
+            "A meal can have up to {} photos.",
+            fuel::MAX_FUEL_IMAGES
+        ));
+        return false;
+    }
+    state.images.push(FuelImage { path, _temp: temp });
+    state.feedback = None;
+    true
 }
 
 fn insert_fuel_text(state: &mut AddFuelState, value: &str) {
@@ -1572,6 +1690,20 @@ fn add_fuel_lines(
         Line::from(Span::styled("Meals or drinks", text_bold())),
     ];
     lines.extend(meal_editor_lines(state, area_width));
+    if !state.images.is_empty() {
+        let mut spans = (1..=state.images.len())
+            .map(|number| Span::styled(format!("[Photo #{number}] "), accent()))
+            .collect::<Vec<_>>();
+        spans.push(Span::styled(
+            format!(
+                "{}/{} · [backspace] Remove last",
+                state.images.len(),
+                fuel::MAX_FUEL_IMAGES
+            ),
+            muted(),
+        ));
+        lines.push(Line::from(spans));
+    }
     lines.extend([
         Line::from(Span::styled(
             if state.backend == RecommenderBackend::Local {
@@ -1582,7 +1714,7 @@ fn add_fuel_lines(
                 )
             } else {
                 format!(
-                    "[enter] Log that fuel · {}/{}",
+                    "[enter] Log that fuel · [ctrl+v] Add photo · {}/{}",
                     state.input.chars().count(),
                     fuel::MAX_FUEL_INPUT_CHARS
                 )
@@ -1650,7 +1782,11 @@ fn add_fuel_lines(
             .unwrap_or(0);
         lines.push(queue_regeneration_loader_line(frame));
         lines.push(Line::from(Span::styled(
-            "Estimating nutrition with Luna…  [esc] Cancel",
+            if state.images.is_empty() {
+                "Estimating nutrition with Luna…  [esc] Cancel"
+            } else {
+                "Reading photos and estimating nutrition with Luna…  [esc] Cancel"
+            },
             muted(),
         )));
     } else if state.confirming_delete {
@@ -2139,18 +2275,13 @@ fn settings_lines_with_notification_reason(
         ),
         ("Goals", profile.goals.join(", ")),
         ("Equipment", profile.equipment_text.clone()),
-        ("Work position", profile.work_setup.clone()),
         (
-            "Arm availability",
-            if profile.one_hand_available {
-                "alternate arms".into()
+            "One-sided exercises",
+            if profile.alternate_sides {
+                "alternate sessions".into()
             } else {
-                "both hands".into()
+                "both sides at once".into()
             },
-        ),
-        (
-            "Cautious body parts",
-            profile.cautious_body_parts.join(", "),
         ),
         ("Injuries / limitations", profile.injuries.join(", ")),
         ("Exercise preferences", profile.exercise_preferences.clone()),
@@ -2267,7 +2398,7 @@ fn settings_lines_with_notification_reason(
             Line::from(Span::styled("[enter/y] Remove key  [esc] Cancel", muted())),
         ]);
     } else if settings.editing {
-        let displayed_edit_value = if settings.row == 15 {
+        let displayed_edit_value = if settings.row == 13 {
             "•".repeat(settings.edit_value.chars().count())
         } else {
             settings.edit_value.to_string()
@@ -2287,7 +2418,7 @@ fn settings_lines_with_notification_reason(
                 accent(),
             )),
             Line::from(Span::styled(
-                if settings.row == 15 {
+                if settings.row == 13 {
                     "[enter] Save key  [esc] Cancel edit"
                 } else {
                     "[enter] Set field  [esc] Cancel edit"
@@ -2392,17 +2523,16 @@ fn begin_setting_edit(settings: &mut SettingsState) {
             .unwrap_or_default(),
         8 => settings.draft.profile.goals.join(", "),
         9 => settings.draft.profile.equipment_text.clone(),
-        12 => settings.draft.profile.cautious_body_parts.join(", "),
-        13 => settings.draft.profile.injuries.join(", "),
-        14 => settings.draft.profile.exercise_preferences.clone(),
-        15 => String::new(),
-        18 => settings
+        11 => settings.draft.profile.injuries.join(", "),
+        12 => settings.draft.profile.exercise_preferences.clone(),
+        13 => String::new(),
+        16 => settings
             .draft
             .agents
             .coding_agent
             .map(CodingAgentSelection::label)
             .unwrap_or_default(),
-        19 => settings.draft.preferences.idle_forge_minutes.to_string(),
+        17 => settings.draft.preferences.idle_forge_minutes.to_string(),
         _ => return,
     });
     settings.editing = true;
@@ -2750,23 +2880,22 @@ fn commit_setting_edit(settings: &mut SettingsState) -> Result<()> {
                 value.into()
             }
         }
-        12 => settings.draft.profile.cautious_body_parts = comma_list(value),
-        13 => settings.draft.profile.injuries = comma_list(value),
-        14 => {
+        11 => settings.draft.profile.injuries = comma_list(value),
+        12 => {
             settings.draft.profile.exercise_preferences = if value.is_empty() {
                 "automatic".into()
             } else {
                 value.into()
             }
         }
-        18 => {
+        16 => {
             settings.draft.agents.coding_agent = Some(
                 value
                     .parse::<CodingAgentSelection>()
                     .map_err(anyhow::Error::msg)?,
             )
         }
-        19 => {
+        17 => {
             let minutes = value
                 .parse::<u32>()
                 .context("idle forge must be a whole number of minutes")?;
@@ -2830,15 +2959,16 @@ fn remove_saved_openai_key_with(
     Ok(())
 }
 
-/// Applies Settings synchronously. Changing the recommender backend is the only
-/// Settings change that replaces the future-forge queue; all other changes keep
-/// compatible queued work in place.
+/// Applies Settings synchronously. Changing the recommender backend or the
+/// alternate-sides preference replaces the future-forge queue, because queued
+/// sides would no longer match; all other changes keep compatible queued work.
 fn apply_settings(
     env: &RuntimeEnv,
     draft: &Config,
 ) -> Result<Option<Receiver<QueueRegenerationResult>>> {
     let previous = config::load_or_default(&env.paths)?;
-    let recommender_changed = previous.recommender.backend != draft.recommender.backend;
+    let regenerate_queue = previous.recommender.backend != draft.recommender.backend
+        || previous.profile.alternate_sides != draft.profile.alternate_sides;
     let agent_changed = previous.agents.coding_agent != draft.agents.coding_agent;
     if agent_changed {
         let selection = draft
@@ -2886,7 +3016,7 @@ fn apply_settings(
             )),
         };
     }
-    Ok(recommender_changed.then(|| daemon::regenerate_queue_after_settings(env)))
+    Ok(regenerate_queue.then(|| daemon::regenerate_queue_after_settings(env)))
 }
 
 fn handle_settings_key(
@@ -3007,7 +3137,7 @@ fn handle_settings_key(
                 settings.edit_value = Zeroizing::new(String::new());
             }
             KeyCode::Enter => {
-                if settings.row == 15 {
+                if settings.row == 13 {
                     if save_openai_key_edit(settings, &env.paths)? {
                         ui.saved_openai_key_available = Some(true);
                     }
@@ -3071,7 +3201,7 @@ fn handle_settings_key(
         }
         KeyCode::Up => move_settings_focus(settings, false),
         KeyCode::Down => move_settings_focus(settings, true),
-        KeyCode::Delete if settings.row == 15 && settings.saved_openai_key_present => {
+        KeyCode::Delete if settings.row == 13 && settings.saved_openai_key_present => {
             settings.confirming_openai_key_delete = true;
             settings.error = None;
         }
@@ -3111,7 +3241,7 @@ fn handle_settings_key(
                             .max(1)
                     }
                 }
-                17 => {
+                15 => {
                     settings.draft.preferences.forge_frequency = if forward {
                         settings
                             .draft
@@ -3128,13 +3258,13 @@ fn handle_settings_key(
                             .max(config::MIN_FORGE_FREQUENCY)
                     }
                 }
-                19 => {
+                17 => {
                     settings.draft.preferences.idle_forge_minutes = next_idle_forge_preset(
                         settings.draft.preferences.idle_forge_minutes,
                         forward,
                     );
                 }
-                18 => {
+                16 => {
                     settings.draft.agents.coding_agent = Some(
                         settings
                             .draft
@@ -3160,18 +3290,8 @@ fn handle_settings_key(
                 }
                 5..=7 => adjust_measurement(settings, forward),
                 10 => {
-                    settings.draft.profile.work_setup =
-                        if settings.draft.profile.work_setup == "sitting" {
-                            "standing".into()
-                        } else {
-                            "sitting".into()
-                        }
-                }
-                11 => {
-                    settings.draft.profile.one_hand_available =
-                        !settings.draft.profile.one_hand_available;
-                    settings.draft.profile.two_hand_available =
-                        !settings.draft.profile.one_hand_available;
+                    settings.draft.profile.alternate_sides =
+                        !settings.draft.profile.alternate_sides;
                 }
                 _ => {}
             }
@@ -3180,7 +3300,7 @@ fn handle_settings_key(
             settings.archetype_original = Some(settings.draft.forge.clone());
             settings.selecting_archetype = true;
         }
-        KeyCode::Enter if settings.row == 16 => {
+        KeyCode::Enter if settings.row == 14 => {
             settings.error = None;
             if settings.development || settings.available_update.is_some() {
                 settings.confirming_update = true;
@@ -4385,6 +4505,7 @@ mod tests {
             focus: AddFuelFocus::Meal,
             input: String::new(),
             cursor: 0,
+            images: Vec::new(),
             parsed: None,
             parsing: None,
             parsing_started_at: None,
@@ -4452,7 +4573,7 @@ mod tests {
         let root = tempdir().unwrap().keep();
         let env = test_env(root);
         let mut settings = settings_state();
-        settings.row = 17;
+        settings.row = 15;
         let mut ui = TuiState {
             settings: Some(settings),
             ..TuiState::default()
@@ -4481,7 +4602,7 @@ mod tests {
         let root = tempdir().unwrap().keep();
         let env = test_env(root);
         let mut settings = settings_state();
-        settings.row = 19;
+        settings.row = 17;
         let mut ui = TuiState {
             settings: Some(settings),
             ..TuiState::default()
@@ -4526,7 +4647,7 @@ mod tests {
         let root = tempdir().unwrap();
         let env = test_env(root.path().to_path_buf());
         let mut settings = settings_state();
-        settings.row = 16;
+        settings.row = 14;
         settings.development = true;
         let rendered = settings_lines(&settings, false, 120, 40)
             .into_iter()
@@ -4562,7 +4683,7 @@ mod tests {
             })))
             .unwrap();
         let mut settings = settings_state();
-        settings.row = 16;
+        settings.row = 14;
         settings.update_check = Some(receiver);
         settings.update_status = Some("Checking for updates…".into());
         let mut ui = TuiState {
@@ -4619,7 +4740,7 @@ mod tests {
         let env = test_env(root.path().to_path_buf());
         let (_sender, receiver) = std::sync::mpsc::channel();
         let mut settings = settings_state();
-        settings.row = 16;
+        settings.row = 14;
         let mut ui = TuiState {
             settings: Some(settings),
             scheduled_update_check: Some(receiver),
@@ -4700,7 +4821,7 @@ mod tests {
 
         settings.row = 1;
         move_settings_focus(&mut settings, true);
-        assert_eq!(settings.row, 15);
+        assert_eq!(settings.row, 13);
         move_settings_focus(&mut settings, true);
         assert_eq!(settings.row, 2);
 
@@ -4815,7 +4936,7 @@ mod tests {
     fn saved_openai_key_editor_masks_and_saves_the_secret_immediately() {
         let mut settings = settings_state();
         settings.draft.recommender.backend = RecommenderBackend::OpenaiKeyring;
-        settings.row = 15;
+        settings.row = 13;
         begin_setting_edit(&mut settings);
         settings.edit_value = Zeroizing::new("sk-never-render-this".into());
         settings.edit_cursor = settings.edit_value.chars().count();
@@ -4850,7 +4971,7 @@ mod tests {
         let env = test_env(root);
         let mut settings = settings_state();
         settings.draft.recommender.backend = RecommenderBackend::OpenaiKeyring;
-        settings.row = 15;
+        settings.row = 13;
         settings.saved_openai_key_present = true;
         let mut ui = TuiState {
             settings: Some(settings),
@@ -4895,7 +5016,7 @@ mod tests {
     #[test]
     fn credential_store_failures_preserve_safe_retry_state() {
         let mut saving = settings_state();
-        saving.row = 15;
+        saving.row = 13;
         begin_setting_edit(&mut saving);
         saving.edit_value = Zeroizing::new("sk-retry-secret".into());
         saving.edit_cursor = saving.edit_value.chars().count();
@@ -4971,7 +5092,7 @@ mod tests {
             .join("\n");
         assert!(top.contains("› Forge archetype"));
 
-        settings.row = 14;
+        settings.row = 12;
         let bottom = settings_lines(&settings, false, 60, 10)
             .into_iter()
             .map(|line| line.to_string())
@@ -5257,6 +5378,22 @@ mod tests {
         let receiver = apply_settings(&env, &Config::default()).unwrap();
         assert!(receiver
             .expect("backend changes should regenerate future forges")
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .is_ok());
+    }
+
+    #[test]
+    fn settings_apply_with_alternate_sides_change_regenerates_queue() {
+        let root = tempdir().unwrap().keep();
+        let env = test_env(root);
+        config::save(&env.paths, &Config::default()).unwrap();
+        let mut draft = Config::default();
+        draft.profile.alternate_sides = false;
+
+        let receiver = apply_settings(&env, &draft).unwrap();
+        assert!(receiver
+            .expect("alternate-sides changes should regenerate future forges")
             .recv_timeout(Duration::from_secs(5))
             .unwrap()
             .is_ok());
@@ -6643,6 +6780,7 @@ mod tests {
             focus: AddFuelFocus::Water,
             input: "coffee with milk".into(),
             cursor: 16,
+            images: Vec::new(),
             parsed: None,
             parsing: None,
             parsing_started_at: None,
@@ -6674,7 +6812,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(rendered.contains("coffee with milk"));
-        assert!(rendered.contains("[enter] Log that fuel · 16/2000"));
+        assert!(rendered.contains("[enter] Log that fuel · [ctrl+v] Add photo · 16/2000"));
         assert!(rendered.contains("200 ml  [+/-] 200 ml"));
         assert!(rendered.contains("Today’s fuel\n120 kcal · P 3.0g · C 14.0g · F 5.0g · S 8.0g"));
         assert!(rendered.contains("Recent fuel"));
@@ -6842,6 +6980,133 @@ mod tests {
     }
 
     #[test]
+    fn add_fuel_paste_attaches_dropped_photos_instead_of_text() {
+        let root = tempdir().unwrap();
+        let photo = root.path().join("my lunch.png");
+        std::fs::write(&photo, "x").unwrap();
+        let mut ui = TuiState {
+            add_fuel: Some(add_fuel_state_for_test()),
+            ..TuiState::default()
+        };
+
+        let dropped = photo.display().to_string().replace(' ', "\\ ");
+        handle_add_fuel_paste(&mut ui, &dropped, 80, 24);
+
+        let state = ui.add_fuel.as_ref().unwrap();
+        assert!(state.input.is_empty());
+        assert_eq!(state.images.len(), 1);
+        assert_eq!(state.images[0].path, photo);
+        let rendered = add_fuel_lines(state, false, 80, 24)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("[Photo #1]"));
+        assert!(rendered.contains("1/10"));
+
+        let notes = root.path().join("notes.txt");
+        std::fs::write(&notes, "x").unwrap();
+        handle_add_fuel_paste(&mut ui, &notes.display().to_string(), 80, 24);
+        let state = ui.add_fuel.as_ref().unwrap();
+        assert_eq!(state.images.len(), 1);
+        assert!(state.input.is_empty());
+        assert!(state
+            .feedback
+            .as_deref()
+            .unwrap()
+            .contains("not a supported photo"));
+    }
+
+    #[test]
+    fn add_fuel_caps_photos_and_backspace_removes_the_last_one() {
+        let root = tempdir().unwrap().keep();
+        let env = test_env(root.clone());
+        let store = Store::open(&root.join("svarog.sqlite3")).unwrap();
+        let mut paths = Vec::new();
+        for index in 0..=fuel::MAX_FUEL_IMAGES {
+            let photo = root.join(format!("photo-{index}.jpg"));
+            std::fs::write(&photo, "x").unwrap();
+            paths.push(photo.display().to_string());
+        }
+        let mut ui = TuiState {
+            add_fuel: Some(add_fuel_state_for_test()),
+            ..TuiState::default()
+        };
+
+        handle_add_fuel_paste(&mut ui, &paths.join("\n"), 80, 24);
+
+        let state = ui.add_fuel.as_ref().unwrap();
+        assert_eq!(state.images.len(), fuel::MAX_FUEL_IMAGES);
+        assert!(state
+            .feedback
+            .as_deref()
+            .unwrap()
+            .contains("up to 10 photos"));
+
+        handle_add_fuel_key(
+            &mut ui,
+            KeyCode::Backspace,
+            KeyModifiers::NONE,
+            &env,
+            &store,
+            80,
+            24,
+        );
+        assert_eq!(
+            ui.add_fuel.as_ref().unwrap().images.len(),
+            fuel::MAX_FUEL_IMAGES - 1
+        );
+    }
+
+    #[test]
+    fn add_fuel_photos_alone_can_be_submitted_and_ctrl_keys_do_not_type() {
+        let root = tempdir().unwrap().keep();
+        let env = test_env(root.clone());
+        let store = Store::open(&root.join("svarog.sqlite3")).unwrap();
+        let photo = root.join("plate.png");
+        std::fs::write(&photo, "x").unwrap();
+        let mut state = add_fuel_state_for_test();
+        state.backend = RecommenderBackend::Local;
+        state.images.push(FuelImage {
+            path: photo,
+            _temp: None,
+        });
+        let mut ui = TuiState {
+            add_fuel: Some(state),
+            ..TuiState::default()
+        };
+
+        handle_add_fuel_key(
+            &mut ui,
+            KeyCode::Char('x'),
+            KeyModifiers::CONTROL,
+            &env,
+            &store,
+            80,
+            24,
+        );
+        assert!(ui.add_fuel.as_ref().unwrap().input.is_empty());
+
+        handle_add_fuel_key(
+            &mut ui,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+            &env,
+            &store,
+            80,
+            24,
+        );
+        assert!(ui
+            .add_fuel
+            .as_ref()
+            .unwrap()
+            .feedback
+            .as_deref()
+            .unwrap()
+            .contains("needs Codex or an OpenAI backend"));
+    }
+
+    #[test]
     fn add_fuel_paste_enforces_limit_and_is_ignored_outside_meal_editing() {
         let mut state = add_fuel_state_for_test();
         state.input = "a".repeat(fuel::MAX_FUEL_INPUT_CHARS - 1);
@@ -6931,7 +7196,7 @@ mod tests {
     fn bracketed_paste_keeps_settings_text_entry_working() {
         let mut settings = settings_state();
         settings.editing = true;
-        settings.row = 14;
+        settings.row = 12;
         let mut ui = TuiState {
             settings: Some(settings),
             ..TuiState::default()

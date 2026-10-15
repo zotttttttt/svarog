@@ -7,9 +7,11 @@ use std::path::{Path, PathBuf};
 const EXERCISE_PROFILE_NAME: &str = "exercise_profile.j2";
 const RECOMMENDATION_QUEUE_NAME: &str = "recommendation_queue.j2";
 const FUEL_ENTRY_NAME: &str = "fuel_entry.j2";
+const FUEL_IMAGES_NAME: &str = "fuel_images.j2";
 const DEFAULT_EXERCISE_PROFILE: &str = include_str!("../prompts/exercise_profile.j2");
 const DEFAULT_RECOMMENDATION_QUEUE: &str = include_str!("../prompts/recommendation_queue.j2");
 const DEFAULT_FUEL_ENTRY: &str = include_str!("../prompts/fuel_entry.j2");
+const DEFAULT_FUEL_IMAGES: &str = include_str!("../prompts/fuel_images.j2");
 const ARCHETYPE_TEMPLATES: [(&str, &str); 12] = [
     (
         "archetypes/common.j2",
@@ -98,6 +100,14 @@ impl<'a> PromptRenderer<'a> {
         self.render(
             FUEL_ENTRY_NAME,
             DEFAULT_FUEL_ENTRY,
+            context!(context => context_value),
+        )
+    }
+
+    pub fn fuel_images<T: Serialize>(&self, context_value: &T) -> Result<String> {
+        self.render(
+            FUEL_IMAGES_NAME,
+            DEFAULT_FUEL_IMAGES,
             context!(context => context_value),
         )
     }
@@ -201,6 +211,29 @@ mod tests {
             .unwrap();
         assert!(custom.contains("Goku"));
         assert!(custom.contains("If unclear, behave as Athlete."));
+    }
+
+    #[test]
+    fn side_rules_follow_alternate_sides_preference() {
+        let root = tempdir().unwrap();
+        let renderer = PromptRenderer::new(root.path());
+        let render = |alternate_sides: bool| {
+            renderer
+                .recommendation_queue(
+                    &json!({"profile": {"archetype": "athlete", "alternate_sides": alternate_sides}}),
+                    1,
+                )
+                .unwrap()
+        };
+
+        let alternating = render(true);
+        assert!(alternating.contains("consecutive opposite-side pairs"));
+        assert!(!alternating.contains("Set `side` to `both`"));
+
+        let together = render(false);
+        assert!(together.contains("Set `side` to `both`"));
+        assert!(!together.contains("consecutive opposite-side pairs"));
+        assert!(together.contains("\n- Use `bilateral` as the `side`"));
     }
 
     #[test]

@@ -33,7 +33,8 @@ pub fn recommend(
         if Some(&movement.primary_muscle) == last_muscle.as_ref() {
             continue;
         }
-        if movement.estimated_seconds + 15 > event.expected_duration_sec {
+        let (_, estimated_seconds) = crate::recommender::local_side_and_seconds(config, &movement);
+        if estimated_seconds + 15 > event.expected_duration_sec {
             continue;
         }
         if !equipment_matches(&config.profile.equipment_text, &movement) {
@@ -67,6 +68,7 @@ pub fn recommend(
     let reps = crate::recommender::adaptive_reps(store, &movement.id, movement.base_reps)?;
 
     let weight_kg = choose_weight(&config.profile.equipment_text, &movement.equipment);
+    let (side, estimated_seconds) = crate::recommender::local_side_and_seconds(config, &movement);
 
     Ok(Some(Recommendation {
         id: None,
@@ -76,10 +78,10 @@ pub fn recommend(
         muscles: movement.muscles,
         reps,
         weight_kg,
-        estimated_seconds: movement.estimated_seconds,
+        estimated_seconds,
         agent: event.agent,
         project: event.project.clone(),
-        side: None,
+        side,
         created_at: Utc::now(),
     }))
 }
@@ -136,9 +138,8 @@ fn is_cautious_body_part(config: &Config, movement: &Movement) -> bool {
     movement.muscles.iter().any(|muscle| {
         config
             .profile
-            .cautious_body_parts
+            .injuries
             .iter()
-            .chain(config.profile.injuries.iter())
             .any(|cautious| cautious.eq_ignore_ascii_case(muscle))
     })
 }
