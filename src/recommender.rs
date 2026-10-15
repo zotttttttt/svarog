@@ -75,10 +75,7 @@ struct ContextProfile {
     equipment_text: String,
     available_equipment: Vec<EquipmentCapability>,
     exercise_preferences: String,
-    work_setup: String,
-    one_hand_available: bool,
-    two_hand_available: bool,
-    cautious_body_parts: Vec<String>,
+    alternate_sides: bool,
     injuries: Vec<String>,
     archetype: String,
     custom_archetype: Option<String>,
@@ -270,7 +267,11 @@ fn generate_recommendation_queue_with_existing(
         }
     };
 
-    recommendations = schedule_equipment_batch(store.movements()?, recommendations);
+    recommendations = schedule_equipment_batch(
+        store.movements()?,
+        recommendations,
+        config.profile.alternate_sides,
+    );
     recommendations.truncate(needed as usize);
     Ok(QueueGeneration {
         recommendations,
@@ -370,7 +371,8 @@ fn local_queue(
         if used_muscles.contains(&movement.primary_muscle) {
             continue;
         }
-        if movement.estimated_seconds + 15 > event.expected_duration_sec {
+        let (side, estimated_seconds) = local_side_and_seconds(config, &movement);
+        if estimated_seconds + 15 > event.expected_duration_sec {
             continue;
         }
         if conflicts_with_limitations(config, &movement.primary_muscle, &movement.muscles) {
@@ -386,10 +388,10 @@ fn local_queue(
             muscles: movement.muscles,
             reps,
             weight_kg: None,
-            estimated_seconds: movement.estimated_seconds,
+            estimated_seconds,
             agent: event.agent,
             project: event.project.clone(),
-            side: None,
+            side,
             created_at: Utc::now(),
         });
         if recommendations.len() >= needed as usize {
@@ -397,6 +399,22 @@ fn local_queue(
         }
     }
     Ok(recommendations)
+}
+
+/// Side and duration for a locally chosen movement. Without alternating sides, a
+/// one-sided movement covers both sides in one session and takes twice as long.
+pub(crate) fn local_side_and_seconds(
+    config: &Config,
+    movement: &Movement,
+) -> (Option<RecommendationSide>, u32) {
+    if movement.sidedness == MovementSidedness::Unilateral && !config.profile.alternate_sides {
+        (
+            Some(RecommendationSide::Both),
+            movement.estimated_seconds.saturating_mul(2),
+        )
+    } else {
+        (None, movement.estimated_seconds)
+    }
 }
 
 pub(crate) fn archetype_score(config: &Config, entry: &ExerciseCatalogEntry) -> u32 {
@@ -534,6 +552,7 @@ fn is_opposite_side_pair(left: &Recommendation, right: &Recommendation) -> bool 
 fn schedule_equipment_batch(
     movements: Vec<Movement>,
     recommendations: Vec<Recommendation>,
+    alternate_sides: bool,
 ) -> Vec<Recommendation> {
     let movement_by_id = movements
         .into_iter()
@@ -567,11 +586,12 @@ fn schedule_equipment_batch(
         .filter(|rec| !is_equipment(rec))
         .cloned()
         .collect::<Vec<_>>();
-    let unilateral = equipment.iter().any(|rec| {
-        movement_by_id
-            .get(&rec.movement_id)
-            .is_some_and(|movement| movement.sidedness == MovementSidedness::Unilateral)
-    });
+    let unilateral = alternate_sides
+        && equipment.iter().any(|rec| {
+            movement_by_id
+                .get(&rec.movement_id)
+                .is_some_and(|movement| movement.sidedness == MovementSidedness::Unilateral)
+        });
 
     if unilateral {
         equipment.sort_by_key(|rec| {
@@ -725,10 +745,7 @@ fn build_context(
             equipment_text: profile.equipment_text.clone(),
             available_equipment,
             exercise_preferences: profile.exercise_preferences.clone(),
-            work_setup: profile.work_setup.clone(),
-            one_hand_available: profile.one_hand_available,
-            two_hand_available: profile.two_hand_available,
-            cautious_body_parts: profile.cautious_body_parts.clone(),
+            alternate_sides: profile.alternate_sides,
             injuries: profile.injuries.clone(),
             archetype: config.forge.archetype.as_str().to_string(),
             custom_archetype: config.forge.custom_archetype.clone(),
@@ -1287,7 +1304,7 @@ fn recommendation_schema() -> serde_json::Value {
             "duration_sec": { "type": ["integer", "null"], "minimum": 1, "maximum": 600 },
             "safety_notes": { "type": ["string", "null"] },
             "rationale": { "type": ["string", "null"] }
-            , "side": { "type": ["string", "null"], "enum": ["left", "right", "bilateral", null] }
+            , "side": { "type": ["string", "null"], "enum": ["left", "right", "bilateral", "both", null] }
         }
     })
 }
@@ -1445,7 +1462,7 @@ fn local_resolved_movements(config: &Config) -> (Vec<Movement>, Vec<EquipmentCap
 }
 
 fn validate_candidate(
-    _config: &Config,
+    config: &Config,
     event: &AgentEvent,
     candidate: LlmRecommendation,
     movements: &[Movement],
@@ -1472,13 +1489,18 @@ fn validate_candidate(
         .iter()
         .find(|movement| movement.id == exercise_id)
         .ok_or_else(|| anyhow!("LLM recommendation is not in the movement catalog"))?;
-    if movement.sidedness == MovementSidedness::Unilateral && candidate.side.is_none() {
-        bail!("unilateral movement is missing a side");
-    }
+    let side = match movement.sidedness {
+        MovementSidedness::Unilateral if !config.profile.alternate_sides => {
+            Some(RecommendationSide::Both)
+        }
+        MovementSidedness::Unilateral => match candidate.side {
+            Some(side @ (RecommendationSide::Left | RecommendationSide::Right)) => Some(side),
+            _ => bail!("unilateral movement is missing a side"),
+        },
+        MovementSidedness::Bilateral => candidate.side,
+    };
     if movement.sidedness == MovementSidedness::Bilateral
-        && candidate
-            .side
-            .is_some_and(|side| side != RecommendationSide::Bilateral)
+        && side.is_some_and(|side| side != RecommendationSide::Bilateral)
     {
         bail!("bilateral movement cannot have a single-side assignment");
     }
@@ -1503,7 +1525,7 @@ fn validate_candidate(
         estimated_seconds: duration_sec,
         agent: event.agent,
         project: event.project.clone(),
-        side: candidate.side,
+        side,
         created_at: Utc::now(),
     }))
 }
@@ -1519,9 +1541,8 @@ fn conflicts_with_limitations(config: &Config, primary_muscle: &str, muscles: &[
         .collect::<Vec<_>>();
     config
         .profile
-        .cautious_body_parts
+        .injuries
         .iter()
-        .chain(config.profile.injuries.iter())
         .map(|item| item.to_lowercase())
         .any(|item| {
             targets
@@ -2005,6 +2026,54 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("not in the movement catalog"));
+    }
+
+    #[test]
+    fn validator_assigns_unilateral_sides_from_alternate_sides_preference() {
+        let movements = vec![Movement {
+            id: "split_squat".into(),
+            name: "split squat".into(),
+            primary_muscle: "quadriceps".into(),
+            muscles: vec!["quadriceps".into()],
+            equipment: vec!["bodyweight".into()],
+            base_reps: 8,
+            estimated_seconds: 40,
+            status: MovementStatus::Allowed,
+            mobility: false,
+            sidedness: MovementSidedness::Unilateral,
+        }];
+        let candidate = |side: Option<&str>| -> LlmRecommendation {
+            serde_json::from_value(json!({
+                "action": "recommend",
+                "exercise_id": "split_squat",
+                "reps": 8,
+                "sets": 1,
+                "weight_text": null,
+                "duration_sec": 35,
+                "safety_notes": "Move gently.",
+                "rationale": "Fits the wait.",
+                "side": side
+            }))
+            .unwrap()
+        };
+        let mut config = Config::default();
+
+        let left = validate_candidate(&config, &event(), candidate(Some("left")), &movements)
+            .unwrap()
+            .unwrap();
+        assert_eq!(left.side, Some(RecommendationSide::Left));
+        assert!(
+            validate_candidate(&config, &event(), candidate(Some("both")), &movements).is_err()
+        );
+
+        config.profile.alternate_sides = false;
+        for side in [Some("left"), Some("both"), None] {
+            let rec = validate_candidate(&config, &event(), candidate(side), &movements)
+                .unwrap()
+                .unwrap();
+            assert_eq!(rec.side, Some(RecommendationSide::Both));
+            assert_eq!(rec.display_name(), "split squat (both sides)");
+        }
     }
 
     #[test]
