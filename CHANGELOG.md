@@ -2,6 +2,14 @@
 
 Notable changes to Svarog are recorded here by the automated release process.
 
+## [0.10.4](https://github.com/zotttttttt/svarog/compare/v0.10.3...v0.10.4) (2026-10-15)
+
+
+### Fixes
+
+* Feat/forging after time ([#67](https://github.com/zotttttttt/svarog/issues/67)) ([fef9f18](https://github.com/zotttttttt/svarog/commit/fef9f1800eb47bd886509e919dfa385bceff75c6))
+* Feat/nutrition via images ([#66](https://github.com/zotttttttt/svarog/issues/66)) ([4efc3b6](https://github.com/zotttttttt/svarog/commit/4efc3b612fdf2047d1c077035e726aa0fe12c97e))
+
 ## [0.10.3](https://github.com/zotttttttt/svarog/compare/v0.10.2...v0.10.3) (2026-10-15)
 
 
