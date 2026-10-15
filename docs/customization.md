@@ -17,7 +17,7 @@ Advanced settings live in:
 ```
 
 Stop Svarog before editing the file so a running process cannot overwrite your
-changes. Useful advanced settings include forge frequency (every 1–12 Codex
+changes. Useful advanced settings include forge frequency (every 1–12 agent
 prompts), the daily forge ceiling (completed forges, not repetitions),
 notification behavior, recommender selection, timeouts, fallback behavior, and
 the Codex/OpenAI model configuration. Forge frequency defaults to every prompt
@@ -30,7 +30,10 @@ offers one. It never fires while agents are idle. Pick 15, 30, 45, or 60
 minutes or Off with ←/→ in Settings, or press Enter to type a custom value of
 5–480 minutes (`0` turns it off). It defaults to 30 minutes and is stored as
 `preferences.idle_forge_minutes`. The daily forge ceiling and fatigue pauses
-still apply.
+still apply. If a forge is still unanswered after the interval, Svarog re-sends
+its alert instead of offering a new one. While idle forge is on, a fatigue
+pause ends after five intervals even if you haven't sent enough prompts.
+Agent-work check-ins run in the background for Claude Code 2.1 and later.
 
 The `[agents]` section also accepts command overrides for tmux sessions. These
 are advanced settings rather than onboarding questions:
