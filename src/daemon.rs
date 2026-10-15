@@ -1,7 +1,9 @@
 use crate::collector_auth;
 use crate::config::{load_or_default, Config, RuntimeEnv};
 use crate::engine;
-use crate::models::{Agent, AppStateKind, IncomingEvent, LifecycleHookEvent, Recommendation};
+use crate::models::{
+    Agent, AgentEvent, AppStateKind, IncomingEvent, LifecycleHookEvent, Recommendation,
+};
 use crate::notifications;
 use crate::recommender;
 use crate::secrets;
@@ -13,6 +15,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -311,6 +314,15 @@ pub fn process_lifecycle_hook(
                 process_event(env, event)?;
             }
         }
+        "PostToolUse" => {
+            process_idle_check_with_notifier(
+                env,
+                agent,
+                payload.project(),
+                Utc::now(),
+                &notifications::notify,
+            )?;
+        }
         "Stop" => store.record_agent_stop(agent, &payload)?,
         "SessionEnd" => store.record_agent_session_end(agent, &payload)?,
         _ => {}
@@ -347,6 +359,66 @@ fn process_event_with_notifier(
         });
     }
 
+    if !crate::engine::opportunity_allows(&store, &config)? {
+        return Ok(EventResponse {
+            recommended: false,
+            recommendation: None,
+            notice: None,
+        });
+    }
+    surface_forge(env, &store, &config, &event, notifier)
+}
+
+/// Fires a forge from an agent tool call when no forge has been surfaced, answered, or
+/// prompted for `idle_forge_minutes` while the agent keeps working.
+fn process_idle_check_with_notifier(
+    env: &RuntimeEnv,
+    agent: Agent,
+    project: Option<String>,
+    now: DateTime<Utc>,
+    notifier: &dyn Fn(bool, &str, &str) -> bool,
+) -> Result<EventResponse> {
+    let not_recommended = EventResponse {
+        recommended: false,
+        recommendation: None,
+        notice: None,
+    };
+    let config = load_or_default(&env.paths)?;
+    let idle_minutes = config.preferences.idle_forge_minutes;
+    if idle_minutes == 0 {
+        return Ok(not_recommended);
+    }
+    let store = Store::open(&env.paths.database_file)?;
+    if store.fatigue_suppression_active()?
+        || store.today_set_count()? >= config.preferences.max_daily_sets
+    {
+        return Ok(not_recommended);
+    }
+    if store
+        .last_forge_activity_at()?
+        .is_some_and(|last| now - last < Duration::minutes(i64::from(idle_minutes)))
+    {
+        return Ok(not_recommended);
+    }
+    ensure_exercise_pool(&store, &config)?;
+    let event = IncomingEvent {
+        agent,
+        event: "idle_forge".to_string(),
+        expected_duration_sec: None,
+        duration_sec: None,
+        project,
+    }
+    .into_event_with_default(config.preferences.default_expected_duration_sec);
+    surface_forge(env, &store, &config, &event, notifier)
+}
+
+fn surface_forge(
+    env: &RuntimeEnv,
+    store: &Store,
+    config: &Config,
+    event: &AgentEvent,
+    notifier: &dyn Fn(bool, &str, &str) -> bool,
+) -> Result<EventResponse> {
     let state = store.state()?;
     let open_recommendation = store.latest_open_recommendation()?;
     if matches!(
@@ -365,19 +437,12 @@ fn process_event_with_notifier(
             notice: None,
         });
     }
-    if !crate::engine::opportunity_allows(&store, &config)? {
-        return Ok(EventResponse {
-            recommended: false,
-            recommendation: None,
-            notice: None,
-        });
-    }
 
     let notice = None;
     let recommendation =
         match store.promote_next_queued_recommendation(event.agent, event.project.as_deref())? {
             Some(rec) => Some(rec),
-            None => match engine::recommend(&store, &config, &event)? {
+            None => match engine::recommend(store, config, event)? {
                 Some(mut rec) => {
                     let id = store.insert_recommendation(&rec)?;
                     rec.id = Some(id);
@@ -1081,6 +1146,108 @@ mod tests {
 
         let store = Store::open(&env.paths.database_file).unwrap();
         assert_eq!(store.event_count().unwrap(), 2);
+    }
+
+    fn idle_env(idle_forge_minutes: u32) -> RuntimeEnv {
+        let env = test_env();
+        let mut config = Config::default();
+        config.recommender.backend = RecommenderBackend::Local;
+        config.preferences.forge_frequency = 3;
+        config.preferences.idle_forge_minutes = idle_forge_minutes;
+        crate::config::save(&env.paths, &config).unwrap();
+        env
+    }
+
+    fn idle_check(env: &RuntimeEnv, now: chrono::DateTime<chrono::Utc>) -> bool {
+        process_idle_check_with_notifier(env, Agent::Claude, None, now, &|_, _, _| true)
+            .unwrap()
+            .recommended
+    }
+
+    fn skip_open_forge(store: &Store) {
+        let open = store.latest_open_recommendation().unwrap().unwrap();
+        store
+            .mark_recommendation(open.id.unwrap(), "skipped")
+            .unwrap();
+        store.record_set(&open, SetStatus::Skipped).unwrap();
+    }
+
+    #[test]
+    fn tool_use_fires_idle_forge_after_interval_without_counting_an_opportunity() {
+        let env = idle_env(30);
+        let now = chrono::Utc::now();
+
+        assert!(idle_check(&env, now));
+        let store = Store::open(&env.paths.database_file).unwrap();
+        assert_eq!(store.event_count().unwrap(), 0);
+        assert!(!idle_check(&env, now + chrono::Duration::minutes(31)));
+
+        skip_open_forge(&store);
+        assert!(!idle_check(
+            &env,
+            chrono::Utc::now() + chrono::Duration::minutes(29)
+        ));
+        assert!(idle_check(
+            &env,
+            chrono::Utc::now() + chrono::Duration::minutes(31)
+        ));
+        assert_eq!(store.event_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn idle_forge_waits_for_the_interval_after_an_unanswered_prompt() {
+        let env = idle_env(30);
+        process_lifecycle_hook(&env, Agent::Claude, codex_hook("UserPromptSubmit", None)).unwrap();
+        let store = Store::open(&env.paths.database_file).unwrap();
+        assert!(store.latest_open_recommendation().unwrap().is_none());
+
+        assert!(!idle_check(
+            &env,
+            chrono::Utc::now() + chrono::Duration::minutes(29)
+        ));
+        assert!(idle_check(
+            &env,
+            chrono::Utc::now() + chrono::Duration::minutes(31)
+        ));
+    }
+
+    #[test]
+    fn post_tool_use_hook_runs_the_idle_check() {
+        let env = idle_env(30);
+
+        process_lifecycle_hook(
+            &env,
+            Agent::Codex,
+            codex_hook("PostToolUse", Some("turn-1")),
+        )
+        .unwrap();
+
+        let store = Store::open(&env.paths.database_file).unwrap();
+        assert!(store.latest_open_recommendation().unwrap().is_some());
+        assert_eq!(store.event_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn idle_forge_respects_off_ceiling_and_fatigue() {
+        let later = || chrono::Utc::now() + chrono::Duration::minutes(120);
+
+        assert!(!idle_check(&idle_env(0), later()));
+
+        let env = idle_env(30);
+        let mut config = load_or_default(&env.paths).unwrap();
+        config.preferences.max_daily_sets = 1;
+        crate::config::save(&env.paths, &config).unwrap();
+        assert!(idle_check(&env, later()));
+        let store = Store::open(&env.paths.database_file).unwrap();
+        let open = store.latest_open_recommendation().unwrap().unwrap();
+        store.mark_recommendation(open.id.unwrap(), "done").unwrap();
+        store.record_set(&open, SetStatus::Done).unwrap();
+        assert!(!idle_check(&env, later()));
+
+        let env = idle_env(30);
+        let store = Store::open(&env.paths.database_file).unwrap();
+        store.suppress_next_opportunities(5).unwrap();
+        assert!(!idle_check(&env, later()));
     }
 
     #[test]
