@@ -214,6 +214,29 @@ mod tests {
     }
 
     #[test]
+    fn side_rules_follow_alternate_sides_preference() {
+        let root = tempdir().unwrap();
+        let renderer = PromptRenderer::new(root.path());
+        let render = |alternate_sides: bool| {
+            renderer
+                .recommendation_queue(
+                    &json!({"profile": {"archetype": "athlete", "alternate_sides": alternate_sides}}),
+                    1,
+                )
+                .unwrap()
+        };
+
+        let alternating = render(true);
+        assert!(alternating.contains("consecutive opposite-side pairs"));
+        assert!(!alternating.contains("Set `side` to `both`"));
+
+        let together = render(false);
+        assert!(together.contains("Set `side` to `both`"));
+        assert!(!together.contains("consecutive opposite-side pairs"));
+        assert!(together.contains("\n- Use `bilateral` as the `side`"));
+    }
+
+    #[test]
     fn override_edits_apply_to_the_next_render() {
         let root = tempdir().unwrap();
         let prompts = root.path().join("prompts");

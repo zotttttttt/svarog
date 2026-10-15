@@ -1655,7 +1655,7 @@ impl Store {
         let side = match side {
             Some(RecommendationSide::Left) => Some("left"),
             Some(RecommendationSide::Right) => Some("right"),
-            Some(RecommendationSide::Bilateral) | None => None,
+            Some(RecommendationSide::Bilateral | RecommendationSide::Both) | None => None,
         };
         let last_done = self
             .conn
@@ -1668,7 +1668,7 @@ impl Store {
                   AND (
                     ?2 IS NULL
                     OR s.side IS NULL
-                    OR s.side = 'bilateral'
+                    OR s.side IN ('bilateral', 'both')
                     OR s.side = ?2
                   )
                 ORDER BY s.id DESC
@@ -2019,6 +2019,7 @@ fn side_to_str(side: RecommendationSide) -> &'static str {
         RecommendationSide::Left => "left",
         RecommendationSide::Right => "right",
         RecommendationSide::Bilateral => "bilateral",
+        RecommendationSide::Both => "both",
     }
 }
 
@@ -2027,6 +2028,7 @@ fn side_from_str(side: Option<String>) -> Option<RecommendationSide> {
         Some("left") => Some(RecommendationSide::Left),
         Some("right") => Some(RecommendationSide::Right),
         Some("bilateral") => Some(RecommendationSide::Bilateral),
+        Some("both") => Some(RecommendationSide::Both),
         _ => None,
     }
 }
