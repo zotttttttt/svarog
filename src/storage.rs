@@ -260,6 +260,9 @@ impl Store {
             "ALTER TABLE app_state ADD COLUMN suppress_until_event_count INTEGER",
             [],
         );
+        let _ = self
+            .conn
+            .execute("ALTER TABLE app_state ADD COLUMN last_forge_at TEXT", []);
         let _ = self.conn.execute(
             "ALTER TABLE recommender_token_usage ADD COLUMN provider TEXT NOT NULL DEFAULT 'codex'",
             [],
@@ -1588,7 +1591,44 @@ impl Store {
                 Utc::now().to_rfc3339(),
             ],
         )?;
+        if kind == AppStateKind::Recommendation {
+            self.conn.execute(
+                "UPDATE app_state SET last_forge_at = ?1 WHERE id = 1",
+                [Utc::now().to_rfc3339()],
+            )?;
+        }
         Ok(())
+    }
+
+    /// Latest moment that resets the idle forge timer: a surfaced forge, a
+    /// recorded outcome, or a counted agent event.
+    pub fn last_forge_activity_at(&self) -> Result<Option<DateTime<Utc>>> {
+        let values: [Option<String>; 3] = [
+            self.conn
+                .query_row(
+                    "SELECT last_forge_at FROM app_state WHERE id = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten(),
+            self.conn
+                .query_row(
+                    "SELECT MAX(created_at) FROM sets WHERE status IN ('done', 'skipped', 'pain')",
+                    [],
+                    |row| row.get(0),
+                )
+                .context("loading last forge outcome")?,
+            self.conn
+                .query_row("SELECT MAX(created_at) FROM events", [], |row| row.get(0))
+                .context("loading last agent event")?,
+        ];
+        Ok(values
+            .into_iter()
+            .flatten()
+            .filter_map(|value| DateTime::parse_from_rfc3339(&value).ok())
+            .map(|dt| dt.with_timezone(&Utc))
+            .max())
     }
 
     pub fn state(&self) -> Result<AppState> {
@@ -2846,6 +2886,25 @@ mod tests {
 
         assert_eq!(promoted.primary_muscle, "upper_back");
         assert_eq!(store.queued_recommendation_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn last_forge_activity_tracks_surfaced_forges_but_not_queueing() {
+        let store = store();
+        assert!(store.last_forge_activity_at().unwrap().is_none());
+
+        store
+            .insert_queued_recommendation(&recommendation())
+            .unwrap();
+        assert!(store.last_forge_activity_at().unwrap().is_none());
+
+        let before = Utc::now();
+        store
+            .promote_next_queued_recommendation(Agent::Codex, None)
+            .unwrap()
+            .unwrap();
+        let surfaced = store.last_forge_activity_at().unwrap().unwrap();
+        assert!(surfaced >= before);
     }
 
     #[test]

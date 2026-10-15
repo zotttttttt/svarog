@@ -34,6 +34,9 @@ pub struct Onboarding {
 pub const CURRENT_ONBOARDING_VERSION: u32 = 4;
 pub const MIN_FORGE_FREQUENCY: u32 = 1;
 pub const MAX_FORGE_FREQUENCY: u32 = 12;
+pub const IDLE_FORGE_PRESETS: [u32; 5] = [0, 15, 30, 45, 60];
+pub const MIN_IDLE_FORGE_MINUTES: u32 = 5;
+pub const MAX_IDLE_FORGE_MINUTES: u32 = 480;
 pub const STEP_HEIGHT: &str = "profile.height_cm";
 pub const STEP_WEIGHT: &str = "profile.weight_kg";
 pub const STEP_AGE: &str = "profile.age";
@@ -371,6 +374,8 @@ pub struct Preferences {
     pub max_daily_sets: u32,
     #[serde(default = "default_true")]
     pub desktop_notifications: bool,
+    #[serde(default = "default_idle_forge_minutes")]
+    pub idle_forge_minutes: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -484,6 +489,7 @@ impl Default for Config {
                 default_expected_duration_sec: 60,
                 max_daily_sets: 100,
                 desktop_notifications: true,
+                idle_forge_minutes: default_idle_forge_minutes(),
             },
             recommender: Recommender::default(),
             onboarding: Onboarding::default(),
@@ -553,6 +559,18 @@ fn default_true() -> bool {
 
 fn default_forge_frequency() -> u32 {
     MIN_FORGE_FREQUENCY
+}
+
+fn default_idle_forge_minutes() -> u32 {
+    30
+}
+
+pub fn clamp_idle_forge_minutes(minutes: u32) -> u32 {
+    if minutes == 0 {
+        0
+    } else {
+        minutes.clamp(MIN_IDLE_FORGE_MINUTES, MAX_IDLE_FORGE_MINUTES)
+    }
 }
 
 fn default_codex_recommender_model() -> String {
@@ -890,6 +908,8 @@ fn normalize_loaded_config(config: &mut Config) {
         .preferences
         .forge_frequency
         .clamp(MIN_FORGE_FREQUENCY, MAX_FORGE_FREQUENCY);
+    config.preferences.idle_forge_minutes =
+        clamp_idle_forge_minutes(config.preferences.idle_forge_minutes);
     if config.onboarding.version < 3 && config.preferences.max_daily_sets == 12 {
         config.preferences.max_daily_sets = 100;
     }
@@ -1142,6 +1162,43 @@ mod tests {
             load_or_default(&paths).unwrap().preferences.forge_frequency,
             12
         );
+    }
+
+    #[test]
+    fn missing_idle_forge_minutes_defaults_to_thirty() {
+        let root = tempdir().unwrap();
+        let paths = Paths::from_root(root.path().join("svarog"));
+        let serialized = toml::to_string_pretty(&Config::default()).unwrap();
+        let mut value: toml::Value = toml::from_str(&serialized).unwrap();
+        value
+            .get_mut("preferences")
+            .and_then(toml::Value::as_table_mut)
+            .unwrap()
+            .remove("idle_forge_minutes");
+        paths.ensure().unwrap();
+        fs::write(&paths.config_file, toml::to_string_pretty(&value).unwrap()).unwrap();
+
+        let loaded = load_or_default(&paths).unwrap();
+
+        assert_eq!(loaded.preferences.idle_forge_minutes, 30);
+    }
+
+    #[test]
+    fn idle_forge_minutes_keeps_off_and_clamps_custom_values() {
+        let root = tempdir().unwrap();
+        let paths = Paths::from_root(root.path().join("svarog"));
+        let mut config = Config::default();
+        for (stored, loaded) in [(0, 0), (1, 5), (20, 20), (9999, 480)] {
+            config.preferences.idle_forge_minutes = stored;
+            save(&paths, &config).unwrap();
+            assert_eq!(
+                load_or_default(&paths)
+                    .unwrap()
+                    .preferences
+                    .idle_forge_minutes,
+                loaded
+            );
+        }
     }
 
     #[test]
