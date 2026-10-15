@@ -84,6 +84,10 @@ builds, see [Installation](docs/installation.md).
 4. Your completions, changed reps, skips, fatigue, and pain shape what comes
    next.
 
+During long agent runs, Svarog also offers a forge after 30 minutes of agent
+work without one (adjustable or off in Settings), and re-sends the alert for a
+forge you haven't answered yet.
+
 A ready movement remains available until you finish, skip, or report pain—even
 if the coding-agent turn that triggered it has already ended. Coding prompts,
 conversation history, and agent results are never collected or sent in

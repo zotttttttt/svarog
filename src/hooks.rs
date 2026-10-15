@@ -8,6 +8,7 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::OnceLock;
 use yaml_edit::{Document, SequenceBuilder, YamlFile, YamlKind, YamlNode};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,7 +106,7 @@ pub fn install_global_hermes(env: &RuntimeEnv) -> Result<PathBuf> {
 #[cfg(test)]
 fn install_codex_hook_config(codex_home: &Path, script: &Path) -> Result<PathBuf> {
     let path = codex_home.join("hooks.json");
-    let contents = updated_settings(&path, Agent::Codex, true, script)?
+    let contents = updated_settings(&path, Agent::Codex, true, script, false)?
         .context("enabled integration did not produce settings")?;
     fs::create_dir_all(codex_home).with_context(|| format!("creating {}", codex_home.display()))?;
     atomic_write_user_only(&path, &contents)?;
@@ -131,7 +132,8 @@ fn install_global(env: &RuntimeEnv, agent: Agent) -> Result<PathBuf> {
         }
         return Ok(path);
     }
-    if let Some(contents) = updated_settings(&path, agent, true, &script)? {
+    let claude_async = claude_async_tool_hooks(env);
+    if let Some(contents) = updated_settings(&path, agent, true, &script, claude_async)? {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
         }
@@ -170,7 +172,10 @@ pub fn reconcile(env: &RuntimeEnv, selection: CodingAgentSelection) -> Result<()
         let (updated, remove) = if agent == Agent::Pi {
             updated_pi_extension(&path, enabled, &script)?
         } else {
-            (updated_settings(&path, agent, enabled, &script)?, false)
+            (
+                updated_settings(&path, agent, enabled, &script, claude_async_tool_hooks(env))?,
+                false,
+            )
         };
         let target = resolve_write_target(&path)?;
         prepared.push(PreparedSettings {
@@ -269,7 +274,7 @@ pub fn is_configured(env: &RuntimeEnv, selection: CodingAgentSelection) -> Resul
             if !script.is_file() {
                 return Ok(false);
             }
-            if !settings_are_current(&path, agent, true, &script)? {
+            if !settings_are_current(env, &path, agent, true, &script)? {
                 return Ok(false);
             }
             if agent == Agent::Hermes && !hermes_allowlist_is_current(env, true, &script)? {
@@ -278,7 +283,7 @@ pub fn is_configured(env: &RuntimeEnv, selection: CodingAgentSelection) -> Resul
         } else {
             if path.exists() {
                 let script = PathBuf::new();
-                if !settings_are_current(&path, agent, false, &script)? {
+                if !settings_are_current(env, &path, agent, false, &script)? {
                     return Ok(false);
                 }
             }
@@ -291,7 +296,13 @@ pub fn is_configured(env: &RuntimeEnv, selection: CodingAgentSelection) -> Resul
     Ok(true)
 }
 
-fn settings_are_current(path: &Path, agent: Agent, enabled: bool, script: &Path) -> Result<bool> {
+fn settings_are_current(
+    env: &RuntimeEnv,
+    path: &Path,
+    agent: Agent,
+    enabled: bool,
+    script: &Path,
+) -> Result<bool> {
     if agent == Agent::Hermes {
         let updated = updated_hermes_config(path, enabled, script)?;
         return match updated {
@@ -309,7 +320,9 @@ fn settings_are_current(path: &Path, agent: Agent, enabled: bool, script: &Path)
             Some(updated) => Ok(read_optional(path)?.as_deref() == Some(updated.as_slice())),
         };
     }
-    let Some(updated) = updated_settings(path, agent, enabled, script)? else {
+    let Some(updated) =
+        updated_settings(path, agent, enabled, script, claude_async_tool_hooks(env))?
+    else {
         return Ok(true);
     };
     let Some(original) = read_optional(path)? else {
@@ -348,9 +361,10 @@ fn settings_path(env: &RuntimeEnv, agent: Agent) -> Result<PathBuf> {
     }
 }
 
-const HERMES_EVENTS: [(&str, u64); 4] = [
+const HERMES_EVENTS: [(&str, u64); 5] = [
     ("on_session_start", 5),
     ("pre_llm_call", 5),
+    ("post_tool_call", 2),
     ("on_session_end", 5),
     ("on_session_finalize", 3),
 ];
@@ -724,6 +738,7 @@ fn updated_settings(
     agent: Agent,
     enabled: bool,
     script: &Path,
+    claude_async: bool,
 ) -> Result<Option<Vec<u8>>> {
     let original = if path.exists() {
         Some(fs::read(path).with_context(|| format!("reading {}", path.display()))?)
@@ -755,7 +770,7 @@ fn updated_settings(
     }
     validate_hook_shape(&root, path)?;
     if enabled {
-        ensure_svarog_hook(&mut root, agent, script);
+        ensure_svarog_hook(&mut root, agent, script, claude_async);
     } else {
         remove_all_svarog_hooks(&mut root, agent);
     }
@@ -781,6 +796,7 @@ fn validate_hook_shape(root: &Value, path: &Path) -> Result<()> {
         "Stop",
         "SessionEnd",
         "PreToolUse",
+        "PostToolUse",
     ] {
         if hooks.get(event).is_some_and(|entries| !entries.is_array()) {
             bail!("{}.hooks.{event} must contain a JSON array", path.display());
@@ -950,7 +966,7 @@ fn managed_claude_settings_dir() -> Option<PathBuf> {
     None
 }
 
-fn ensure_svarog_hook(root: &mut Value, agent: Agent, script: &Path) {
+fn ensure_svarog_hook(root: &mut Value, agent: Agent, script: &Path, claude_async: bool) {
     if !root.is_object() {
         *root = json!({});
     }
@@ -976,7 +992,77 @@ fn ensure_svarog_hook(root: &mut Value, agent: Agent, script: &Path) {
     ] {
         ensure_agent_event_hook(hooks, agent, event, matcher, timeout, &command);
     }
+    ensure_agent_event_hook(hooks, agent, "PostToolUse", "", 2, &command);
+    if let Some(hook) = hooks["PostToolUse"]
+        .as_array_mut()
+        .and_then(|entries| entries.last_mut())
+        .and_then(|entry| entry["hooks"][0].as_object_mut())
+    {
+        // Fires after every tool call; keep it silent and, where supported, off the critical path.
+        hook.remove("statusMessage");
+        if agent == Agent::Claude && claude_async {
+            hook.insert("async".to_string(), json!(true));
+        }
+    }
     remove_svarog_hook(hooks, agent, "PreToolUse");
+}
+
+/// Background (`async`) command hooks shipped in Claude Code 2.1. Older or undetectable
+/// versions get a regular hook, which is still fast because the collector call is capped.
+fn claude_async_tool_hooks(env: &RuntimeEnv) -> bool {
+    if cfg!(test) {
+        return true;
+    }
+    static SUPPORTED: OnceLock<bool> = OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        let command = crate::config::load_or_default(&env.paths)
+            .map(|config| config.agents.claude_command)
+            .unwrap_or_else(|_| "claude".to_string());
+        let Some(program) = command.split_whitespace().next() else {
+            return false;
+        };
+        command_stdout(program, &["--version"], std::time::Duration::from_secs(3))
+            .is_some_and(|output| claude_version_supports_async_hooks(&output))
+    })
+}
+
+fn claude_version_supports_async_hooks(version_output: &str) -> bool {
+    let mut parts = version_output
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .split('.')
+        .map(|part| part.parse::<u32>().ok());
+    match (parts.next().flatten(), parts.next().flatten()) {
+        (Some(major), Some(minor)) => (major, minor) >= (2, 1),
+        _ => false,
+    }
+}
+
+fn command_stdout(program: &str, args: &[&str], timeout: std::time::Duration) -> Option<String> {
+    let mut child = std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait().ok()? {
+            Some(status) if status.success() => break,
+            Some(_) => return None,
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
+    }
+    let mut output = String::new();
+    child.stdout.take()?.read_to_string(&mut output).ok()?;
+    Some(output)
 }
 
 fn ensure_agent_event_hook(
@@ -1173,6 +1259,11 @@ export default function (pi: ExtensionAPI) {{
     await deliver(payload(ctx, "UserPromptSubmit", turnId));
   }});
 
+  pi.on("tool_execution_end", (_event, ctx) => {{
+    const turnId = [...pendingTurns].pop();
+    void deliver(payload(ctx, "PostToolUse", turnId));
+  }});
+
   pi.on("agent_settled", async (_event, ctx) => {{
     await stopPending(ctx, "settled");
   }});
@@ -1235,6 +1326,7 @@ fn parse_lifecycle_payload(agent: Agent, input: &str) -> Result<LifecycleHookEve
     let hook_event_name = match event {
         "on_session_start" => "SessionStart",
         "pre_llm_call" => "UserPromptSubmit",
+        "post_tool_call" => "PostToolUse",
         "on_session_end" => "Stop",
         "on_session_finalize" => "SessionEnd",
         _ => bail!("unsupported Hermes lifecycle event"),
@@ -1335,6 +1427,13 @@ mod tests {
         assert_eq!(value["hooks"]["SessionEnd"][0]["hooks"][0]["timeout"], 3);
         assert_eq!(value["hooks"]["Stop"][1]["hooks"][0]["timeout"], 5);
         assert!(value["hooks"].get("PreToolUse").is_none());
+        let tool_hook = &value["hooks"]["PostToolUse"][0]["hooks"][0];
+        assert!(tool_hook["command"]
+            .as_str()
+            .unwrap()
+            .contains("codex-event.sh"));
+        assert!(tool_hook.get("async").is_none());
+        assert!(tool_hook.get("statusMessage").is_none());
         assert_eq!(
             fs::metadata(codex_home.join("hooks.json"))
                 .unwrap()
@@ -1375,7 +1474,7 @@ mod tests {
     fn codex_hook_command_shell_quotes_metacharacter_paths() {
         let script = Path::new("/tmp/space ' $(touch nope); `nope`/codex-event.sh");
         let mut root = json!({});
-        ensure_svarog_hook(&mut root, Agent::Codex, script);
+        ensure_svarog_hook(&mut root, Agent::Codex, script, false);
         let command = root["hooks"]["Stop"][0]["hooks"][0]["command"]
             .as_str()
             .unwrap();
@@ -1512,10 +1611,32 @@ mod tests {
     }
 
     #[test]
+    fn claude_async_hooks_require_version_two_one() {
+        assert!(claude_version_supports_async_hooks("2.1.283 (Claude Code)"));
+        assert!(claude_version_supports_async_hooks("3.0.0"));
+        assert!(!claude_version_supports_async_hooks("2.0.77 (Claude Code)"));
+        assert!(!claude_version_supports_async_hooks("1.9.0"));
+        assert!(!claude_version_supports_async_hooks(""));
+        assert!(!claude_version_supports_async_hooks("claude"));
+
+        let mut root = json!({});
+        ensure_svarog_hook(
+            &mut root,
+            Agent::Claude,
+            Path::new("/tmp/claude-event.sh"),
+            false,
+        );
+        assert!(root["hooks"]["PostToolUse"][0]["hooks"][0]
+            .get("async")
+            .is_none());
+    }
+
+    #[test]
     fn hermes_payloads_map_lifecycle_and_discard_private_content() {
         let cases = [
             ("on_session_start", "SessionStart", None),
             ("pre_llm_call", "UserPromptSubmit", Some("turn-1")),
+            ("post_tool_call", "PostToolUse", Some("turn-1")),
             ("on_session_end", "Stop", Some("turn-1")),
             ("on_session_finalize", "SessionEnd", None),
         ];
@@ -1581,7 +1702,7 @@ mod tests {
             assert!(config.contains(event));
         }
         let allowlist: Value = serde_json::from_slice(&first_allowlist).unwrap();
-        assert_eq!(allowlist["approvals"].as_array().unwrap().len(), 5);
+        assert_eq!(allowlist["approvals"].as_array().unwrap().len(), 6);
         assert!(allowlist["approvals"]
             .as_array()
             .unwrap()
@@ -1817,12 +1938,17 @@ mod tests {
             "startup|resume|clear|compact|fork"
         );
         assert_eq!(claude["hooks"]["SessionEnd"][0]["hooks"][0]["timeout"], 3);
+        let claude_tool_hook = &claude["hooks"]["PostToolUse"][0];
+        assert!(claude_tool_hook.get("matcher").is_none());
+        assert_eq!(claude_tool_hook["hooks"][0]["async"], true);
+        assert!(claude_tool_hook["hooks"][0].get("statusMessage").is_none());
         let pi_path = env.pi_config_dir.join("extensions/svarog.ts");
         let pi = fs::read_to_string(&pi_path).unwrap();
         assert!(pi.starts_with(PI_EXTENSION_MARKER));
         for event in [
             "session_start",
             "before_agent_start",
+            "tool_execution_end",
             "agent_settled",
             "session_shutdown",
         ] {
