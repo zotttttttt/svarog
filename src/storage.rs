@@ -263,6 +263,9 @@ impl Store {
         let _ = self
             .conn
             .execute("ALTER TABLE app_state ADD COLUMN last_forge_at TEXT", []);
+        let _ = self
+            .conn
+            .execute("ALTER TABLE app_state ADD COLUMN suppressed_at TEXT", []);
         let _ = self.conn.execute(
             "ALTER TABLE recommender_token_usage ADD COLUMN provider TEXT NOT NULL DEFAULT 'codex'",
             [],
@@ -1522,18 +1525,42 @@ impl Store {
 
     pub fn suppress_next_opportunities(&self, opportunities: u32) -> Result<()> {
         let until = self.event_count()?.saturating_add(opportunities);
+        let now = Utc::now().to_rfc3339();
         self.conn.execute(
-            "UPDATE app_state SET suppress_until_event_count = ?1, updated_at = ?2 WHERE id = 1",
-            params![i64::from(until), Utc::now().to_rfc3339()],
+            "UPDATE app_state SET suppress_until_event_count = ?1, suppressed_at = ?2, updated_at = ?2 WHERE id = 1",
+            params![i64::from(until), now],
         )?;
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn fatigue_suppression_active(&self) -> Result<bool> {
+        self.fatigue_suppression_active_at(Utc::now(), None)
+    }
+
+    /// Fatigue pauses end after enough opportunities or, when `max_age` is set,
+    /// once that much time has passed since the report, whichever comes first.
+    pub fn fatigue_suppression_active_at(
+        &self,
+        now: DateTime<Utc>,
+        max_age: Option<Duration>,
+    ) -> Result<bool> {
         let Some(until) = self.current_suppression()? else {
             return Ok(false);
         };
-        if self.event_count()? <= until {
+        let expired_by_time = match max_age {
+            Some(max_age) => self
+                .conn
+                .query_row(
+                    "SELECT suppressed_at FROM app_state WHERE id = 1",
+                    [],
+                    |row| row.get::<_, Option<String>>(0),
+                )?
+                .and_then(|value| DateTime::parse_from_rfc3339(&value).ok())
+                .is_some_and(|since| now - since.with_timezone(&Utc) >= max_age),
+            None => false,
+        };
+        if !expired_by_time && self.event_count()? <= until {
             return Ok(true);
         }
         self.clear_fatigue_suppression()?;
@@ -1555,7 +1582,7 @@ impl Store {
 
     fn clear_fatigue_suppression(&self) -> Result<()> {
         self.conn.execute(
-            "UPDATE app_state SET suppress_until_event_count = NULL, updated_at = ?1 WHERE id = 1",
+            "UPDATE app_state SET suppress_until_event_count = NULL, suppressed_at = NULL, updated_at = ?1 WHERE id = 1",
             [Utc::now().to_rfc3339()],
         )?;
         Ok(())
@@ -2606,6 +2633,25 @@ mod tests {
             .find(|movement| movement.id == "Bodyweight_Squat")
             .unwrap();
         assert_eq!(refreshed.status, MovementStatus::Blocked);
+    }
+
+    #[test]
+    fn fatigue_suppression_also_expires_after_max_age() {
+        let store = store();
+        store.suppress_next_opportunities(5).unwrap();
+        let max_age = Some(Duration::minutes(150));
+
+        assert!(store
+            .fatigue_suppression_active_at(Utc::now() + Duration::minutes(149), max_age)
+            .unwrap());
+        assert!(store
+            .fatigue_suppression_active_at(Utc::now() + Duration::minutes(500), None)
+            .unwrap());
+        assert!(!store
+            .fatigue_suppression_active_at(Utc::now() + Duration::minutes(151), max_age)
+            .unwrap());
+        assert!(store.state().unwrap().suppress_until_event_count.is_none());
+        assert!(!store.fatigue_suppression_active().unwrap());
     }
 
     #[test]

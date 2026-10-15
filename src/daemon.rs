@@ -351,7 +351,7 @@ fn process_event_with_notifier(
     ensure_exercise_pool(&store, &config)?;
     let event = payload.into_event_with_default(config.preferences.default_expected_duration_sec);
     store.insert_event(&event)?;
-    if store.fatigue_suppression_active()? {
+    if store.fatigue_suppression_active_at(Utc::now(), fatigue_max_age(&config))? {
         return Ok(EventResponse {
             recommended: false,
             recommendation: None,
@@ -389,7 +389,7 @@ fn process_idle_check_with_notifier(
         return Ok(not_recommended);
     }
     let store = Store::open(&env.paths.database_file)?;
-    if store.fatigue_suppression_active()?
+    if store.fatigue_suppression_active_at(now, fatigue_max_age(&config))?
         || store.today_set_count()? >= config.preferences.max_daily_sets
     {
         return Ok(not_recommended);
@@ -410,6 +410,15 @@ fn process_idle_check_with_notifier(
     }
     .into_event_with_default(config.preferences.default_expected_duration_sec);
     surface_forge(env, &store, &config, &event, notifier)
+}
+
+/// With idle forges on, a fatigue pause also ends after five idle intervals, so
+/// sessions with few prompts are not muted for the rest of the day.
+fn fatigue_max_age(config: &Config) -> Option<Duration> {
+    match config.preferences.idle_forge_minutes {
+        0 => None,
+        minutes => Some(Duration::minutes(i64::from(minutes) * 5)),
+    }
 }
 
 fn surface_forge(
@@ -1248,6 +1257,10 @@ mod tests {
         let store = Store::open(&env.paths.database_file).unwrap();
         store.suppress_next_opportunities(5).unwrap();
         assert!(!idle_check(&env, later()));
+        assert!(idle_check(
+            &env,
+            chrono::Utc::now() + chrono::Duration::minutes(151)
+        ));
     }
 
     #[test]
