@@ -445,7 +445,7 @@ fn surface_forge(
         AppStateKind::Recommendation | AppStateKind::Active
     ) || open_recommendation.is_some()
     {
-        if event.agent == Agent::Codex && event.event == "user_prompt_submit" {
+        if event.event == "user_prompt_submit" {
             if let Some(rec) = open_recommendation.as_ref() {
                 notify_recommendation(notifier, config.preferences.desktop_notifications, rec);
             }
@@ -1055,7 +1055,17 @@ mod tests {
     }
 
     #[test]
-    fn codex_prompts_repeat_notification_without_stacking_an_open_forge() {
+    fn prompts_repeat_notification_without_stacking_an_open_forge() {
+        for agent in [Agent::Codex, Agent::Claude, Agent::Pi, Agent::Hermes] {
+            assert_prompts_repeat_open_forge_notification(agent);
+        }
+    }
+
+    fn assert_prompts_repeat_open_forge_notification(agent: Agent) {
+        let prompt = || IncomingEvent {
+            agent,
+            ..codex_prompt_event()
+        };
         let env = test_env();
         let store = Store::open(&env.paths.database_file).unwrap();
         store.seed_movements().unwrap();
@@ -1077,9 +1087,8 @@ mod tests {
             true
         };
 
-        let first = process_event_with_notifier(&env, codex_prompt_event(), &notifier).unwrap();
-        let offered_reminder =
-            process_event_with_notifier(&env, codex_prompt_event(), &notifier).unwrap();
+        let first = process_event_with_notifier(&env, prompt(), &notifier).unwrap();
+        let offered_reminder = process_event_with_notifier(&env, prompt(), &notifier).unwrap();
 
         assert!(first.recommended);
         assert!(!offered_reminder.recommended);
@@ -1094,8 +1103,7 @@ mod tests {
         store
             .set_state(AppStateKind::Active, Some(id), None, None)
             .unwrap();
-        let active_reminder =
-            process_event_with_notifier(&env, codex_prompt_event(), &notifier).unwrap();
+        let active_reminder = process_event_with_notifier(&env, prompt(), &notifier).unwrap();
 
         assert!(!active_reminder.recommended);
         assert_eq!(
