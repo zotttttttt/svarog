@@ -2,6 +2,13 @@
 
 Notable changes to Svarog are recorded here by the automated release process.
 
+## [0.10.5](https://github.com/zotttttttt/svarog/compare/v0.10.4...v0.10.5) (2026-10-23)
+
+
+### Fixes
+
+* notify open forge on Claude prompts ([#70](https://github.com/zotttttttt/svarog/issues/70)) ([a1d5efe](https://github.com/zotttttttt/svarog/commit/a1d5efe32e631d12184ad0564a0025d2cf2e4bca))
+
 ## [0.10.4](https://github.com/zotttttttt/svarog/compare/v0.10.3...v0.10.4) (2026-10-15)
 
 
