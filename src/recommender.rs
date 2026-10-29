@@ -690,7 +690,13 @@ fn schedule_equipment_batch(
                 matches!(rec.side, Some(RecommendationSide::Left)),
             )
         });
-        let equipment = equipment.into_iter().take(8).collect::<Vec<_>>();
+        // Lead with up to two general sessions, then equipment pairs; never drop sessions
+        // when the batch has fewer general movements to lead with.
+        let leading = other.len().min(2);
+        let equipment = equipment
+            .into_iter()
+            .take(recommendations.len() - leading)
+            .collect::<Vec<_>>();
         other.truncate(recommendations.len().saturating_sub(equipment.len()));
         other.extend(equipment);
         other
@@ -3218,6 +3224,47 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1000,"cached_inp
 
         assert_eq!(squat.status, MovementStatus::Allowed);
         assert!(notice.is_none());
+    }
+
+    #[test]
+    fn equipment_scheduling_keeps_every_session_when_the_batch_is_all_equipment() {
+        let movements: Vec<Movement> = (0..5)
+            .map(|index| Movement {
+                id: format!("One_Arm_Kettlebell_{index}"),
+                name: format!("one arm kettlebell {index}"),
+                primary_muscle: format!("muscle {index}"),
+                muscles: vec![format!("muscle {index}")],
+                equipment: vec!["kettlebell".into()],
+                base_reps: 8,
+                estimated_seconds: 30,
+                status: MovementStatus::Allowed,
+                mobility: false,
+                sidedness: MovementSidedness::Unilateral,
+            })
+            .collect();
+        let recommendations: Vec<Recommendation> = movements
+            .iter()
+            .flat_map(|movement| {
+                [RecommendationSide::Right, RecommendationSide::Left].map(|side| Recommendation {
+                    id: None,
+                    movement_id: movement.id.clone(),
+                    movement_name: movement.name.clone(),
+                    primary_muscle: movement.primary_muscle.clone(),
+                    muscles: movement.muscles.clone(),
+                    reps: 8,
+                    weight_kg: Some(16.0),
+                    estimated_seconds: 30,
+                    agent: Agent::Custom,
+                    project: None,
+                    side: Some(side),
+                    created_at: Utc::now(),
+                })
+            })
+            .collect();
+
+        let scheduled = schedule_equipment_batch(movements, recommendations, true);
+
+        assert_eq!(scheduled.len(), 10);
     }
 
     #[test]
