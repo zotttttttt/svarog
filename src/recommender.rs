@@ -30,6 +30,9 @@ pub struct QueueGeneration {
     pub source: QueueGenerationSource,
     pub llm_count: usize,
     pub local_count: usize,
+    /// LLM candidates dropped by validation or batch rules, as `id: reason`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub rejected: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -211,6 +214,7 @@ fn generate_recommendation_queue_with_existing(
         project: None,
         created_at: Utc::now(),
     };
+    let mut rejected = Vec::new();
     let (mut recommendations, notice, source, llm_count, local_count) = match config
         .recommender
         .backend
@@ -223,7 +227,15 @@ fn generate_recommendation_queue_with_existing(
         RecommenderBackend::Codex
         | RecommenderBackend::OpenaiEnv
         | RecommenderBackend::OpenaiKeyring => {
-            match llm_queue(store, config, paths, &event, needed, existing) {
+            match llm_queue(
+                store,
+                config,
+                paths,
+                &event,
+                needed,
+                existing,
+                &mut rejected,
+            ) {
                 Ok(mut llm) => {
                     llm.truncate(needed as usize);
                     let llm_count = llm.len();
@@ -279,6 +291,7 @@ fn generate_recommendation_queue_with_existing(
         source,
         llm_count,
         local_count,
+        rejected,
     })
 }
 
@@ -500,6 +513,7 @@ fn llm_queue(
     event: &AgentEvent,
     needed: u32,
     existing: &[Recommendation],
+    rejected: &mut Vec<String>,
 ) -> Result<Vec<Recommendation>> {
     let context = build_context(store, config, event)?;
     let prompt = PromptRenderer::new(&paths.config_dir).recommendation_queue(&context, needed)?;
@@ -513,8 +527,17 @@ fn llm_queue(
     let movements = store.movements()?;
     let mut recommendations: Vec<Recommendation> = existing.to_vec();
     for candidate in batch.recommendations {
-        let Ok(Some(rec)) = validate_candidate(config, event, candidate, &movements) else {
-            continue;
+        let id = candidate.exercise_id.clone().unwrap_or_default();
+        let rec = match validate_candidate(config, event, candidate, &movements) {
+            Ok(Some(rec)) => rec,
+            Ok(None) => {
+                rejected.push(format!("{id}: no recommendation"));
+                continue;
+            }
+            Err(err) => {
+                rejected.push(format!("{id}: {err}"));
+                continue;
+            }
         };
         let repeats_movement = recommendations.iter().any(|existing| {
             existing.movement_id == rec.movement_id && !is_opposite_side_pair(existing, &rec)
@@ -525,7 +548,14 @@ fn llm_queue(
                     .last()
                     .is_some_and(|last| is_opposite_side_pair(last, &rec))
         });
-        if !repeats_movement && !repeats_muscle {
+        if repeats_movement {
+            rejected.push(format!("{}: repeats a movement", rec.movement_id));
+        } else if repeats_muscle {
+            rejected.push(format!(
+                "{}: repeats primary muscle {}",
+                rec.movement_id, rec.primary_muscle
+            ));
+        } else {
             recommendations.push(rec);
         }
         if recommendations.len() >= existing.len() + needed as usize {
@@ -2813,3 +2843,6 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1000,"cached_inp
         assert!(notice.is_none());
     }
 }
+
+#[cfg(test)]
+mod evals;
