@@ -2,6 +2,13 @@
 
 Notable changes to Svarog are recorded here by the automated release process.
 
+## [0.10.6](https://github.com/zotttttttt/svarog/compare/v0.10.5...v0.10.6) (2026-10-29)
+
+
+### Fixes
+
+* improve recommender instruction following ([#73](https://github.com/zotttttttt/svarog/issues/73)) ([9198af2](https://github.com/zotttttttt/svarog/commit/9198af24778ef08184648afd2d63115db3215661))
+
 ## [0.10.5](https://github.com/zotttttttt/svarog/compare/v0.10.4...v0.10.5) (2026-10-23)
 
 
