@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-pub const FUEL_MODEL: &str = "gpt-5.6-luna";
+pub const FUEL_MODEL: &str = "gpt-6-luna";
 const MAX_FUEL_ITEMS: usize = 20;
 const MAX_FUEL_EVENTS: usize = 12;
 const MAX_BATCH_ITEMS: usize = 40;

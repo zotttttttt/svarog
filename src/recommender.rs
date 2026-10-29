@@ -22,6 +22,13 @@ use std::time::{Duration, Instant};
 
 pub const QUEUE_TARGET: u32 = 10;
 pub const QUEUE_LOW_WATER_MARK: u32 = 1;
+/// Seconds reserved after a session so it comfortably fits the agent's downtime.
+const DOWNTIME_MARGIN_SEC: u32 = 15;
+const MAX_LLM_REPS: u32 = 20;
+/// Sessions per primary muscle in one queue; an opposite-side pair counts as one session.
+const MAX_SESSIONS_PER_PRIMARY_MUSCLE: usize = 2;
+/// Extra LLM candidates that replace any planned session Svarog rejects.
+const QUEUE_SPARES: u32 = 4;
 
 #[derive(Debug)]
 pub struct QueueGeneration {
@@ -30,6 +37,9 @@ pub struct QueueGeneration {
     pub source: QueueGenerationSource,
     pub llm_count: usize,
     pub local_count: usize,
+    /// LLM candidates dropped by validation or batch rules, as `id: reason`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub rejected: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,7 +59,49 @@ struct RecommendationContext {
     today_stats: TodayStats,
     recent_sets: Vec<ContextSet>,
     app_state: ContextAppState,
-    movements: Vec<ExerciseCatalogEntry>,
+    movements: Vec<ContextMovement>,
+}
+
+/// Catalog metadata plus what Svarog enforces locally: full equipment needs and sidedness.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ContextMovement {
+    id: String,
+    force: Option<String>,
+    mechanic: Option<String>,
+    equipment: Vec<String>,
+    primary_muscles: Vec<String>,
+    secondary_muscles: Vec<String>,
+    category: String,
+    #[serde(skip_serializing_if = "is_bilateral")]
+    sidedness: MovementSidedness,
+}
+
+fn is_bilateral(sidedness: &MovementSidedness) -> bool {
+    *sidedness == MovementSidedness::Bilateral
+}
+
+impl ContextMovement {
+    fn new(entry: ExerciseCatalogEntry, sidedness: MovementSidedness) -> Self {
+        let equipment = exercise_catalog::equipment_requirements_for_movement(&entry.id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|requirement| match requirement.count {
+                0 | 1 => requirement.kind.to_string(),
+                count => format!("{count}x {}", requirement.kind),
+            })
+            .collect();
+        Self {
+            id: entry.id,
+            force: entry.force,
+            mechanic: entry.mechanic,
+            equipment,
+            primary_muscles: entry.primary_muscles,
+            secondary_muscles: entry.secondary_muscles,
+            category: entry.category,
+            sidedness,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -211,6 +263,7 @@ fn generate_recommendation_queue_with_existing(
         project: None,
         created_at: Utc::now(),
     };
+    let mut rejected = Vec::new();
     let (mut recommendations, notice, source, llm_count, local_count) = match config
         .recommender
         .backend
@@ -223,7 +276,15 @@ fn generate_recommendation_queue_with_existing(
         RecommenderBackend::Codex
         | RecommenderBackend::OpenaiEnv
         | RecommenderBackend::OpenaiKeyring => {
-            match llm_queue(store, config, paths, &event, needed, existing) {
+            match llm_queue(
+                store,
+                config,
+                paths,
+                &event,
+                needed,
+                existing,
+                &mut rejected,
+            ) {
                 Ok(mut llm) => {
                     llm.truncate(needed as usize);
                     let llm_count = llm.len();
@@ -279,6 +340,7 @@ fn generate_recommendation_queue_with_existing(
         source,
         llm_count,
         local_count,
+        rejected,
     })
 }
 
@@ -500,39 +562,126 @@ fn llm_queue(
     event: &AgentEvent,
     needed: u32,
     existing: &[Recommendation],
+    rejected: &mut Vec<String>,
 ) -> Result<Vec<Recommendation>> {
     let context = build_context(store, config, event)?;
-    let prompt = PromptRenderer::new(&paths.config_dir).recommendation_queue(&context, needed)?;
+    let prompt = PromptRenderer::new(&paths.config_dir).recommendation_queue_with_spares(
+        &context,
+        needed,
+        QUEUE_SPARES,
+    )?;
+    let requested = needed + QUEUE_SPARES;
     let batch = match config.recommender.backend {
-        RecommenderBackend::Codex => call_codex_queue(store, config, &prompt, needed),
+        RecommenderBackend::Codex => call_codex_queue(store, config, &prompt, requested, event),
         RecommenderBackend::OpenaiEnv | RecommenderBackend::OpenaiKeyring => {
-            call_openai_queue(store, config, paths, &prompt, needed)
+            call_openai_queue(store, config, paths, &prompt, requested, event)
         }
         RecommenderBackend::Local => unreachable!(),
     }?;
     let movements = store.movements()?;
     let mut recommendations: Vec<Recommendation> = existing.to_vec();
     for candidate in batch.recommendations {
-        let Ok(Some(rec)) = validate_candidate(config, event, candidate, &movements) else {
-            continue;
+        let id = candidate.exercise_id.clone().unwrap_or_default();
+        let rec = match validate_candidate(config, event, candidate, &movements) {
+            Ok(Some(rec)) => rec,
+            Ok(None) => {
+                rejected.push(format!("{id}: no recommendation"));
+                continue;
+            }
+            Err(err) => {
+                rejected.push(format!("{id}: {err}"));
+                continue;
+            }
         };
         let repeats_movement = recommendations.iter().any(|existing| {
             existing.movement_id == rec.movement_id && !is_opposite_side_pair(existing, &rec)
         });
-        let repeats_muscle = recommendations.iter().any(|existing| {
-            existing.primary_muscle == rec.primary_muscle
-                && !recommendations
-                    .last()
-                    .is_some_and(|last| is_opposite_side_pair(last, &rec))
-        });
-        if !repeats_movement && !repeats_muscle {
+        let completes_pair = recommendations
+            .last()
+            .is_some_and(|last| is_opposite_side_pair(last, &rec));
+        let repeats_muscle = !completes_pair
+            && primary_muscle_sessions(&recommendations, &rec.primary_muscle)
+                >= MAX_SESSIONS_PER_PRIMARY_MUSCLE;
+        if repeats_movement {
+            rejected.push(format!("{}: repeats a movement", rec.movement_id));
+        } else if repeats_muscle {
+            rejected.push(format!(
+                "{}: repeats primary muscle {}",
+                rec.movement_id, rec.primary_muscle
+            ));
+        } else {
             recommendations.push(rec);
         }
-        if recommendations.len() >= existing.len() + needed as usize {
-            break;
+    }
+    let accepted = recommendations.split_off(existing.len());
+    Ok(keep_complete_side_pairs(
+        existing.last(),
+        accepted,
+        needed as usize,
+        rejected,
+    ))
+}
+
+fn is_single_side(rec: &Recommendation) -> bool {
+    matches!(
+        rec.side,
+        Some(RecommendationSide::Left | RecommendationSide::Right)
+    )
+}
+
+/// Takes up to `needed` sessions, keeping left/right sessions only as adjacent opposite pairs so
+/// the user is never asked to train one side alone or to stop between the two halves.
+fn keep_complete_side_pairs(
+    previous: Option<&Recommendation>,
+    accepted: Vec<Recommendation>,
+    needed: usize,
+    rejected: &mut Vec<String>,
+) -> Vec<Recommendation> {
+    let mut kept: Vec<Recommendation> = Vec::with_capacity(needed);
+    let mut accepted = accepted.into_iter().peekable();
+    while let Some(rec) = accepted.next() {
+        if !is_single_side(&rec) {
+            if kept.len() < needed {
+                kept.push(rec);
+            }
+            continue;
+        }
+        let completes_previous = kept.is_empty()
+            && previous.is_some_and(|previous| {
+                is_single_side(previous) && is_opposite_side_pair(previous, &rec)
+            });
+        if completes_previous {
+            if kept.len() < needed {
+                kept.push(rec);
+            }
+            continue;
+        }
+        match accepted.next_if(|next| is_opposite_side_pair(&rec, next)) {
+            Some(other) if kept.len() + 2 <= needed => {
+                kept.push(rec);
+                kept.push(other);
+            }
+            Some(_) => rejected.push(format!("{}: no room for both sides", rec.movement_id)),
+            None if kept.len() < needed => {
+                rejected.push(format!("{}: missing the opposite side", rec.movement_id))
+            }
+            None => {}
         }
     }
-    Ok(recommendations.into_iter().skip(existing.len()).collect())
+    kept
+}
+
+fn primary_muscle_sessions(recommendations: &[Recommendation], muscle: &str) -> usize {
+    recommendations
+        .iter()
+        .enumerate()
+        .filter(|(index, rec)| {
+            rec.primary_muscle == muscle
+                && !index
+                    .checked_sub(1)
+                    .is_some_and(|previous| is_opposite_side_pair(&recommendations[previous], rec))
+        })
+        .count()
 }
 
 fn is_opposite_side_pair(left: &Recommendation, right: &Recommendation) -> bool {
@@ -600,7 +749,13 @@ fn schedule_equipment_batch(
                 matches!(rec.side, Some(RecommendationSide::Left)),
             )
         });
-        let equipment = equipment.into_iter().take(8).collect::<Vec<_>>();
+        // Lead with up to two general sessions, then equipment pairs; never drop sessions
+        // when the batch has fewer general movements to lead with.
+        let leading = other.len().min(2);
+        let equipment = equipment
+            .into_iter()
+            .take(recommendations.len() - leading)
+            .collect::<Vec<_>>();
         other.truncate(recommendations.len().saturating_sub(equipment.len()));
         other.extend(equipment);
         other
@@ -622,7 +777,241 @@ fn schedule_equipment_batch(
     }
 }
 
+/// Resolves the user's movement pool: equipment first, then preference and injury exclusions.
 pub fn initial_exercise_profile(
+    store: &Store,
+    config: &Config,
+    paths: &Paths,
+) -> (Vec<Movement>, Option<String>) {
+    let (movements, equipment_notice) = equipment_movement_pool(store, config, paths);
+    let (movements, constraints_notice) =
+        apply_exercise_constraints(store, config, paths, movements);
+    (movements, equipment_notice.or(constraints_notice))
+}
+
+/// User exclusions win over variety; only an empty result falls back to the full pool.
+const MIN_CONSTRAINED_POOL: usize = 1;
+const CONSTRAINT_INSTRUCTION_CHARS: usize = 160;
+
+#[derive(Debug, Serialize)]
+struct ExerciseConstraintsContext<'a> {
+    exercise_preferences: &'a str,
+    injuries: &'a [String],
+    movements: Vec<ConstraintMovement>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConstraintMovement {
+    id: String,
+    category: String,
+    equipment: Option<String>,
+    primary_muscles: Vec<String>,
+    start: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LlmExerciseConstraints {
+    excluded: Vec<LlmExcludedMovement>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LlmExcludedMovement {
+    exercise_id: String,
+    reason: String,
+}
+
+fn has_exercise_constraints(profile: &Profile) -> bool {
+    let preferences = profile.exercise_preferences.trim();
+    let has_preferences = !preferences.is_empty() && !preferences.eq_ignore_ascii_case("automatic");
+    has_preferences || profile.injuries.iter().any(|item| !item.trim().is_empty())
+}
+
+/// Rebuilds the pool from the user's equipment text and applies preference and injury exclusions.
+/// Used after Settings changes and catalog upgrades, which do not rerun equipment normalization.
+pub fn rebuild_exercise_pool(
+    store: &Store,
+    config: &Config,
+    paths: &Paths,
+) -> Result<Option<String>> {
+    let (movements, equipment) = local_resolved_movements(config);
+    let (movements, notice) = apply_exercise_constraints(store, config, paths, movements);
+    store.save_exercise_filter(&equipment)?;
+    store.replace_movement_pool(&movements)?;
+    Ok(notice)
+}
+
+/// Fast, offline version of the exclusion step for synchronous Settings saves.
+pub fn locally_constrained_movements(config: &Config, movements: Vec<Movement>) -> Vec<Movement> {
+    if !has_exercise_constraints(&config.profile) {
+        return movements;
+    }
+    let excluded: Vec<String> = movements
+        .iter()
+        .filter(|movement| conflicts_with_preferences(config, movement))
+        .map(|movement| movement.id.clone())
+        .collect();
+    filter_excluded_movements(config, movements, &excluded).0
+}
+
+fn apply_exercise_constraints(
+    store: &Store,
+    config: &Config,
+    paths: &Paths,
+    movements: Vec<Movement>,
+) -> (Vec<Movement>, Option<String>) {
+    if !has_exercise_constraints(&config.profile) {
+        return (movements, None);
+    }
+    let excluded: Result<Vec<String>> = if config.recommender.backend == RecommenderBackend::Local {
+        Ok(movements
+            .iter()
+            .filter(|movement| conflicts_with_preferences(config, movement))
+            .map(|movement| movement.id.clone())
+            .collect())
+    } else {
+        PromptRenderer::new(&paths.config_dir)
+            .exercise_constraints(&exercise_constraints_context(config, &movements))
+            .and_then(|prompt| match config.recommender.backend {
+                RecommenderBackend::Codex => {
+                    call_codex_json(store, config, &prompt, &exercise_constraints_schema())
+                }
+                RecommenderBackend::OpenaiEnv | RecommenderBackend::OpenaiKeyring => {
+                    let body = openai_structured_request_body(
+                        config,
+                        &prompt,
+                        "svarog_exercise_constraints",
+                        exercise_constraints_schema(),
+                    );
+                    call_openai_json(store, config, paths, body)
+                        .context("parsing OpenAI exercise constraints")
+                }
+                RecommenderBackend::Local => unreachable!(),
+            })
+            .map(|constraints: LlmExerciseConstraints| {
+                constraints
+                    .excluded
+                    .into_iter()
+                    .map(|item| item.exercise_id)
+                    .collect()
+            })
+    };
+    let excluded = match excluded {
+        Ok(excluded) => excluded,
+        Err(err) => {
+            let notice = config
+                .recommender
+                .show_llm_failures
+                .then(|| format!("Could not apply exercise preferences to the catalog: {err}"));
+            return (movements, notice);
+        }
+    };
+    filter_excluded_movements(config, movements, &excluded)
+}
+
+fn filter_excluded_movements(
+    config: &Config,
+    movements: Vec<Movement>,
+    excluded: &[String],
+) -> (Vec<Movement>, Option<String>) {
+    let excluded: std::collections::HashSet<&str> = excluded.iter().map(String::as_str).collect();
+    let remaining = movements
+        .iter()
+        .filter(|movement| !excluded.contains(movement.id.as_str()))
+        .count();
+    if remaining < MIN_CONSTRAINED_POOL {
+        let notice = config.recommender.show_llm_failures.then(|| {
+            format!(
+                "Exercise preferences would leave only {remaining} movements; keeping the full catalog"
+            )
+        });
+        return (movements, notice);
+    }
+    (
+        movements
+            .into_iter()
+            .filter(|movement| !excluded.contains(movement.id.as_str()))
+            .collect(),
+        None,
+    )
+}
+
+fn exercise_constraints_context<'a>(
+    config: &'a Config,
+    movements: &[Movement],
+) -> ExerciseConstraintsContext<'a> {
+    ExerciseConstraintsContext {
+        exercise_preferences: &config.profile.exercise_preferences,
+        injuries: &config.profile.injuries,
+        movements: exercise_catalog::entries_for_movements(movements)
+            .into_iter()
+            .map(|entry| ConstraintMovement {
+                start: entry
+                    .instructions
+                    .join(" ")
+                    .chars()
+                    .take(CONSTRAINT_INSTRUCTION_CHARS)
+                    .collect(),
+                id: entry.id,
+                category: entry.category,
+                equipment: entry.equipment,
+                primary_muscles: entry.primary_muscles,
+            })
+            .collect(),
+    }
+}
+
+fn exercise_constraints_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["excluded"],
+        "properties": {
+            "excluded": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["exercise_id", "reason"],
+                    "properties": {
+                        "exercise_id": { "type": "string" },
+                        "reason": { "type": "string" }
+                    }
+                }
+            }
+        }
+    })
+}
+
+fn openai_structured_request_body(
+    config: &Config,
+    prompt: &str,
+    name: &str,
+    schema: serde_json::Value,
+) -> serde_json::Value {
+    json!({
+        "model": config.recommender.openai.model,
+        "reasoning": {
+            "effort": config.recommender.openai.reasoning_effort
+        },
+        "input": [
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ],
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": name,
+                "strict": true,
+                "schema": schema
+            }
+        }
+    })
+}
+
+fn equipment_movement_pool(
     store: &Store,
     config: &Config,
     paths: &Paths,
@@ -766,7 +1155,20 @@ fn build_context(
             cooldown_muscle: state.cooldown_muscle,
             cooldown_until: state.cooldown_until.map(|dt| dt.to_rfc3339()),
         },
-        movements: exercise_catalog::entries_for_movements(&store.movements()?),
+        movements: {
+            let movements = store.movements()?;
+            let sidedness: std::collections::HashMap<_, _> = movements
+                .iter()
+                .map(|movement| (movement.id.clone(), movement.sidedness))
+                .collect();
+            exercise_catalog::entries_for_movements(&movements)
+                .into_iter()
+                .map(|entry| {
+                    let side = sidedness.get(&entry.id).copied().unwrap_or_default();
+                    ContextMovement::new(entry, side)
+                })
+                .collect()
+        },
     })
 }
 
@@ -790,8 +1192,14 @@ fn call_codex_queue(
     config: &Config,
     prompt: &str,
     needed: u32,
+    event: &AgentEvent,
 ) -> Result<LlmRecommendationBatch> {
-    call_codex_json(store, config, prompt, &recommendation_queue_schema(needed))
+    call_codex_json(
+        store,
+        config,
+        prompt,
+        &recommendation_queue_schema(needed, max_session_seconds(event)),
+    )
 }
 
 fn call_codex_exercise_profile(
@@ -1091,8 +1499,9 @@ fn call_openai_queue(
     paths: &Paths,
     prompt: &str,
     needed: u32,
+    event: &AgentEvent,
 ) -> Result<LlmRecommendationBatch> {
-    let body = openai_queue_request_body(config, prompt, needed)?;
+    let body = openai_queue_request_body(config, prompt, needed, max_session_seconds(event))?;
     call_openai_json(store, config, paths, body).context("parsing OpenAI recommendation queue")
 }
 
@@ -1290,6 +1699,7 @@ fn openai_queue_request_body(
     config: &Config,
     prompt: &str,
     needed: u32,
+    max_duration_sec: u32,
 ) -> Result<serde_json::Value> {
     Ok(json!({
         "model": config.recommender.openai.model,
@@ -1307,28 +1717,37 @@ fn openai_queue_request_body(
                 "type": "json_schema",
                 "name": "svarog_recommendation_queue",
                 "strict": true,
-                "schema": recommendation_queue_schema(needed)
+                "schema": recommendation_queue_schema(needed, max_duration_sec)
             }
         }
     }))
 }
 
-fn recommendation_schema() -> serde_json::Value {
+fn max_session_seconds(event: &AgentEvent) -> u32 {
+    event
+        .expected_duration_sec
+        .saturating_sub(DOWNTIME_MARGIN_SEC)
+        .max(1)
+}
+
+/// Mirrors `validate_candidate` so the model cannot emit values Svarog would discard.
+fn recommendation_schema(max_duration_sec: u32) -> serde_json::Value {
     json!({
         "type": "object",
         "additionalProperties": false,
         "required": [
-            "action", "exercise_id", "reps", "sets", "weight_text", "duration_sec",
+            "action", "exercise_id", "primary_muscle", "reps", "sets", "weight_text", "duration_sec",
             "safety_notes", "rationale"
             , "side"
         ],
         "properties": {
             "action": { "type": "string", "enum": ["recommend", "no_recommendation"] },
             "exercise_id": { "type": ["string", "null"] },
-            "reps": { "type": ["integer", "null"], "minimum": 1, "maximum": 30 },
-            "sets": { "type": ["integer", "null"], "minimum": 1, "maximum": 3 },
+            "primary_muscle": { "type": ["string", "null"] },
+            "reps": { "type": "integer", "minimum": 1, "maximum": MAX_LLM_REPS },
+            "sets": { "type": "integer", "enum": [1] },
             "weight_text": { "type": ["string", "null"] },
-            "duration_sec": { "type": ["integer", "null"], "minimum": 1, "maximum": 600 },
+            "duration_sec": { "type": "integer", "minimum": 1, "maximum": max_duration_sec },
             "safety_notes": { "type": ["string", "null"] },
             "rationale": { "type": ["string", "null"] }
             , "side": { "type": ["string", "null"], "enum": ["left", "right", "bilateral", "both", null] }
@@ -1336,7 +1755,7 @@ fn recommendation_schema() -> serde_json::Value {
     })
 }
 
-fn recommendation_queue_schema(needed: u32) -> serde_json::Value {
+fn recommendation_queue_schema(needed: u32, max_duration_sec: u32) -> serde_json::Value {
     json!({
         "type": "object",
         "additionalProperties": false,
@@ -1346,7 +1765,7 @@ fn recommendation_queue_schema(needed: u32) -> serde_json::Value {
                 "type": "array",
                 "minItems": needed,
                 "maxItems": needed,
-                "items": recommendation_schema()
+                "items": recommendation_schema(max_duration_sec)
             }
         }
     })
@@ -1506,10 +1925,10 @@ fn validate_candidate(
     if sets != 1 {
         bail!("LLM recommended more than one set");
     }
-    if reps > 20 {
+    if reps > MAX_LLM_REPS {
         bail!("LLM recommended too many reps");
     }
-    if duration_sec + 15 > event.expected_duration_sec {
+    if duration_sec + DOWNTIME_MARGIN_SEC > event.expected_duration_sec {
         bail!("LLM recommendation does not fit downtime");
     }
     let movement = movements
@@ -1559,6 +1978,59 @@ fn validate_candidate(
 
 fn required<T>(value: Option<T>, name: &str) -> Result<T> {
     value.ok_or_else(|| anyhow!("LLM recommendation missing {name}"))
+}
+
+/// Keyword exclusions for the local backend; LLM backends judge preferences semantically.
+fn conflicts_with_preferences(config: &Config, movement: &Movement) -> bool {
+    const NEGATIONS: &[&str] = &[
+        "no ", "not ", "avoid", "don't", "dont", "without", "hate", "dislike", "never",
+    ];
+    const FLOOR_IDS: &[&str] = &[
+        "push-up",
+        "pushup",
+        "push_up",
+        "plank",
+        "crunch",
+        "sit-up",
+        "situp",
+        "bridge",
+        "lying",
+        "prone",
+        "supine",
+        "floor",
+        "kneeling",
+        "superman",
+        "dead_bug",
+        "mountain",
+        "groiner",
+        "burpee",
+        "all_fours",
+        "inchworm",
+        "hip_circles_prone",
+    ];
+    const JUMP_IDS: &[&str] = &["jump", "hop", "skip", "bound", "burpee", "jack", "sprint"];
+    let id = movement.id.to_lowercase();
+    let category = exercise_catalog::find(&movement.id)
+        .map(|entry| entry.category.as_str())
+        .unwrap_or_default();
+    let is_floor = FLOOR_IDS.iter().any(|needle| id.contains(needle));
+    let is_jump = category == "plyometrics" || JUMP_IDS.iter().any(|needle| id.contains(needle));
+    let text = config.profile.exercise_preferences.to_lowercase();
+    text.split([',', ';', '.', '\n'])
+        .map(|clause| format!(" {} ", clause.trim()))
+        .filter(|clause| NEGATIONS.iter().any(|negation| clause.contains(negation)))
+        .any(|clause| {
+            let floor = [
+                "floor", "push-up", "pushup", "push up", "lying", "kneel", "plank",
+            ]
+            .iter()
+            .any(|word| clause.contains(word));
+            let jump = ["jump", "plyo", "hop", "impact"]
+                .iter()
+                .any(|word| clause.contains(word));
+            let stretch = clause.contains("stretch");
+            (floor && is_floor) || (jump && is_jump) || (stretch && category == "stretching")
+        })
 }
 
 fn conflicts_with_limitations(config: &Config, primary_muscle: &str, muscles: &[String]) -> bool {
@@ -1804,9 +2276,9 @@ mod tests {
         let prompt = PromptRenderer::new(&test_paths().config_dir)
             .recommendation_queue(&context, QUEUE_TARGET)
             .unwrap();
-        let body = openai_queue_request_body(&config, &prompt, QUEUE_TARGET).unwrap();
+        let body = openai_queue_request_body(&config, &prompt, QUEUE_TARGET, 45).unwrap();
 
-        assert_eq!(body["model"], "gpt-5.6-luna");
+        assert_eq!(body["model"], "gpt-6-luna");
         assert_eq!(body["reasoning"]["effort"], "low");
         assert_eq!(body["text"]["format"]["type"], "json_schema");
         assert_eq!(
@@ -1827,7 +2299,7 @@ mod tests {
     #[test]
     fn recommendation_schema_requires_the_requested_queue_size() {
         for needed in [2, QUEUE_TARGET] {
-            let schema = recommendation_queue_schema(needed);
+            let schema = recommendation_queue_schema(needed, 45);
             assert_eq!(schema["properties"]["recommendations"]["minItems"], needed);
             assert_eq!(schema["properties"]["recommendations"]["maxItems"], needed);
         }
@@ -1924,7 +2396,7 @@ mod tests {
         assert!(rendered.get("today_events").is_none());
         assert!(rendered.get("today_sets").is_none());
         assert!(prompt.len() < 60_000, "prompt was {} bytes", prompt.len());
-        assert!(prompt.contains("Return exactly 10 valid, distinct recommendations"));
+        assert!(prompt.contains("Return exactly 10 distinct recommendations"));
         assert!(!prompt.contains("return fewer"));
     }
 
@@ -2207,7 +2679,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":24763,"cached_in
             &store,
             &config,
             "ignored",
-            &recommendation_queue_schema(QUEUE_TARGET),
+            &recommendation_queue_schema(QUEUE_TARGET, 45),
         )
         .unwrap();
         assert!(batch.recommendations.is_empty());
@@ -2249,8 +2721,8 @@ sleep 30
             &store,
             &config,
             "ignored",
-            &recommendation_queue_schema(QUEUE_TARGET),
-            "gpt-5.6-luna",
+            &recommendation_queue_schema(QUEUE_TARGET, 45),
+            "gpt-6-luna",
             cancel.as_ref(),
         )
         .unwrap_err();
@@ -2297,8 +2769,8 @@ printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"{
             &config,
             "describe",
             &images,
-            &recommendation_queue_schema(QUEUE_TARGET),
-            "gpt-5.6-luna",
+            &recommendation_queue_schema(QUEUE_TARGET, 45),
+            "gpt-6-luna",
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -2344,7 +2816,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input
             &store,
             &config,
             "ignored",
-            &recommendation_queue_schema(QUEUE_TARGET),
+            &recommendation_queue_schema(QUEUE_TARGET, 45),
         )
         .unwrap();
 
@@ -2366,7 +2838,7 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 printf '%s\n' "$model" >> "__LOG__"
-if [ "$model" = "gpt-5.6-luna" ]; then
+if [ "$model" = "gpt-6-luna" ]; then
   printf '%s\n' 'model unavailable' >&2
   exit 1
 fi
@@ -2388,12 +2860,12 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":100,"cached_inpu
             &store,
             &config,
             "ignored",
-            &recommendation_queue_schema(QUEUE_TARGET),
+            &recommendation_queue_schema(QUEUE_TARGET, 45),
         )
         .unwrap();
 
         assert!(batch.recommendations.is_empty());
-        assert_eq!(fs::read_to_string(log).unwrap(), "gpt-5.6-luna\ninherit\n");
+        assert_eq!(fs::read_to_string(log).unwrap(), "gpt-6-luna\ninherit\n");
         let usage = store
             .recommender_token_usage_summary_for(RecommenderTokenProvider::Codex)
             .unwrap();
@@ -2414,7 +2886,7 @@ while [ "$#" -gt 0 ]; do
   fi
   shift
 done
-if [ "$model" = "gpt-5.6-luna" ]; then
+if [ "$model" = "gpt-6-luna" ]; then
   sleep 0.8
   exit 1
 fi
@@ -2435,7 +2907,7 @@ exec sleep 2
             &store,
             &config,
             "ignored",
-            &recommendation_queue_schema(QUEUE_TARGET),
+            &recommendation_queue_schema(QUEUE_TARGET, 45),
         );
 
         let error = result.unwrap_err();
@@ -2480,11 +2952,11 @@ exec sleep 5
             &store,
             &config,
             "ignored",
-            &recommendation_queue_schema(QUEUE_TARGET),
+            &recommendation_queue_schema(QUEUE_TARGET, 45),
         );
 
         assert!(result.unwrap_err().to_string().contains("timed out"));
-        assert_eq!(fs::read_to_string(log).unwrap(), "gpt-5.6-luna\n");
+        assert_eq!(fs::read_to_string(log).unwrap(), "gpt-6-luna\n");
     }
 
     #[test]
@@ -2534,7 +3006,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1000,"cached_inp
             &store,
             &config,
             "ignored",
-            &recommendation_queue_schema(QUEUE_TARGET),
+            &recommendation_queue_schema(QUEUE_TARGET, 45),
         );
 
         assert!(result.is_err());
@@ -2812,4 +3284,227 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1000,"cached_inp
         assert_eq!(squat.status, MovementStatus::Allowed);
         assert!(notice.is_none());
     }
+
+    #[test]
+    fn equipment_scheduling_keeps_every_session_when_the_batch_is_all_equipment() {
+        let movements: Vec<Movement> = (0..5)
+            .map(|index| Movement {
+                id: format!("One_Arm_Kettlebell_{index}"),
+                name: format!("one arm kettlebell {index}"),
+                primary_muscle: format!("muscle {index}"),
+                muscles: vec![format!("muscle {index}")],
+                equipment: vec!["kettlebell".into()],
+                base_reps: 8,
+                estimated_seconds: 30,
+                status: MovementStatus::Allowed,
+                mobility: false,
+                sidedness: MovementSidedness::Unilateral,
+            })
+            .collect();
+        let recommendations: Vec<Recommendation> = movements
+            .iter()
+            .flat_map(|movement| {
+                [RecommendationSide::Right, RecommendationSide::Left].map(|side| Recommendation {
+                    id: None,
+                    movement_id: movement.id.clone(),
+                    movement_name: movement.name.clone(),
+                    primary_muscle: movement.primary_muscle.clone(),
+                    muscles: movement.muscles.clone(),
+                    reps: 8,
+                    weight_kg: Some(16.0),
+                    estimated_seconds: 30,
+                    agent: Agent::Custom,
+                    project: None,
+                    side: Some(side),
+                    created_at: Utc::now(),
+                })
+            })
+            .collect();
+
+        let scheduled = schedule_equipment_batch(movements, recommendations, true);
+
+        assert_eq!(scheduled.len(), 10);
+    }
+
+    #[test]
+    fn side_pairs_are_kept_whole_or_dropped() {
+        let rec = |id: &str, side: Option<RecommendationSide>| Recommendation {
+            id: None,
+            movement_id: id.into(),
+            movement_name: id.into(),
+            primary_muscle: id.into(),
+            muscles: vec![id.into()],
+            reps: 8,
+            weight_kg: None,
+            estimated_seconds: 30,
+            agent: Agent::Custom,
+            project: None,
+            side,
+            created_at: Utc::now(),
+        };
+        let left = Some(RecommendationSide::Left);
+        let right = Some(RecommendationSide::Right);
+        let both = Some(RecommendationSide::Bilateral);
+        let ids = |recs: &[Recommendation]| {
+            recs.iter()
+                .map(|rec| format!("{}{:?}", rec.movement_id, rec.side.unwrap()))
+                .collect::<Vec<_>>()
+        };
+        let mut rejected = Vec::new();
+
+        let kept = keep_complete_side_pairs(
+            None,
+            vec![
+                rec("Lunge", right),
+                rec("Squat", both),
+                rec("Row", right),
+                rec("Row", left),
+                rec("Bridge", both),
+                rec("Kickback", left),
+                rec("Kickback", right),
+            ],
+            4,
+            &mut rejected,
+        );
+
+        assert_eq!(
+            ids(&kept),
+            ["SquatBilateral", "RowRight", "RowLeft", "BridgeBilateral"]
+        );
+        assert_eq!(
+            rejected,
+            [
+                "Lunge: missing the opposite side",
+                "Kickback: no room for both sides"
+            ]
+        );
+    }
+
+    #[test]
+    fn primary_muscle_sessions_count_opposite_side_pairs_once() {
+        let rec = |id: &str, muscle: &str, side: Option<RecommendationSide>| Recommendation {
+            id: None,
+            movement_id: id.into(),
+            movement_name: id.into(),
+            primary_muscle: muscle.into(),
+            muscles: vec![muscle.into()],
+            reps: 8,
+            weight_kg: None,
+            estimated_seconds: 30,
+            agent: Agent::Custom,
+            project: None,
+            side,
+            created_at: Utc::now(),
+        };
+        let batch = vec![
+            rec("One_Arm_Row", "lats", Some(RecommendationSide::Left)),
+            rec("One_Arm_Row", "lats", Some(RecommendationSide::Right)),
+            rec("Pullups", "lats", Some(RecommendationSide::Bilateral)),
+            rec("Bodyweight_Squat", "quadriceps", None),
+        ];
+
+        assert_eq!(primary_muscle_sessions(&batch, "lats"), 2);
+        assert_eq!(primary_muscle_sessions(&batch, "quadriceps"), 1);
+        assert_eq!(primary_muscle_sessions(&batch, "chest"), 0);
+    }
+
+    #[test]
+    fn local_preferences_exclude_floor_and_jumping_movements() {
+        let mut config = Config::default();
+        config.profile.exercise_preferences =
+            "no jumping, no bodyweight on the floor like push-ups, for example".into();
+        let pool = exercise_catalog::movements_for_equipment(&["bodyweight".to_string()]);
+        let filtered = locally_constrained_movements(&config, pool.clone());
+        let ids: Vec<_> = filtered
+            .iter()
+            .map(|movement| movement.id.as_str())
+            .collect();
+
+        assert!(!filtered.is_empty());
+        assert!(filtered.len() < pool.len());
+        for excluded in ["Pushups", "Clock_Push-Up", "Plank", "Butt_Lift_Bridge"] {
+            assert!(!ids.contains(&excluded), "{excluded} was kept");
+        }
+        assert!(!filtered.iter().any(|movement| {
+            exercise_catalog::find(&movement.id).unwrap().category == "plyometrics"
+        }));
+        assert!(ids.contains(&"Bodyweight_Squat"));
+    }
+
+    #[test]
+    fn local_preferences_ignore_positive_mentions() {
+        let mut config = Config::default();
+        config.profile.exercise_preferences = "I love push-ups and jumping".into();
+        let pool = exercise_catalog::movements_for_equipment(&["bodyweight".to_string()]);
+
+        assert_eq!(
+            locally_constrained_movements(&config, pool.clone()).len(),
+            pool.len()
+        );
+    }
+
+    #[test]
+    fn exclusions_never_starve_the_pool() {
+        let mut config = Config::default();
+        config.recommender.show_llm_failures = true;
+        let pool = exercise_catalog::movements_for_equipment(&["bodyweight".to_string()]);
+        let everything: Vec<_> = pool.iter().map(|movement| movement.id.clone()).collect();
+
+        let (kept, notice) = filter_excluded_movements(&config, pool.clone(), &everything);
+
+        assert_eq!(kept.len(), pool.len());
+        assert!(notice.unwrap().contains("keeping the full catalog"));
+    }
+
+    #[test]
+    fn recommender_exclusions_filter_the_initial_pool() {
+        let response = json!({
+            "excluded": [
+                { "exercise_id": "Pushups", "reason": "floor push-up" },
+                { "exercise_id": "Not_A_Movement", "reason": "unknown ids are ignored" }
+            ]
+        });
+        let mut config = codex_config_returning(&response.to_string());
+        config.profile.exercise_preferences = "no push-ups".into();
+        let store = test_store();
+        let pool = exercise_catalog::movements_for_equipment(&["bodyweight".to_string()]);
+
+        let (movements, notice) =
+            apply_exercise_constraints(&store, &config, &test_paths(), pool.clone());
+
+        assert!(notice.is_none());
+        assert_eq!(movements.len(), pool.len() - 1);
+        assert!(!movements.iter().any(|movement| movement.id == "Pushups"));
+    }
+
+    #[test]
+    fn exercise_constraints_are_skipped_without_preferences_or_injuries() {
+        let config = codex_config_returning("not json");
+        let pool = exercise_catalog::movements_for_equipment(&["bodyweight".to_string()]);
+
+        let (movements, notice) =
+            apply_exercise_constraints(&test_store(), &config, &test_paths(), pool.clone());
+
+        assert_eq!(movements.len(), pool.len());
+        assert!(notice.is_none());
+    }
+
+    #[test]
+    fn exercise_constraints_prompt_lists_preferences_and_instruction_starts() {
+        let mut config = Config::default();
+        config.profile.exercise_preferences = "no floor work".into();
+        config.profile.injuries = vec!["wrist pain".into()];
+        let pool = exercise_catalog::movements_for_equipment(&["bodyweight".to_string()]);
+        let prompt = PromptRenderer::new(&test_paths().config_dir)
+            .exercise_constraints(&exercise_constraints_context(&config, &pool))
+            .unwrap();
+
+        assert!(prompt.contains("\"no floor work\""));
+        assert!(prompt.contains("wrist pain"));
+        assert!(prompt.contains("\"start\":"));
+        assert!(prompt.contains("\"id\":\"Pushups\""));
+    }
 }
+
+#[cfg(test)]
+mod evals;

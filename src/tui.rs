@@ -2959,16 +2959,22 @@ fn remove_saved_openai_key_with(
     Ok(())
 }
 
-/// Applies Settings synchronously. Changing the recommender backend or the
-/// alternate-sides preference replaces the future-forge queue, because queued
-/// sides would no longer match; all other changes keep compatible queued work.
+/// Applies Settings synchronously. Changing the recommender backend, the
+/// alternate-sides preference, or anything that shapes exercise choice (goals,
+/// equipment, preferences, injuries, archetype) replaces the future-forge queue,
+/// because queued work may no longer match; other changes keep queued work.
 fn apply_settings(
     env: &RuntimeEnv,
     draft: &Config,
 ) -> Result<Option<Receiver<QueueRegenerationResult>>> {
     let previous = config::load_or_default(&env.paths)?;
     let regenerate_queue = previous.recommender.backend != draft.recommender.backend
-        || previous.profile.alternate_sides != draft.profile.alternate_sides;
+        || previous.profile.alternate_sides != draft.profile.alternate_sides
+        || previous.profile.goals != draft.profile.goals
+        || previous.profile.equipment_text != draft.profile.equipment_text
+        || previous.profile.exercise_preferences != draft.profile.exercise_preferences
+        || previous.profile.injuries != draft.profile.injuries
+        || previous.forge != draft.forge;
     let agent_changed = previous.agents.coding_agent != draft.agents.coding_agent;
     if agent_changed {
         let selection = draft
@@ -2985,7 +2991,10 @@ fn apply_settings(
         return Err(error);
     }
     let equipment = exercise_catalog::locally_resolved_equipment(&draft.profile.equipment_text);
-    let movements = exercise_catalog::movements_for_equipment(&equipment);
+    let movements = crate::recommender::locally_constrained_movements(
+        draft,
+        exercise_catalog::movements_for_equipment(&equipment),
+    );
     let equipment_filter = serde_json::to_string(&crate::recommender::normalize_equipment(
         &draft.profile.equipment_text,
     ))?;
@@ -5330,17 +5339,45 @@ mod tests {
     }
 
     #[test]
-    fn settings_apply_without_backend_change_does_not_regenerate_queue() {
+    fn settings_apply_without_exercise_change_does_not_regenerate_queue() {
         let root = tempdir().unwrap().keep();
         let env = test_env(root);
         let mut draft = Config::default();
-        draft.profile.goals = vec!["mobility".into()];
+        draft.preferences.max_daily_sets += 1;
 
         assert!(apply_settings(&env, &draft).unwrap().is_none());
         assert_eq!(
-            config::load_or_default(&env.paths).unwrap().profile.goals,
-            vec!["mobility"]
+            config::load_or_default(&env.paths)
+                .unwrap()
+                .preferences
+                .max_daily_sets,
+            draft.preferences.max_daily_sets
         );
+    }
+
+    #[test]
+    fn settings_apply_with_exercise_preferences_change_regenerates_and_filters_pool() {
+        let root = tempdir().unwrap().keep();
+        let env = test_env(root);
+        config::save(&env.paths, &Config::default()).unwrap();
+        let mut draft = Config::default();
+        draft.profile.exercise_preferences =
+            "no jumping, no bodyweight on the floor like push-ups".into();
+
+        let receiver = apply_settings(&env, &draft).unwrap();
+        assert!(receiver
+            .expect("preference changes should regenerate future forges")
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .is_ok());
+        let movements = Store::open(&env.paths.database_file)
+            .unwrap()
+            .movements()
+            .unwrap();
+        assert!(!movements.is_empty());
+        assert!(!movements
+            .iter()
+            .any(|movement| movement.id == "Pushups" || movement.id == "Clock_Push-Up"));
     }
 
     #[test]
@@ -5404,7 +5441,7 @@ mod tests {
         let root = tempdir().unwrap().keep();
         let env = test_env(root);
         let mut settings = settings_state();
-        settings.draft.profile.goals = vec!["mobility".into()];
+        settings.draft.preferences.max_daily_sets += 1;
         let mut ui = TuiState {
             settings: Some(settings),
             ..TuiState::default()

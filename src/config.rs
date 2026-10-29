@@ -566,11 +566,11 @@ pub fn clamp_idle_forge_minutes(minutes: u32) -> u32 {
 }
 
 fn default_codex_recommender_model() -> String {
-    "gpt-5.6-luna".to_string()
+    "gpt-6-luna".to_string()
 }
 
 fn default_openai_recommender_model() -> String {
-    "gpt-5.6-luna".to_string()
+    "gpt-6-luna".to_string()
 }
 
 #[derive(Debug, Clone)]
@@ -961,11 +961,17 @@ fn normalize_loaded_config(config: &mut Config) {
     if config.recommender.timeout_ms == 8_000 {
         config.recommender.timeout_ms = 60_000;
     }
-    if config.recommender.openai.model == "gpt-5.4-nano" {
+    if matches!(
+        config.recommender.openai.model.as_str(),
+        "gpt-5.4-nano" | "gpt-5.6-luna"
+    ) {
         config.recommender.openai.model = default_openai_recommender_model();
     }
     if let Some(model) = take_codex_model_arg(&mut config.recommender.codex.args) {
         config.recommender.codex.model = model;
+    }
+    if config.recommender.codex.model == "gpt-5.6-luna" {
+        config.recommender.codex.model = default_codex_recommender_model();
     }
 }
 
@@ -1114,8 +1120,8 @@ mod tests {
                 .windows(2)
                 .any(|args| args == ["--disable", feature]));
         }
-        assert_eq!(config.recommender.codex.model, "gpt-5.6-luna");
-        assert_eq!(config.recommender.openai.model, "gpt-5.6-luna");
+        assert_eq!(config.recommender.codex.model, "gpt-6-luna");
+        assert_eq!(config.recommender.openai.model, "gpt-6-luna");
         assert_eq!(config.recommender.timeout_ms, 60_000);
         assert_eq!(config.onboarding.pending_steps(), CURRENT_ONBOARDING_STEPS);
     }
@@ -1211,6 +1217,15 @@ mod tests {
         old.recommender.openai.model = "gpt-5.4-nano".into();
         save(&old_paths, &old).unwrap();
 
+        let previous_paths = Paths::from_root(root.path().join("previous"));
+        let mut previous = Config::default();
+        previous.recommender.openai.model = "gpt-5.6-luna".into();
+        previous.recommender.codex.model = "gpt-5.6-luna".into();
+        save(&previous_paths, &previous).unwrap();
+        let previous = load_or_default(&previous_paths).unwrap();
+        assert_eq!(previous.recommender.openai.model, "gpt-6-luna");
+        assert_eq!(previous.recommender.codex.model, "gpt-6-luna");
+
         let custom_paths = Paths::from_root(root.path().join("custom"));
         let mut custom = Config::default();
         custom.recommender.openai.model = "custom-openai-model".into();
@@ -1222,7 +1237,7 @@ mod tests {
                 .recommender
                 .openai
                 .model,
-            "gpt-5.6-luna"
+            "gpt-6-luna"
         );
         assert_eq!(
             load_or_default(&custom_paths)
