@@ -1806,7 +1806,7 @@ mod tests {
             .unwrap();
         let body = openai_queue_request_body(&config, &prompt, QUEUE_TARGET).unwrap();
 
-        assert_eq!(body["model"], "gpt-5.6-luna");
+        assert_eq!(body["model"], "gpt-6-luna");
         assert_eq!(body["reasoning"]["effort"], "low");
         assert_eq!(body["text"]["format"]["type"], "json_schema");
         assert_eq!(
@@ -2250,7 +2250,7 @@ sleep 30
             &config,
             "ignored",
             &recommendation_queue_schema(QUEUE_TARGET),
-            "gpt-5.6-luna",
+            "gpt-6-luna",
             cancel.as_ref(),
         )
         .unwrap_err();
@@ -2298,7 +2298,7 @@ printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"{
             "describe",
             &images,
             &recommendation_queue_schema(QUEUE_TARGET),
-            "gpt-5.6-luna",
+            "gpt-6-luna",
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -2366,7 +2366,7 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 printf '%s\n' "$model" >> "__LOG__"
-if [ "$model" = "gpt-5.6-luna" ]; then
+if [ "$model" = "gpt-6-luna" ]; then
   printf '%s\n' 'model unavailable' >&2
   exit 1
 fi
@@ -2393,7 +2393,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":100,"cached_inpu
         .unwrap();
 
         assert!(batch.recommendations.is_empty());
-        assert_eq!(fs::read_to_string(log).unwrap(), "gpt-5.6-luna\ninherit\n");
+        assert_eq!(fs::read_to_string(log).unwrap(), "gpt-6-luna\ninherit\n");
         let usage = store
             .recommender_token_usage_summary_for(RecommenderTokenProvider::Codex)
             .unwrap();
@@ -2414,7 +2414,7 @@ while [ "$#" -gt 0 ]; do
   fi
   shift
 done
-if [ "$model" = "gpt-5.6-luna" ]; then
+if [ "$model" = "gpt-6-luna" ]; then
   sleep 0.8
   exit 1
 fi
@@ -2484,7 +2484,7 @@ exec sleep 5
         );
 
         assert!(result.unwrap_err().to_string().contains("timed out"));
-        assert_eq!(fs::read_to_string(log).unwrap(), "gpt-5.6-luna\n");
+        assert_eq!(fs::read_to_string(log).unwrap(), "gpt-6-luna\n");
     }
 
     #[test]

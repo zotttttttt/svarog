@@ -11,7 +11,7 @@ Describe a single meal or paste a timeline containing several meals. Press
 Enter to submit it. Svarog reviews a multi-meal description and saves each time
 block as a separate meal.
 
-Meal parsing uses `gpt-5.6-luna` through the selected Codex or OpenAI
+Meal parsing uses `gpt-6-luna` through the selected Codex or OpenAI
 recommender to estimate calories, protein, carbohydrates, fat, fiber, sugar,
 sodium, and potassium. The Local recommender disables meal submission because
 it does not parse natural-language food descriptions.
@@ -27,7 +27,7 @@ recommender data flow.
 
 ## Meals from photos
 
-Attach up to 10 photos of what you ate. Svarog reads them with `gpt-5.6-luna`,
+Attach up to 10 photos of what you ate. Svarog reads them with `gpt-6-luna`,
 lists each meal's ingredients with estimated grams, and then sends that list
 through the same text parser described above, so you review the result before
 anything is saved.

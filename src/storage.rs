@@ -2707,7 +2707,7 @@ mod tests {
                     }],
                 },
                 "codex",
-                "gpt-5.6-luna",
+                "gpt-6-luna",
                 Utc::now(),
             )
             .unwrap();
@@ -3158,7 +3158,7 @@ mod tests {
                 "oatmeal with milk",
                 &parsed,
                 "codex",
-                "gpt-5.6-luna",
+                "gpt-6-luna",
                 Utc::now(),
             )
             .unwrap();
@@ -3195,7 +3195,7 @@ mod tests {
                     &format!("meal {index}"),
                     &parsed,
                     "codex",
-                    "gpt-5.6-luna",
+                    "gpt-6-luna",
                     now - Duration::days(index),
                 )
                 .unwrap();
@@ -3243,7 +3243,7 @@ mod tests {
         ];
 
         let ids = store
-            .save_fuel_batch(&events, "codex", "gpt-5.6-luna")
+            .save_fuel_batch(&events, "codex", "gpt-6-luna")
             .unwrap();
         assert_eq!(ids.len(), 2);
         let recent = store.recent_fuel_entries(5).unwrap();
@@ -3256,7 +3256,7 @@ mod tests {
         let mut invalid = events.clone();
         invalid[1].parsed.items[0].name = " ".into();
         assert!(store
-            .save_fuel_batch(&invalid, "codex", "gpt-5.6-luna")
+            .save_fuel_batch(&invalid, "codex", "gpt-6-luna")
             .is_err());
         assert_eq!(store.recent_fuel_entries(5).unwrap().len(), 2);
     }
@@ -3292,7 +3292,7 @@ mod tests {
         ];
 
         store
-            .save_fuel_batch(&events, "openai", "gpt-5.6-luna")
+            .save_fuel_batch(&events, "openai", "gpt-6-luna")
             .unwrap();
 
         let recent = store.recent_fuel_entries(5).unwrap();
@@ -3335,7 +3335,7 @@ mod tests {
                     "meal",
                     &parsed,
                     "codex",
-                    "gpt-5.6-luna",
+                    "gpt-6-luna",
                     created_at.with_timezone(&Utc),
                 )
                 .unwrap();
@@ -3384,7 +3384,7 @@ mod tests {
                         "meal",
                         &fuel_parse_with_calories(calories),
                         "codex",
-                        "gpt-5.6-luna",
+                        "gpt-6-luna",
                         (base_time + Duration::minutes(index as i64)).with_timezone(&Utc),
                     )
                     .unwrap();
@@ -3417,7 +3417,7 @@ mod tests {
                     "meal",
                     &fuel_parse_with_calories((day_offset + 1) as f64 * 100.0),
                     "codex",
-                    "gpt-5.6-luna",
+                    "gpt-6-luna",
                     created_at.with_timezone(&Utc),
                 )
                 .unwrap();
