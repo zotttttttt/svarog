@@ -1,5 +1,5 @@
 use crate::collector_auth;
-use crate::config::{load_or_default, Config, RuntimeEnv};
+use crate::config::{load_or_default, Config, Paths, RuntimeEnv};
 use crate::engine;
 use crate::models::{
     Agent, AgentEvent, AppStateKind, IncomingEvent, LifecycleHookEvent, Recommendation,
@@ -509,7 +509,7 @@ pub fn refill_queue_best_effort(env: &RuntimeEnv) {
         let Ok(store) = Store::open(&env.paths.database_file) else {
             return;
         };
-        let _ = ensure_exercise_pool(&store, &config);
+        let _ = ensure_exercise_pool_with_recommender(&store, &config, &env.paths);
         let _ = recommender::fill_recommendation_queue(&store, &config, &env.paths);
     });
 }
@@ -532,7 +532,7 @@ pub fn regenerate_queue_after_settings(env: &RuntimeEnv) -> Receiver<QueueRegene
         for _ in 0..300 {
             if begin_queue_job(&REFILL_IN_PROGRESS) {
                 let _guard = RefillGuard;
-                let result = regenerate_queue_now(&env).map_err(|err| err.to_string());
+                let result = rebuild_pool_and_regenerate_queue(&env).map_err(|err| err.to_string());
                 let _ = sender.send(result);
                 return;
             }
@@ -583,10 +583,21 @@ fn begin_queue_job(flag: &AtomicBool) -> bool {
         .is_ok()
 }
 
+/// Settings changes can alter preferences and injuries, so the pool's exclusions are re-judged
+/// before the queue is replaced.
+fn rebuild_pool_and_regenerate_queue(env: &RuntimeEnv) -> Result<QueueRegenerationOutcome> {
+    let config = load_or_default(&env.paths)?;
+    let store = Store::open(&env.paths.database_file)?;
+    let pool_notice = recommender::rebuild_exercise_pool(&store, &config, &env.paths)?;
+    let mut outcome = regenerate_queue_now(env)?;
+    outcome.notice = pool_notice.or(outcome.notice);
+    Ok(outcome)
+}
+
 fn regenerate_queue_now(env: &RuntimeEnv) -> Result<QueueRegenerationOutcome> {
     let config = load_or_default(&env.paths)?;
     let mut store = Store::open(&env.paths.database_file)?;
-    ensure_exercise_pool(&store, &config)?;
+    ensure_exercise_pool_with_recommender(&store, &config, &env.paths)?;
     let generated = recommender::generate_recommendation_queue(
         &store,
         &config,
@@ -611,17 +622,33 @@ pub fn refresh_exercise_pool(env: &RuntimeEnv) -> Result<()> {
     ensure_exercise_pool(&store, &config)
 }
 
+/// Offline pool repair for latency-sensitive hook paths.
 fn ensure_exercise_pool(store: &Store, config: &Config) -> Result<()> {
     if store.exercise_catalog_is_current()? {
         return Ok(());
     }
     let equipment =
         crate::exercise_catalog::locally_resolved_equipment(&config.profile.equipment_text);
-    let movements = crate::exercise_catalog::movements_for_equipment(&equipment);
-    store.save_exercise_filter(&crate::recommender::normalize_equipment(
+    let movements = recommender::locally_constrained_movements(
+        config,
+        crate::exercise_catalog::movements_for_equipment(&equipment),
+    );
+    store.save_exercise_filter(&recommender::normalize_equipment(
         &config.profile.equipment_text,
     ))?;
     store.replace_movement_pool(&movements)
+}
+
+/// Background pool repair that may ask the recommender to judge preference exclusions.
+fn ensure_exercise_pool_with_recommender(
+    store: &Store,
+    config: &Config,
+    paths: &Paths,
+) -> Result<()> {
+    if store.exercise_catalog_is_current()? {
+        return Ok(());
+    }
+    recommender::rebuild_exercise_pool(store, config, paths).map(|_| ())
 }
 
 #[cfg(test)]

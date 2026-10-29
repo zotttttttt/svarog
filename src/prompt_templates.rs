@@ -5,10 +5,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 const EXERCISE_PROFILE_NAME: &str = "exercise_profile.j2";
+const EXERCISE_CONSTRAINTS_NAME: &str = "exercise_constraints.j2";
 const RECOMMENDATION_QUEUE_NAME: &str = "recommendation_queue.j2";
 const FUEL_ENTRY_NAME: &str = "fuel_entry.j2";
 const FUEL_IMAGES_NAME: &str = "fuel_images.j2";
 const DEFAULT_EXERCISE_PROFILE: &str = include_str!("../prompts/exercise_profile.j2");
+const DEFAULT_EXERCISE_CONSTRAINTS: &str = include_str!("../prompts/exercise_constraints.j2");
 const DEFAULT_RECOMMENDATION_QUEUE: &str = include_str!("../prompts/recommendation_queue.j2");
 const DEFAULT_FUEL_ENTRY: &str = include_str!("../prompts/fuel_entry.j2");
 const DEFAULT_FUEL_IMAGES: &str = include_str!("../prompts/fuel_images.j2");
@@ -81,6 +83,14 @@ impl<'a> PromptRenderer<'a> {
             EXERCISE_PROFILE_NAME,
             DEFAULT_EXERCISE_PROFILE,
             context!(config => config),
+        )
+    }
+
+    pub fn exercise_constraints<T: Serialize>(&self, context_value: &T) -> Result<String> {
+        self.render(
+            EXERCISE_CONSTRAINTS_NAME,
+            DEFAULT_EXERCISE_CONSTRAINTS,
+            context!(context => context_value),
         )
     }
 

@@ -316,6 +316,9 @@ struct RunResult {
     profile_notice: Option<String>,
     llm_count: usize,
     local_count: usize,
+    pool_size: usize,
+    /// Pool ids when the pool is small enough to eyeball over-exclusion.
+    small_pool: Vec<String>,
     picks: Vec<String>,
     rejected: Vec<String>,
     /// Hard failures: (check, detail).
@@ -355,6 +358,8 @@ fn run_scenario(scenario: &Scenario, run: usize, model: &str, judge_model: &str)
         profile_notice: None,
         llm_count: 0,
         local_count: 0,
+        pool_size: 0,
+        small_pool: Vec::new(),
         picks: Vec::new(),
         rejected: Vec::new(),
         violations: Vec::new(),
@@ -404,18 +409,29 @@ fn run_scenario_inner(
             None => rec.movement_id.clone(),
         })
         .collect();
-    if recs.len() < QUEUE_TARGET as usize {
+    let pool = store.movements()?;
+    result.pool_size = pool.len();
+    if pool.len() <= 40 {
+        result.small_pool = pool.iter().map(|m| m.id.clone()).collect();
+    }
+    // The queue never repeats a primary muscle, so a narrow pool caps the achievable size.
+    let distinct_muscles = pool
+        .iter()
+        .map(|m| m.primary_muscle.as_str())
+        .collect::<BTreeSet<_>>()
+        .len();
+    let achievable = distinct_muscles.min(QUEUE_TARGET as usize);
+    if recs.len() < achievable {
         result.violations.push((
             "queue_size".into(),
             format!(
-                "{} valid of {QUEUE_TARGET}; rejected {:?}",
+                "{} valid of {achievable} achievable; rejected {:?}",
                 recs.len(),
                 result.rejected
             ),
         ));
     }
 
-    let pool = store.movements()?;
     let by_id: BTreeMap<_, _> = pool.iter().map(|m| (m.id.as_str(), m)).collect();
     check_equipment_use(
         scenario,

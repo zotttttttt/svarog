@@ -697,7 +697,241 @@ fn schedule_equipment_batch(
     }
 }
 
+/// Resolves the user's movement pool: equipment first, then preference and injury exclusions.
 pub fn initial_exercise_profile(
+    store: &Store,
+    config: &Config,
+    paths: &Paths,
+) -> (Vec<Movement>, Option<String>) {
+    let (movements, equipment_notice) = equipment_movement_pool(store, config, paths);
+    let (movements, constraints_notice) =
+        apply_exercise_constraints(store, config, paths, movements);
+    (movements, equipment_notice.or(constraints_notice))
+}
+
+/// User exclusions win over variety; only an empty result falls back to the full pool.
+const MIN_CONSTRAINED_POOL: usize = 1;
+const CONSTRAINT_INSTRUCTION_CHARS: usize = 160;
+
+#[derive(Debug, Serialize)]
+struct ExerciseConstraintsContext<'a> {
+    exercise_preferences: &'a str,
+    injuries: &'a [String],
+    movements: Vec<ConstraintMovement>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConstraintMovement {
+    id: String,
+    category: String,
+    equipment: Option<String>,
+    primary_muscles: Vec<String>,
+    start: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LlmExerciseConstraints {
+    excluded: Vec<LlmExcludedMovement>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LlmExcludedMovement {
+    exercise_id: String,
+    reason: String,
+}
+
+fn has_exercise_constraints(profile: &Profile) -> bool {
+    let preferences = profile.exercise_preferences.trim();
+    let has_preferences = !preferences.is_empty() && !preferences.eq_ignore_ascii_case("automatic");
+    has_preferences || profile.injuries.iter().any(|item| !item.trim().is_empty())
+}
+
+/// Rebuilds the pool from the user's equipment text and applies preference and injury exclusions.
+/// Used after Settings changes and catalog upgrades, which do not rerun equipment normalization.
+pub fn rebuild_exercise_pool(
+    store: &Store,
+    config: &Config,
+    paths: &Paths,
+) -> Result<Option<String>> {
+    let (movements, equipment) = local_resolved_movements(config);
+    let (movements, notice) = apply_exercise_constraints(store, config, paths, movements);
+    store.save_exercise_filter(&equipment)?;
+    store.replace_movement_pool(&movements)?;
+    Ok(notice)
+}
+
+/// Fast, offline version of the exclusion step for synchronous Settings saves.
+pub fn locally_constrained_movements(config: &Config, movements: Vec<Movement>) -> Vec<Movement> {
+    if !has_exercise_constraints(&config.profile) {
+        return movements;
+    }
+    let excluded: Vec<String> = movements
+        .iter()
+        .filter(|movement| conflicts_with_preferences(config, movement))
+        .map(|movement| movement.id.clone())
+        .collect();
+    filter_excluded_movements(config, movements, &excluded).0
+}
+
+fn apply_exercise_constraints(
+    store: &Store,
+    config: &Config,
+    paths: &Paths,
+    movements: Vec<Movement>,
+) -> (Vec<Movement>, Option<String>) {
+    if !has_exercise_constraints(&config.profile) {
+        return (movements, None);
+    }
+    let excluded: Result<Vec<String>> = if config.recommender.backend == RecommenderBackend::Local {
+        Ok(movements
+            .iter()
+            .filter(|movement| conflicts_with_preferences(config, movement))
+            .map(|movement| movement.id.clone())
+            .collect())
+    } else {
+        PromptRenderer::new(&paths.config_dir)
+            .exercise_constraints(&exercise_constraints_context(config, &movements))
+            .and_then(|prompt| match config.recommender.backend {
+                RecommenderBackend::Codex => {
+                    call_codex_json(store, config, &prompt, &exercise_constraints_schema())
+                }
+                RecommenderBackend::OpenaiEnv | RecommenderBackend::OpenaiKeyring => {
+                    let body = openai_structured_request_body(
+                        config,
+                        &prompt,
+                        "svarog_exercise_constraints",
+                        exercise_constraints_schema(),
+                    );
+                    call_openai_json(store, config, paths, body)
+                        .context("parsing OpenAI exercise constraints")
+                }
+                RecommenderBackend::Local => unreachable!(),
+            })
+            .map(|constraints: LlmExerciseConstraints| {
+                constraints
+                    .excluded
+                    .into_iter()
+                    .map(|item| item.exercise_id)
+                    .collect()
+            })
+    };
+    let excluded = match excluded {
+        Ok(excluded) => excluded,
+        Err(err) => {
+            let notice = config
+                .recommender
+                .show_llm_failures
+                .then(|| format!("Could not apply exercise preferences to the catalog: {err}"));
+            return (movements, notice);
+        }
+    };
+    filter_excluded_movements(config, movements, &excluded)
+}
+
+fn filter_excluded_movements(
+    config: &Config,
+    movements: Vec<Movement>,
+    excluded: &[String],
+) -> (Vec<Movement>, Option<String>) {
+    let excluded: std::collections::HashSet<&str> = excluded.iter().map(String::as_str).collect();
+    let remaining = movements
+        .iter()
+        .filter(|movement| !excluded.contains(movement.id.as_str()))
+        .count();
+    if remaining < MIN_CONSTRAINED_POOL {
+        let notice = config.recommender.show_llm_failures.then(|| {
+            format!(
+                "Exercise preferences would leave only {remaining} movements; keeping the full catalog"
+            )
+        });
+        return (movements, notice);
+    }
+    (
+        movements
+            .into_iter()
+            .filter(|movement| !excluded.contains(movement.id.as_str()))
+            .collect(),
+        None,
+    )
+}
+
+fn exercise_constraints_context<'a>(
+    config: &'a Config,
+    movements: &[Movement],
+) -> ExerciseConstraintsContext<'a> {
+    ExerciseConstraintsContext {
+        exercise_preferences: &config.profile.exercise_preferences,
+        injuries: &config.profile.injuries,
+        movements: exercise_catalog::entries_for_movements(movements)
+            .into_iter()
+            .map(|entry| ConstraintMovement {
+                start: entry
+                    .instructions
+                    .join(" ")
+                    .chars()
+                    .take(CONSTRAINT_INSTRUCTION_CHARS)
+                    .collect(),
+                id: entry.id,
+                category: entry.category,
+                equipment: entry.equipment,
+                primary_muscles: entry.primary_muscles,
+            })
+            .collect(),
+    }
+}
+
+fn exercise_constraints_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["excluded"],
+        "properties": {
+            "excluded": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["exercise_id", "reason"],
+                    "properties": {
+                        "exercise_id": { "type": "string" },
+                        "reason": { "type": "string" }
+                    }
+                }
+            }
+        }
+    })
+}
+
+fn openai_structured_request_body(
+    config: &Config,
+    prompt: &str,
+    name: &str,
+    schema: serde_json::Value,
+) -> serde_json::Value {
+    json!({
+        "model": config.recommender.openai.model,
+        "reasoning": {
+            "effort": config.recommender.openai.reasoning_effort
+        },
+        "input": [
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ],
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": name,
+                "strict": true,
+                "schema": schema
+            }
+        }
+    })
+}
+
+fn equipment_movement_pool(
     store: &Store,
     config: &Config,
     paths: &Paths,
@@ -1422,13 +1656,14 @@ fn recommendation_schema(max_duration_sec: u32) -> serde_json::Value {
         "type": "object",
         "additionalProperties": false,
         "required": [
-            "action", "exercise_id", "reps", "sets", "weight_text", "duration_sec",
+            "action", "exercise_id", "primary_muscle", "reps", "sets", "weight_text", "duration_sec",
             "safety_notes", "rationale"
             , "side"
         ],
         "properties": {
             "action": { "type": "string", "enum": ["recommend", "no_recommendation"] },
             "exercise_id": { "type": ["string", "null"] },
+            "primary_muscle": { "type": ["string", "null"] },
             "reps": { "type": "integer", "minimum": 1, "maximum": MAX_LLM_REPS },
             "sets": { "type": "integer", "enum": [1] },
             "weight_text": { "type": ["string", "null"] },
@@ -1663,6 +1898,59 @@ fn validate_candidate(
 
 fn required<T>(value: Option<T>, name: &str) -> Result<T> {
     value.ok_or_else(|| anyhow!("LLM recommendation missing {name}"))
+}
+
+/// Keyword exclusions for the local backend; LLM backends judge preferences semantically.
+fn conflicts_with_preferences(config: &Config, movement: &Movement) -> bool {
+    const NEGATIONS: &[&str] = &[
+        "no ", "not ", "avoid", "don't", "dont", "without", "hate", "dislike", "never",
+    ];
+    const FLOOR_IDS: &[&str] = &[
+        "push-up",
+        "pushup",
+        "push_up",
+        "plank",
+        "crunch",
+        "sit-up",
+        "situp",
+        "bridge",
+        "lying",
+        "prone",
+        "supine",
+        "floor",
+        "kneeling",
+        "superman",
+        "dead_bug",
+        "mountain",
+        "groiner",
+        "burpee",
+        "all_fours",
+        "inchworm",
+        "hip_circles_prone",
+    ];
+    const JUMP_IDS: &[&str] = &["jump", "hop", "skip", "bound", "burpee", "jack", "sprint"];
+    let id = movement.id.to_lowercase();
+    let category = exercise_catalog::find(&movement.id)
+        .map(|entry| entry.category.as_str())
+        .unwrap_or_default();
+    let is_floor = FLOOR_IDS.iter().any(|needle| id.contains(needle));
+    let is_jump = category == "plyometrics" || JUMP_IDS.iter().any(|needle| id.contains(needle));
+    let text = config.profile.exercise_preferences.to_lowercase();
+    text.split([',', ';', '.', '\n'])
+        .map(|clause| format!(" {} ", clause.trim()))
+        .filter(|clause| NEGATIONS.iter().any(|negation| clause.contains(negation)))
+        .any(|clause| {
+            let floor = [
+                "floor", "push-up", "pushup", "push up", "lying", "kneel", "plank",
+            ]
+            .iter()
+            .any(|word| clause.contains(word));
+            let jump = ["jump", "plyo", "hop", "impact"]
+                .iter()
+                .any(|word| clause.contains(word));
+            let stretch = clause.contains("stretch");
+            (floor && is_floor) || (jump && is_jump) || (stretch && category == "stretching")
+        })
 }
 
 fn conflicts_with_limitations(config: &Config, primary_muscle: &str, muscles: &[String]) -> bool {
@@ -2915,6 +3203,103 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1000,"cached_inp
 
         assert_eq!(squat.status, MovementStatus::Allowed);
         assert!(notice.is_none());
+    }
+
+    #[test]
+    fn local_preferences_exclude_floor_and_jumping_movements() {
+        let mut config = Config::default();
+        config.profile.exercise_preferences =
+            "no jumping, no bodyweight on the floor like push-ups, for example".into();
+        let pool = exercise_catalog::movements_for_equipment(&["bodyweight".to_string()]);
+        let filtered = locally_constrained_movements(&config, pool.clone());
+        let ids: Vec<_> = filtered
+            .iter()
+            .map(|movement| movement.id.as_str())
+            .collect();
+
+        assert!(!filtered.is_empty());
+        assert!(filtered.len() < pool.len());
+        for excluded in ["Pushups", "Clock_Push-Up", "Plank", "Butt_Lift_Bridge"] {
+            assert!(!ids.contains(&excluded), "{excluded} was kept");
+        }
+        assert!(!filtered.iter().any(|movement| {
+            exercise_catalog::find(&movement.id).unwrap().category == "plyometrics"
+        }));
+        assert!(ids.contains(&"Bodyweight_Squat"));
+    }
+
+    #[test]
+    fn local_preferences_ignore_positive_mentions() {
+        let mut config = Config::default();
+        config.profile.exercise_preferences = "I love push-ups and jumping".into();
+        let pool = exercise_catalog::movements_for_equipment(&["bodyweight".to_string()]);
+
+        assert_eq!(
+            locally_constrained_movements(&config, pool.clone()).len(),
+            pool.len()
+        );
+    }
+
+    #[test]
+    fn exclusions_never_starve_the_pool() {
+        let mut config = Config::default();
+        config.recommender.show_llm_failures = true;
+        let pool = exercise_catalog::movements_for_equipment(&["bodyweight".to_string()]);
+        let everything: Vec<_> = pool.iter().map(|movement| movement.id.clone()).collect();
+
+        let (kept, notice) = filter_excluded_movements(&config, pool.clone(), &everything);
+
+        assert_eq!(kept.len(), pool.len());
+        assert!(notice.unwrap().contains("keeping the full catalog"));
+    }
+
+    #[test]
+    fn recommender_exclusions_filter_the_initial_pool() {
+        let response = json!({
+            "excluded": [
+                { "exercise_id": "Pushups", "reason": "floor push-up" },
+                { "exercise_id": "Not_A_Movement", "reason": "unknown ids are ignored" }
+            ]
+        });
+        let mut config = codex_config_returning(&response.to_string());
+        config.profile.exercise_preferences = "no push-ups".into();
+        let store = test_store();
+        let pool = exercise_catalog::movements_for_equipment(&["bodyweight".to_string()]);
+
+        let (movements, notice) =
+            apply_exercise_constraints(&store, &config, &test_paths(), pool.clone());
+
+        assert!(notice.is_none());
+        assert_eq!(movements.len(), pool.len() - 1);
+        assert!(!movements.iter().any(|movement| movement.id == "Pushups"));
+    }
+
+    #[test]
+    fn exercise_constraints_are_skipped_without_preferences_or_injuries() {
+        let config = codex_config_returning("not json");
+        let pool = exercise_catalog::movements_for_equipment(&["bodyweight".to_string()]);
+
+        let (movements, notice) =
+            apply_exercise_constraints(&test_store(), &config, &test_paths(), pool.clone());
+
+        assert_eq!(movements.len(), pool.len());
+        assert!(notice.is_none());
+    }
+
+    #[test]
+    fn exercise_constraints_prompt_lists_preferences_and_instruction_starts() {
+        let mut config = Config::default();
+        config.profile.exercise_preferences = "no floor work".into();
+        config.profile.injuries = vec!["wrist pain".into()];
+        let pool = exercise_catalog::movements_for_equipment(&["bodyweight".to_string()]);
+        let prompt = PromptRenderer::new(&test_paths().config_dir)
+            .exercise_constraints(&exercise_constraints_context(&config, &pool))
+            .unwrap();
+
+        assert!(prompt.contains("\"no floor work\""));
+        assert!(prompt.contains("wrist pain"));
+        assert!(prompt.contains("\"start\":"));
+        assert!(prompt.contains("\"id\":\"Pushups\""));
     }
 }
 
