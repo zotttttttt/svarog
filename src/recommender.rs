@@ -25,6 +25,8 @@ pub const QUEUE_LOW_WATER_MARK: u32 = 1;
 /// Seconds reserved after a session so it comfortably fits the agent's downtime.
 const DOWNTIME_MARGIN_SEC: u32 = 15;
 const MAX_LLM_REPS: u32 = 20;
+/// Sessions per primary muscle in one queue; an opposite-side pair counts as one session.
+const MAX_SESSIONS_PER_PRIMARY_MUSCLE: usize = 2;
 
 #[derive(Debug)]
 pub struct QueueGeneration {
@@ -587,12 +589,12 @@ fn llm_queue(
         let repeats_movement = recommendations.iter().any(|existing| {
             existing.movement_id == rec.movement_id && !is_opposite_side_pair(existing, &rec)
         });
-        let repeats_muscle = recommendations.iter().any(|existing| {
-            existing.primary_muscle == rec.primary_muscle
-                && !recommendations
-                    .last()
-                    .is_some_and(|last| is_opposite_side_pair(last, &rec))
-        });
+        let completes_pair = recommendations
+            .last()
+            .is_some_and(|last| is_opposite_side_pair(last, &rec));
+        let repeats_muscle = !completes_pair
+            && primary_muscle_sessions(&recommendations, &rec.primary_muscle)
+                >= MAX_SESSIONS_PER_PRIMARY_MUSCLE;
         if repeats_movement {
             rejected.push(format!("{}: repeats a movement", rec.movement_id));
         } else if repeats_muscle {
@@ -608,6 +610,19 @@ fn llm_queue(
         }
     }
     Ok(recommendations.into_iter().skip(existing.len()).collect())
+}
+
+fn primary_muscle_sessions(recommendations: &[Recommendation], muscle: &str) -> usize {
+    recommendations
+        .iter()
+        .enumerate()
+        .filter(|(index, rec)| {
+            rec.primary_muscle == muscle
+                && !index
+                    .checked_sub(1)
+                    .is_some_and(|previous| is_opposite_side_pair(&recommendations[previous], rec))
+        })
+        .count()
 }
 
 fn is_opposite_side_pair(left: &Recommendation, right: &Recommendation) -> bool {
@@ -3203,6 +3218,34 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1000,"cached_inp
 
         assert_eq!(squat.status, MovementStatus::Allowed);
         assert!(notice.is_none());
+    }
+
+    #[test]
+    fn primary_muscle_sessions_count_opposite_side_pairs_once() {
+        let rec = |id: &str, muscle: &str, side: Option<RecommendationSide>| Recommendation {
+            id: None,
+            movement_id: id.into(),
+            movement_name: id.into(),
+            primary_muscle: muscle.into(),
+            muscles: vec![muscle.into()],
+            reps: 8,
+            weight_kg: None,
+            estimated_seconds: 30,
+            agent: Agent::Custom,
+            project: None,
+            side,
+            created_at: Utc::now(),
+        };
+        let batch = vec![
+            rec("One_Arm_Row", "lats", Some(RecommendationSide::Left)),
+            rec("One_Arm_Row", "lats", Some(RecommendationSide::Right)),
+            rec("Pullups", "lats", Some(RecommendationSide::Bilateral)),
+            rec("Bodyweight_Squat", "quadriceps", None),
+        ];
+
+        assert_eq!(primary_muscle_sessions(&batch, "lats"), 2);
+        assert_eq!(primary_muscle_sessions(&batch, "quadriceps"), 1);
+        assert_eq!(primary_muscle_sessions(&batch, "chest"), 0);
     }
 
     #[test]

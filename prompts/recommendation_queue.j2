@@ -31,7 +31,7 @@ Hard constraints (a recommendation that breaks any of these is wrong, even if it
 {%- else %}
 - `side`: the user prefers to do both sides of a unilateral movement within one session. Use `both` for unilateral movements (catalog `sidedness: "unilateral"`), size reps and duration to cover both sides, and never split one movement into left and right sessions. Use `bilateral` for bilateral movements.
 {%- endif %}
-- Return exactly {{ needed }} distinct recommendations, all with action `recommend`. Do not repeat a movement. A movement's primary muscle is the first entry of its `primaryMuscles`; copy it into `primary_muscle`. Every recommendation must have a different primary muscle{% if context.profile.alternate_sides | default(true) %}, except the two halves of an adjacent opposite-side pair of the same unilateral movement{% endif %}.
+- Return exactly {{ needed }} distinct recommendations, all with action `recommend`. Do not repeat a movement. A movement's primary muscle is the first entry of its `primaryMuscles`; copy it into `primary_muscle`. Use each primary muscle for at most 2 sessions in this batch{% if context.profile.alternate_sides | default(true) %}; an adjacent opposite-side pair of the same unilateral movement counts as one session{% endif %}. Prefer spreading the batch across as many different primary muscles as the constraints allow.
 
 {% include "archetypes/common.j2" %}
 {% include "archetypes/" ~ context.profile.archetype ~ ".j2" %}

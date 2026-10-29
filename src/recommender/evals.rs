@@ -295,14 +295,14 @@ fn scenarios() -> Vec<Scenario> {
             "combined_real_user",
             Combined,
             |c| {
-                c.profile.equipment_text = "one 16kg kettlebell, resistance band".into();
+                c.profile.equipment_text = "two 16kg kettlebells".into();
                 c.profile.goals = vec!["stay strong".into(), "mobility".into()];
                 c.profile.exercise_preferences =
                     "no jumping, no bodyweight on the floor like push-ups, for example".into();
                 c.profile.injuries = vec!["occasional lower back tightness".into()];
                 c.forge.archetype = ArchetypeId::Boxer;
             },
-            Some(&[("kettlebell", 1), ("band", 1)]),
+            Some(&[("kettlebell", 2)]),
         ),
     ]
 }
@@ -414,13 +414,19 @@ fn run_scenario_inner(
     if pool.len() <= 40 {
         result.small_pool = pool.iter().map(|m| m.id.clone()).collect();
     }
-    // The queue never repeats a primary muscle, so a narrow pool caps the achievable size.
-    let distinct_muscles = pool
-        .iter()
-        .map(|m| m.primary_muscle.as_str())
-        .collect::<BTreeSet<_>>()
-        .len();
-    let achievable = distinct_muscles.min(QUEUE_TARGET as usize);
+    // Each primary muscle may fill at most two sessions, so a narrow pool caps the achievable size.
+    // Movements never repeat either, so each muscle contributes at most its movement count.
+    let mut movements_per_muscle = BTreeMap::<&str, usize>::new();
+    for movement in &pool {
+        *movements_per_muscle
+            .entry(movement.primary_muscle.as_str())
+            .or_default() += 1;
+    }
+    let achievable = movements_per_muscle
+        .values()
+        .map(|count| (*count).min(MAX_SESSIONS_PER_PRIMARY_MUSCLE))
+        .sum::<usize>()
+        .min(QUEUE_TARGET as usize);
     if recs.len() < achievable {
         result.violations.push((
             "queue_size".into(),
