@@ -220,7 +220,7 @@ mod tests {
             )
             .unwrap();
         assert!(custom.contains("Goku"));
-        assert!(custom.contains("If unclear, behave as Athlete."));
+        assert!(custom.contains("If it is not clearly recognized, behave as Athlete"));
     }
 
     #[test]
