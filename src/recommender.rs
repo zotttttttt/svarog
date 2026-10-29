@@ -27,6 +27,8 @@ const DOWNTIME_MARGIN_SEC: u32 = 15;
 const MAX_LLM_REPS: u32 = 20;
 /// Sessions per primary muscle in one queue; an opposite-side pair counts as one session.
 const MAX_SESSIONS_PER_PRIMARY_MUSCLE: usize = 2;
+/// Extra LLM candidates that replace any planned session Svarog rejects.
+const QUEUE_SPARES: u32 = 4;
 
 #[derive(Debug)]
 pub struct QueueGeneration {
@@ -563,11 +565,16 @@ fn llm_queue(
     rejected: &mut Vec<String>,
 ) -> Result<Vec<Recommendation>> {
     let context = build_context(store, config, event)?;
-    let prompt = PromptRenderer::new(&paths.config_dir).recommendation_queue(&context, needed)?;
+    let prompt = PromptRenderer::new(&paths.config_dir).recommendation_queue_with_spares(
+        &context,
+        needed,
+        QUEUE_SPARES,
+    )?;
+    let requested = needed + QUEUE_SPARES;
     let batch = match config.recommender.backend {
-        RecommenderBackend::Codex => call_codex_queue(store, config, &prompt, needed, event),
+        RecommenderBackend::Codex => call_codex_queue(store, config, &prompt, requested, event),
         RecommenderBackend::OpenaiEnv | RecommenderBackend::OpenaiKeyring => {
-            call_openai_queue(store, config, paths, &prompt, needed, event)
+            call_openai_queue(store, config, paths, &prompt, requested, event)
         }
         RecommenderBackend::Local => unreachable!(),
     }?;
@@ -605,10 +612,8 @@ fn llm_queue(
         } else {
             recommendations.push(rec);
         }
-        if recommendations.len() >= existing.len() + needed as usize {
-            break;
-        }
     }
+    recommendations.truncate(existing.len() + needed as usize);
     Ok(recommendations.into_iter().skip(existing.len()).collect())
 }
 

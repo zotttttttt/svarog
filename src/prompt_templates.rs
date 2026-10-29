@@ -94,15 +94,25 @@ impl<'a> PromptRenderer<'a> {
         )
     }
 
+    #[cfg(test)]
     pub fn recommendation_queue<T: Serialize>(
         &self,
         context_value: &T,
         needed: u32,
     ) -> Result<String> {
+        self.recommendation_queue_with_spares(context_value, needed, 0)
+    }
+
+    pub fn recommendation_queue_with_spares<T: Serialize>(
+        &self,
+        context_value: &T,
+        needed: u32,
+        spares: u32,
+    ) -> Result<String> {
         self.render(
             RECOMMENDATION_QUEUE_NAME,
             DEFAULT_RECOMMENDATION_QUEUE,
-            context!(context => context_value, needed => needed),
+            context!(context => context_value, needed => needed, spares => spares),
         )
     }
 
@@ -221,6 +231,23 @@ mod tests {
             .unwrap();
         assert!(custom.contains("Goku"));
         assert!(custom.contains("If it is not clearly recognized, behave as Athlete"));
+    }
+
+    #[test]
+    fn queue_prompt_requests_spares_after_the_planned_batch() {
+        let root = tempdir().unwrap();
+        let renderer = PromptRenderer::new(root.path());
+        let context = json!({"profile": {"archetype": "athlete"}});
+
+        let with_spares = renderer
+            .recommendation_queue_with_spares(&context, 10, 4)
+            .unwrap();
+        assert!(with_spares.contains("Return exactly 14 distinct recommendations"));
+        assert!(with_spares.contains("the last 4 are spares"));
+
+        let without = renderer.recommendation_queue(&context, 10).unwrap();
+        assert!(without.contains("Return exactly 10 distinct recommendations"));
+        assert!(!without.contains("spares"));
     }
 
     #[test]
