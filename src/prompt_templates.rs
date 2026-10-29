@@ -228,12 +228,12 @@ mod tests {
 
         let alternating = render(true);
         assert!(alternating.contains("consecutive opposite-side pairs"));
-        assert!(!alternating.contains("Set `side` to `both`"));
+        assert!(!alternating.contains("Use `both` for unilateral movements"));
 
         let together = render(false);
-        assert!(together.contains("Set `side` to `both`"));
+        assert!(together.contains("Use `both` for unilateral movements"));
         assert!(!together.contains("consecutive opposite-side pairs"));
-        assert!(together.contains("\n- Use `bilateral` as the `side`"));
+        assert!(together.contains("Use `bilateral` for bilateral movements"));
     }
 
     #[test]

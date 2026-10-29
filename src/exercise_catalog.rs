@@ -9,7 +9,7 @@ use std::sync::OnceLock;
 
 const CATALOG_JSON: &str = include_str!("../data/free-exercise-db.compact.json");
 pub const CATALOG_REVISION: &str = "b0eed061e1c832b3ed815fbaa4b45b3cdc14df49";
-const MOVEMENT_POOL_POLICY_REVISION: &str = "equipment-v2";
+const MOVEMENT_POOL_POLICY_REVISION: &str = "equipment-v3";
 const PARTNER_REQUIRED_EXERCISE_IDS: &[&str] = &[
     "Adductor_Groin",
     "Barbell_Seated_Calf_Raise",
@@ -254,6 +254,13 @@ pub fn inferred_sidedness(id: &str) -> MovementSidedness {
         "one_arm",
         "single-arm",
         "single_arm",
+        "one-leg",
+        "one_leg",
+        "single-leg",
+        "single_leg",
+        "side_leg",
+        "side_bridge",
+        "glute_kickback",
         "alternate",
         "alternating",
     ]
@@ -607,7 +614,7 @@ mod tests {
         assert_eq!(CATALOG_REVISION, "b0eed061e1c832b3ed815fbaa4b45b3cdc14df49");
         assert_eq!(
             movement_pool_revision(),
-            "b0eed061e1c832b3ed815fbaa4b45b3cdc14df49:equipment-v2"
+            "b0eed061e1c832b3ed815fbaa4b45b3cdc14df49:equipment-v3"
         );
     }
 

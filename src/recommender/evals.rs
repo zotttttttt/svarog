@@ -443,6 +443,12 @@ fn run_scenario_inner(
             ));
         }
     }
+    if verdict.preference_fit < 4 {
+        result.violations.push((
+            "preference_fit".into(),
+            format!("positive preferences scored {}/5", verdict.preference_fit),
+        ));
+    }
     if !config.profile.goals.is_empty() && scenario.dimension != Dimension::Archetype {
         result.goal_score = Some(verdict.goal_alignment as f32);
     }
@@ -500,7 +506,11 @@ fn check_equipment_use(
                 format!("{} needs {missing:?}", rec.movement_id),
             ));
         }
-        if movement.equipment.iter().any(|kind| kind != "bodyweight") {
+        let uses_equipment = exercise_catalog::equipment_requirements_for_movement(&movement.id)
+            .unwrap_or_default()
+            .iter()
+            .any(|requirement| requirement.kind != "bodyweight");
+        if uses_equipment {
             equipment_sessions += 1;
         }
     }
@@ -508,7 +518,11 @@ fn check_equipment_use(
     let neutral = config.profile.exercise_preferences == "automatic"
         && config.profile.injuries.is_empty()
         && matches!(scenario.dimension, Dimension::Equipment | Dimension::Sides);
-    if neutral && available.len() > 1 && equipment_sessions < MIN_EQUIPMENT_SESSIONS {
+    // Expect at least 4 of every 10 sessions to use equipment (the prompt targets 5).
+    if neutral
+        && available.len() > 1
+        && equipment_sessions * 10 < MIN_EQUIPMENT_SESSIONS * recs.len()
+    {
         violations.push((
             "equipment_share".into(),
             format!(
@@ -591,6 +605,7 @@ struct JudgeVerdict {
     items: Vec<JudgeItem>,
     goal_alignment: u8,
     archetype_fit: u8,
+    preference_fit: u8,
 }
 
 #[derive(Debug, Deserialize)]
@@ -645,15 +660,18 @@ fn judge(
          The user configured these settings:\n{settings}\n\n\
          The recommender produced this queue of short desk-break exercise sessions:\n{movements}\n\n\
          For EACH exercise, decide:\n\
-         - violates_preferences: true if it conflicts with the user's stated exercise preferences, \
-         including the whole class of movements the user describes (an example like \"push-ups\" \
-         stands for the described class), judged from the name, category and instructions. \
-         If preferences are \"automatic\" this is always false.\n\
+         - violates_preferences: true only if the exercise is something the user's preferences \
+         exclude or dislike, including the whole class of movements the user describes (an example \
+         like \"push-ups\" stands for the described class), judged from the name, category and \
+         instructions. Positive preferences (\"I love X\") never make a single exercise a \
+         violation; score them in preference_fit instead. Ignore side labels; they are checked \
+         separately. If preferences are \"automatic\" this is always false.\n\
          - violates_injuries: true if it plausibly loads or aggravates a stated injury/limitation \
          at the prescribed load. Conservative, injury-friendly variants are fine. If there are no \
          injuries this is always false.\n\
          - reason: one short sentence (empty if neither is violated).\n\
          Then score the whole batch 1-5:\n\
+         - preference_fit: how well the batch reflects positive preferences (5 if there are none).\n\
          - goal_alignment: how well the batch serves the stated goals (5 = clearly most sessions \
          serve them).\n\
          - archetype_fit: how well the batch reflects the Forge archetype's long-term direction \
@@ -679,7 +697,7 @@ fn judge(
             "schema": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["items", "goal_alignment", "archetype_fit"],
+                "required": ["items", "goal_alignment", "archetype_fit", "preference_fit"],
                 "properties": {
                     "items": { "type": "array", "items": {
                         "type": "object",
@@ -693,7 +711,8 @@ fn judge(
                         }
                     }},
                     "goal_alignment": { "type": "integer", "minimum": 1, "maximum": 5 },
-                    "archetype_fit": { "type": "integer", "minimum": 1, "maximum": 5 }
+                    "archetype_fit": { "type": "integer", "minimum": 1, "maximum": 5 },
+                    "preference_fit": { "type": "integer", "minimum": 1, "maximum": 5 }
                 }
             }
         }}

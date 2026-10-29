@@ -22,6 +22,9 @@ use std::time::{Duration, Instant};
 
 pub const QUEUE_TARGET: u32 = 10;
 pub const QUEUE_LOW_WATER_MARK: u32 = 1;
+/// Seconds reserved after a session so it comfortably fits the agent's downtime.
+const DOWNTIME_MARGIN_SEC: u32 = 15;
+const MAX_LLM_REPS: u32 = 20;
 
 #[derive(Debug)]
 pub struct QueueGeneration {
@@ -52,7 +55,49 @@ struct RecommendationContext {
     today_stats: TodayStats,
     recent_sets: Vec<ContextSet>,
     app_state: ContextAppState,
-    movements: Vec<ExerciseCatalogEntry>,
+    movements: Vec<ContextMovement>,
+}
+
+/// Catalog metadata plus what Svarog enforces locally: full equipment needs and sidedness.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ContextMovement {
+    id: String,
+    force: Option<String>,
+    mechanic: Option<String>,
+    equipment: Vec<String>,
+    primary_muscles: Vec<String>,
+    secondary_muscles: Vec<String>,
+    category: String,
+    #[serde(skip_serializing_if = "is_bilateral")]
+    sidedness: MovementSidedness,
+}
+
+fn is_bilateral(sidedness: &MovementSidedness) -> bool {
+    *sidedness == MovementSidedness::Bilateral
+}
+
+impl ContextMovement {
+    fn new(entry: ExerciseCatalogEntry, sidedness: MovementSidedness) -> Self {
+        let equipment = exercise_catalog::equipment_requirements_for_movement(&entry.id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|requirement| match requirement.count {
+                0 | 1 => requirement.kind.to_string(),
+                count => format!("{count}x {}", requirement.kind),
+            })
+            .collect();
+        Self {
+            id: entry.id,
+            force: entry.force,
+            mechanic: entry.mechanic,
+            equipment,
+            primary_muscles: entry.primary_muscles,
+            secondary_muscles: entry.secondary_muscles,
+            category: entry.category,
+            sidedness,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -518,9 +563,9 @@ fn llm_queue(
     let context = build_context(store, config, event)?;
     let prompt = PromptRenderer::new(&paths.config_dir).recommendation_queue(&context, needed)?;
     let batch = match config.recommender.backend {
-        RecommenderBackend::Codex => call_codex_queue(store, config, &prompt, needed),
+        RecommenderBackend::Codex => call_codex_queue(store, config, &prompt, needed, event),
         RecommenderBackend::OpenaiEnv | RecommenderBackend::OpenaiKeyring => {
-            call_openai_queue(store, config, paths, &prompt, needed)
+            call_openai_queue(store, config, paths, &prompt, needed, event)
         }
         RecommenderBackend::Local => unreachable!(),
     }?;
@@ -796,7 +841,20 @@ fn build_context(
             cooldown_muscle: state.cooldown_muscle,
             cooldown_until: state.cooldown_until.map(|dt| dt.to_rfc3339()),
         },
-        movements: exercise_catalog::entries_for_movements(&store.movements()?),
+        movements: {
+            let movements = store.movements()?;
+            let sidedness: std::collections::HashMap<_, _> = movements
+                .iter()
+                .map(|movement| (movement.id.clone(), movement.sidedness))
+                .collect();
+            exercise_catalog::entries_for_movements(&movements)
+                .into_iter()
+                .map(|entry| {
+                    let side = sidedness.get(&entry.id).copied().unwrap_or_default();
+                    ContextMovement::new(entry, side)
+                })
+                .collect()
+        },
     })
 }
 
@@ -820,8 +878,14 @@ fn call_codex_queue(
     config: &Config,
     prompt: &str,
     needed: u32,
+    event: &AgentEvent,
 ) -> Result<LlmRecommendationBatch> {
-    call_codex_json(store, config, prompt, &recommendation_queue_schema(needed))
+    call_codex_json(
+        store,
+        config,
+        prompt,
+        &recommendation_queue_schema(needed, max_session_seconds(event)),
+    )
 }
 
 fn call_codex_exercise_profile(
@@ -1121,8 +1185,9 @@ fn call_openai_queue(
     paths: &Paths,
     prompt: &str,
     needed: u32,
+    event: &AgentEvent,
 ) -> Result<LlmRecommendationBatch> {
-    let body = openai_queue_request_body(config, prompt, needed)?;
+    let body = openai_queue_request_body(config, prompt, needed, max_session_seconds(event))?;
     call_openai_json(store, config, paths, body).context("parsing OpenAI recommendation queue")
 }
 
@@ -1320,6 +1385,7 @@ fn openai_queue_request_body(
     config: &Config,
     prompt: &str,
     needed: u32,
+    max_duration_sec: u32,
 ) -> Result<serde_json::Value> {
     Ok(json!({
         "model": config.recommender.openai.model,
@@ -1337,13 +1403,21 @@ fn openai_queue_request_body(
                 "type": "json_schema",
                 "name": "svarog_recommendation_queue",
                 "strict": true,
-                "schema": recommendation_queue_schema(needed)
+                "schema": recommendation_queue_schema(needed, max_duration_sec)
             }
         }
     }))
 }
 
-fn recommendation_schema() -> serde_json::Value {
+fn max_session_seconds(event: &AgentEvent) -> u32 {
+    event
+        .expected_duration_sec
+        .saturating_sub(DOWNTIME_MARGIN_SEC)
+        .max(1)
+}
+
+/// Mirrors `validate_candidate` so the model cannot emit values Svarog would discard.
+fn recommendation_schema(max_duration_sec: u32) -> serde_json::Value {
     json!({
         "type": "object",
         "additionalProperties": false,
@@ -1355,10 +1429,10 @@ fn recommendation_schema() -> serde_json::Value {
         "properties": {
             "action": { "type": "string", "enum": ["recommend", "no_recommendation"] },
             "exercise_id": { "type": ["string", "null"] },
-            "reps": { "type": ["integer", "null"], "minimum": 1, "maximum": 30 },
-            "sets": { "type": ["integer", "null"], "minimum": 1, "maximum": 3 },
+            "reps": { "type": "integer", "minimum": 1, "maximum": MAX_LLM_REPS },
+            "sets": { "type": "integer", "enum": [1] },
             "weight_text": { "type": ["string", "null"] },
-            "duration_sec": { "type": ["integer", "null"], "minimum": 1, "maximum": 600 },
+            "duration_sec": { "type": "integer", "minimum": 1, "maximum": max_duration_sec },
             "safety_notes": { "type": ["string", "null"] },
             "rationale": { "type": ["string", "null"] }
             , "side": { "type": ["string", "null"], "enum": ["left", "right", "bilateral", "both", null] }
@@ -1366,7 +1440,7 @@ fn recommendation_schema() -> serde_json::Value {
     })
 }
 
-fn recommendation_queue_schema(needed: u32) -> serde_json::Value {
+fn recommendation_queue_schema(needed: u32, max_duration_sec: u32) -> serde_json::Value {
     json!({
         "type": "object",
         "additionalProperties": false,
@@ -1376,7 +1450,7 @@ fn recommendation_queue_schema(needed: u32) -> serde_json::Value {
                 "type": "array",
                 "minItems": needed,
                 "maxItems": needed,
-                "items": recommendation_schema()
+                "items": recommendation_schema(max_duration_sec)
             }
         }
     })
@@ -1536,10 +1610,10 @@ fn validate_candidate(
     if sets != 1 {
         bail!("LLM recommended more than one set");
     }
-    if reps > 20 {
+    if reps > MAX_LLM_REPS {
         bail!("LLM recommended too many reps");
     }
-    if duration_sec + 15 > event.expected_duration_sec {
+    if duration_sec + DOWNTIME_MARGIN_SEC > event.expected_duration_sec {
         bail!("LLM recommendation does not fit downtime");
     }
     let movement = movements
@@ -1834,7 +1908,7 @@ mod tests {
         let prompt = PromptRenderer::new(&test_paths().config_dir)
             .recommendation_queue(&context, QUEUE_TARGET)
             .unwrap();
-        let body = openai_queue_request_body(&config, &prompt, QUEUE_TARGET).unwrap();
+        let body = openai_queue_request_body(&config, &prompt, QUEUE_TARGET, 45).unwrap();
 
         assert_eq!(body["model"], "gpt-6-luna");
         assert_eq!(body["reasoning"]["effort"], "low");
@@ -1857,7 +1931,7 @@ mod tests {
     #[test]
     fn recommendation_schema_requires_the_requested_queue_size() {
         for needed in [2, QUEUE_TARGET] {
-            let schema = recommendation_queue_schema(needed);
+            let schema = recommendation_queue_schema(needed, 45);
             assert_eq!(schema["properties"]["recommendations"]["minItems"], needed);
             assert_eq!(schema["properties"]["recommendations"]["maxItems"], needed);
         }
@@ -1954,7 +2028,7 @@ mod tests {
         assert!(rendered.get("today_events").is_none());
         assert!(rendered.get("today_sets").is_none());
         assert!(prompt.len() < 60_000, "prompt was {} bytes", prompt.len());
-        assert!(prompt.contains("Return exactly 10 valid, distinct recommendations"));
+        assert!(prompt.contains("Return exactly 10 distinct recommendations"));
         assert!(!prompt.contains("return fewer"));
     }
 
@@ -2237,7 +2311,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":24763,"cached_in
             &store,
             &config,
             "ignored",
-            &recommendation_queue_schema(QUEUE_TARGET),
+            &recommendation_queue_schema(QUEUE_TARGET, 45),
         )
         .unwrap();
         assert!(batch.recommendations.is_empty());
@@ -2279,7 +2353,7 @@ sleep 30
             &store,
             &config,
             "ignored",
-            &recommendation_queue_schema(QUEUE_TARGET),
+            &recommendation_queue_schema(QUEUE_TARGET, 45),
             "gpt-6-luna",
             cancel.as_ref(),
         )
@@ -2327,7 +2401,7 @@ printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"{
             &config,
             "describe",
             &images,
-            &recommendation_queue_schema(QUEUE_TARGET),
+            &recommendation_queue_schema(QUEUE_TARGET, 45),
             "gpt-6-luna",
             &AtomicBool::new(false),
         )
@@ -2374,7 +2448,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input
             &store,
             &config,
             "ignored",
-            &recommendation_queue_schema(QUEUE_TARGET),
+            &recommendation_queue_schema(QUEUE_TARGET, 45),
         )
         .unwrap();
 
@@ -2418,7 +2492,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":100,"cached_inpu
             &store,
             &config,
             "ignored",
-            &recommendation_queue_schema(QUEUE_TARGET),
+            &recommendation_queue_schema(QUEUE_TARGET, 45),
         )
         .unwrap();
 
@@ -2465,7 +2539,7 @@ exec sleep 2
             &store,
             &config,
             "ignored",
-            &recommendation_queue_schema(QUEUE_TARGET),
+            &recommendation_queue_schema(QUEUE_TARGET, 45),
         );
 
         let error = result.unwrap_err();
@@ -2510,7 +2584,7 @@ exec sleep 5
             &store,
             &config,
             "ignored",
-            &recommendation_queue_schema(QUEUE_TARGET),
+            &recommendation_queue_schema(QUEUE_TARGET, 45),
         );
 
         assert!(result.unwrap_err().to_string().contains("timed out"));
@@ -2564,7 +2638,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1000,"cached_inp
             &store,
             &config,
             "ignored",
-            &recommendation_queue_schema(QUEUE_TARGET),
+            &recommendation_queue_schema(QUEUE_TARGET, 45),
         );
 
         assert!(result.is_err());
