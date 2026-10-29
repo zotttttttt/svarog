@@ -613,8 +613,62 @@ fn llm_queue(
             recommendations.push(rec);
         }
     }
-    recommendations.truncate(existing.len() + needed as usize);
-    Ok(recommendations.into_iter().skip(existing.len()).collect())
+    let accepted = recommendations.split_off(existing.len());
+    Ok(keep_complete_side_pairs(
+        existing.last(),
+        accepted,
+        needed as usize,
+        rejected,
+    ))
+}
+
+fn is_single_side(rec: &Recommendation) -> bool {
+    matches!(
+        rec.side,
+        Some(RecommendationSide::Left | RecommendationSide::Right)
+    )
+}
+
+/// Takes up to `needed` sessions, keeping left/right sessions only as adjacent opposite pairs so
+/// the user is never asked to train one side alone or to stop between the two halves.
+fn keep_complete_side_pairs(
+    previous: Option<&Recommendation>,
+    accepted: Vec<Recommendation>,
+    needed: usize,
+    rejected: &mut Vec<String>,
+) -> Vec<Recommendation> {
+    let mut kept: Vec<Recommendation> = Vec::with_capacity(needed);
+    let mut accepted = accepted.into_iter().peekable();
+    while let Some(rec) = accepted.next() {
+        if !is_single_side(&rec) {
+            if kept.len() < needed {
+                kept.push(rec);
+            }
+            continue;
+        }
+        let completes_previous = kept.is_empty()
+            && previous.is_some_and(|previous| {
+                is_single_side(previous) && is_opposite_side_pair(previous, &rec)
+            });
+        if completes_previous {
+            if kept.len() < needed {
+                kept.push(rec);
+            }
+            continue;
+        }
+        match accepted.next_if(|next| is_opposite_side_pair(&rec, next)) {
+            Some(other) if kept.len() + 2 <= needed => {
+                kept.push(rec);
+                kept.push(other);
+            }
+            Some(_) => rejected.push(format!("{}: no room for both sides", rec.movement_id)),
+            None if kept.len() < needed => {
+                rejected.push(format!("{}: missing the opposite side", rec.movement_id))
+            }
+            None => {}
+        }
+    }
+    kept
 }
 
 fn primary_muscle_sessions(recommendations: &[Recommendation], muscle: &str) -> usize {
@@ -3270,6 +3324,60 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1000,"cached_inp
         let scheduled = schedule_equipment_batch(movements, recommendations, true);
 
         assert_eq!(scheduled.len(), 10);
+    }
+
+    #[test]
+    fn side_pairs_are_kept_whole_or_dropped() {
+        let rec = |id: &str, side: Option<RecommendationSide>| Recommendation {
+            id: None,
+            movement_id: id.into(),
+            movement_name: id.into(),
+            primary_muscle: id.into(),
+            muscles: vec![id.into()],
+            reps: 8,
+            weight_kg: None,
+            estimated_seconds: 30,
+            agent: Agent::Custom,
+            project: None,
+            side,
+            created_at: Utc::now(),
+        };
+        let left = Some(RecommendationSide::Left);
+        let right = Some(RecommendationSide::Right);
+        let both = Some(RecommendationSide::Bilateral);
+        let ids = |recs: &[Recommendation]| {
+            recs.iter()
+                .map(|rec| format!("{}{:?}", rec.movement_id, rec.side.unwrap()))
+                .collect::<Vec<_>>()
+        };
+        let mut rejected = Vec::new();
+
+        let kept = keep_complete_side_pairs(
+            None,
+            vec![
+                rec("Lunge", right),
+                rec("Squat", both),
+                rec("Row", right),
+                rec("Row", left),
+                rec("Bridge", both),
+                rec("Kickback", left),
+                rec("Kickback", right),
+            ],
+            4,
+            &mut rejected,
+        );
+
+        assert_eq!(
+            ids(&kept),
+            ["SquatBilateral", "RowRight", "RowLeft", "BridgeBilateral"]
+        );
+        assert_eq!(
+            rejected,
+            [
+                "Lunge: missing the opposite side",
+                "Kickback: no room for both sides"
+            ]
+        );
     }
 
     #[test]
