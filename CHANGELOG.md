@@ -2,6 +2,13 @@
 
 Notable changes to Svarog are recorded here by the automated release process.
 
+## [0.10.7](https://github.com/zotttttttt/svarog/compare/v0.10.6...v0.10.7) (2026-11-01)
+
+
+### Fixes
+
+* ignore agent-driven Claude hooks ([#75](https://github.com/zotttttttt/svarog/issues/75)) ([ba98123](https://github.com/zotttttttt/svarog/commit/ba98123590bfc1945ec36740aeb45b8833e3900c))
+
 ## [0.10.6](https://github.com/zotttttttt/svarog/compare/v0.10.5...v0.10.6) (2026-10-29)
 
 
