@@ -1314,7 +1314,21 @@ pub async fn ingest_lifecycle(env: &RuntimeEnv, agent: Agent) -> Result<()> {
     Ok(())
 }
 
+// Claude Code injects background-agent results as prompts that fire
+// UserPromptSubmit without the documented `source` field.
+const CLAUDE_AGENT_PROMPT_PREFIXES: [&str; 2] = [
+    "<task-notification>",
+    "Another Claude session sent a message",
+];
+
 fn parse_lifecycle_payload(agent: Agent, input: &str) -> Result<LifecycleHookEvent> {
+    if agent == Agent::Claude {
+        let root: Value = serde_json::from_str(input).context("parsing Claude hook payload")?;
+        if is_claude_agent_driven(&root) {
+            bail!("ignoring agent-driven Claude hook");
+        }
+        return serde_json::from_value(root).context("parsing lifecycle hook payload");
+    }
     if agent != Agent::Hermes {
         return serde_json::from_str(input).context("parsing lifecycle hook payload");
     }
@@ -1373,6 +1387,26 @@ fn parse_lifecycle_payload(agent: Agent, input: &str) -> Result<LifecycleHookEve
             })
         }),
     })
+}
+
+fn is_claude_agent_driven(root: &Value) -> bool {
+    if root.get("agent_id").and_then(Value::as_str).is_some() {
+        return true;
+    }
+    if root.get("hook_event_name").and_then(Value::as_str) != Some("UserPromptSubmit") {
+        return false;
+    }
+    if let Some(source) = root.get("source").and_then(Value::as_str) {
+        return source == "system";
+    }
+    root.get("prompt")
+        .and_then(Value::as_str)
+        .map(str::trim_start)
+        .is_some_and(|prompt| {
+            CLAUDE_AGENT_PROMPT_PREFIXES
+                .iter()
+                .any(|prefix| prompt.starts_with(prefix))
+        })
 }
 
 pub(crate) fn shell_quote(value: &str) -> String {
@@ -1588,6 +1622,38 @@ mod tests {
         assert!(forwarded["turn_id"].is_null());
         assert!(forwarded.get("prompt").is_none());
         assert!(forwarded.get("transcript_path").is_none());
+    }
+
+    #[test]
+    fn claude_agent_driven_payloads_are_not_forwarded() {
+        for input in [
+            r#"{"session_id":"s","cwd":"/work/svarog","hook_event_name":"UserPromptSubmit","prompt":"<task-notification>\n<task-id>a1</task-id>"}"#,
+            r#"{"session_id":"s","cwd":"/work/svarog","hook_event_name":"UserPromptSubmit","prompt":"Another Claude session sent a message:\n<agent-message from=\"a1\">"}"#,
+            r#"{"session_id":"s","cwd":"/work/svarog","hook_event_name":"UserPromptSubmit","source":"system","prompt":"anything"}"#,
+            r#"{"session_id":"s","cwd":"/work/svarog","hook_event_name":"PostToolUse","agent_id":"a1","agent_type":"general-purpose"}"#,
+        ] {
+            assert!(
+                parse_lifecycle_payload(Agent::Claude, input).is_err(),
+                "{input}"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_human_payloads_are_forwarded() {
+        for input in [
+            r#"{"session_id":"s","cwd":"/work/svarog","hook_event_name":"UserPromptSubmit","prompt":"fix the <task-notification> parser"}"#,
+            r#"{"session_id":"s","cwd":"/work/svarog","hook_event_name":"UserPromptSubmit","source":"human","prompt":"<task-notification>"}"#,
+            r#"{"session_id":"s","cwd":"/work/svarog","hook_event_name":"PostToolUse"}"#,
+        ] {
+            let payload = parse_lifecycle_payload(Agent::Claude, input).unwrap();
+            assert!(serde_json::to_value(payload)
+                .unwrap()
+                .get("prompt")
+                .is_none());
+        }
+        let codex = r#"{"session_id":"s","turn_id":"t","cwd":"/work/svarog","hook_event_name":"UserPromptSubmit","prompt":"<task-notification>"}"#;
+        assert!(parse_lifecycle_payload(Agent::Codex, codex).is_ok());
     }
 
     #[test]
