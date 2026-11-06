@@ -2,6 +2,13 @@
 
 Notable changes to Svarog are recorded here by the automated release process.
 
+## [0.10.8](https://github.com/zotttttttt/svarog/compare/v0.10.7...v0.10.8) (2026-11-06)
+
+
+### Fixes
+
+* bump yanked async-executor to 1.14.1 ([#77](https://github.com/zotttttttt/svarog/issues/77)) ([9498851](https://github.com/zotttttttt/svarog/commit/9498851d47d8d97811e274e8c3da202d97968ad6))
+
 ## [0.10.7](https://github.com/zotttttttt/svarog/compare/v0.10.6...v0.10.7) (2026-11-01)
 
 
