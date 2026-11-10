@@ -45,7 +45,7 @@ base64 = "0.23"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29"
-directories = "5"
+directories = "6"
 getrandom = "0.4"
 libc = "0.2"
 minijinja = { version = "2", features = ["json"] }
