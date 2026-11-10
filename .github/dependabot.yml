@@ -7,6 +7,10 @@ updates:
     open-pull-requests-limit: 5
     commit-message:
       prefix: "fix(deps)"
+    # Security updates still bump majors; this only skips routine major bumps.
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
     groups:
       cargo-compatible:
         update-types: [minor, patch]

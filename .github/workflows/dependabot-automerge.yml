@@ -1,20 +1,60 @@
 name: Dependabot auto-merge
 
-on: pull_request_target
+on:
+  pull_request_target:
+  push:
+    branches: [main]
+  workflow_dispatch:
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
 
 jobs:
   automerge:
     name: Enable auto-merge
-    if: github.event.pull_request.user.login == 'dependabot[bot]'
+    if: github.event_name == 'pull_request_target' && github.event.pull_request.user.login == 'dependabot[bot]'
     runs-on: ubuntu-latest
     steps:
-      - uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
+      # App token, not GITHUB_TOKEN: merges made with GITHUB_TOKEN don't trigger
+      # push workflows on main (CI, audit, release-please).
+      - name: Create GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
       # Required checks gate the merge; breaking bumps that fail CI wait for a human.
       - run: gh pr merge --auto --squash "$PR_URL"
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+
+  update-branches:
+    name: Update behind bot PRs
+    if: github.event_name != 'pull_request_target'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+      # The ruleset requires up-to-date branches and Dependabot only rebases on
+      # conflicts, so auto-merge PRs that fall behind main would wait forever.
+      - name: Rebase behind PRs
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          for pr in $(gh pr list --state open --json number,autoMergeRequest,headRefName \
+              --jq '.[] | select(.autoMergeRequest != null and (.headRefName | test("^(dependabot|bot)/"))) | .number'); do
+            state=$(gh pr view "$pr" --json mergeStateStatus --jq .mergeStateStatus)
+            if [ "$state" = "BEHIND" ]; then
+              gh pr update-branch "$pr" --rebase || echo "::warning::could not update #$pr"
+            fi
+          done
