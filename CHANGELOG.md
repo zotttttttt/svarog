@@ -2,6 +2,15 @@
 
 Notable changes to Svarog are recorded here by the automated release process.
 
+## [0.10.10](https://github.com/zotttttttt/svarog/compare/v0.10.9...v0.10.10) (2026-11-10)
+
+
+### Fixes
+
+* bump minijinja from 2.21.0 to 3.0.5 ([#83](https://github.com/zotttttttt/svarog/issues/83)) ([68e96b1](https://github.com/zotttttttt/svarog/commit/68e96b161f3a32885adee32c8157560c8e9f8ac0))
+* **deps:** bump base64 from 0.22.1 to 0.23.1 ([#86](https://github.com/zotttttttt/svarog/issues/86)) ([1329afd](https://github.com/zotttttttt/svarog/commit/1329afdb2bc4db16f6f074e7e22a098ae4368d72))
+* **deps:** bump the cargo-compatible group across 1 directory with 9 updates ([#82](https://github.com/zotttttttt/svarog/issues/82)) ([daa1294](https://github.com/zotttttttt/svarog/commit/daa1294b64bf402b9285081251519e5cb31541ab))
+
 ## [0.10.9](https://github.com/zotttttttt/svarog/compare/v0.10.8...v0.10.9) (2026-11-10)
 
 
