@@ -1,5 +1,9 @@
 use anyhow::{Context, Result};
-use minijinja::{context, Environment, UndefinedBehavior};
+use minijinja::{
+    context,
+    value::{Kwargs, Serde},
+    Environment, ErrorKind, UndefinedBehavior,
+};
 use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -82,7 +86,7 @@ impl<'a> PromptRenderer<'a> {
         self.render(
             EXERCISE_PROFILE_NAME,
             DEFAULT_EXERCISE_PROFILE,
-            context!(config => config),
+            context!(config => Serde(config)),
         )
     }
 
@@ -90,7 +94,7 @@ impl<'a> PromptRenderer<'a> {
         self.render(
             EXERCISE_CONSTRAINTS_NAME,
             DEFAULT_EXERCISE_CONSTRAINTS,
-            context!(context => context_value),
+            context!(context => Serde(context_value)),
         )
     }
 
@@ -112,7 +116,7 @@ impl<'a> PromptRenderer<'a> {
         self.render(
             RECOMMENDATION_QUEUE_NAME,
             DEFAULT_RECOMMENDATION_QUEUE,
-            context!(context => context_value, needed => needed, spares => spares),
+            context!(context => Serde(context_value), needed => needed, spares => spares),
         )
     }
 
@@ -120,7 +124,7 @@ impl<'a> PromptRenderer<'a> {
         self.render(
             FUEL_ENTRY_NAME,
             DEFAULT_FUEL_ENTRY,
-            context!(context => context_value),
+            context!(context => Serde(context_value)),
         )
     }
 
@@ -128,7 +132,7 @@ impl<'a> PromptRenderer<'a> {
         self.render(
             FUEL_IMAGES_NAME,
             DEFAULT_FUEL_IMAGES,
-            context!(context => context_value),
+            context!(context => Serde(context_value)),
         )
     }
 
@@ -147,6 +151,7 @@ impl<'a> PromptRenderer<'a> {
         };
         let mut environment = Environment::new();
         environment.set_undefined_behavior(UndefinedBehavior::Strict);
+        environment.add_filter("tojson", compact_tojson);
         for (partial_name, embedded) in ARCHETYPE_TEMPLATES
             .into_iter()
             .chain(std::iter::once(CUSTOM_ARCHETYPE_TEMPLATE))
@@ -176,6 +181,34 @@ impl<'a> PromptRenderer<'a> {
     fn override_path(&self, name: &str) -> PathBuf {
         self.config_dir.join("prompts").join(name)
     }
+}
+
+/// minijinja 3's `tojson` adds spaces after separators; keep the compact
+/// output prompts were tuned against. Indented output still uses the builtin.
+fn compact_tojson(
+    value: &minijinja::Value,
+    indent: Option<minijinja::Value>,
+    args: Kwargs,
+) -> std::result::Result<minijinja::Value, minijinja::Error> {
+    if indent.is_some() || args.has("indent") {
+        return minijinja::filters::tojson(value, indent, args);
+    }
+    args.assert_all_used()?;
+    let json = serde_json::to_string(value).map_err(|err| {
+        minijinja::Error::new(ErrorKind::InvalidOperation, "cannot serialize to JSON")
+            .with_source(err)
+    })?;
+    let mut escaped = String::with_capacity(json.len());
+    for c in json.chars() {
+        match c {
+            '<' => escaped.push_str("\\u003c"),
+            '>' => escaped.push_str("\\u003e"),
+            '&' => escaped.push_str("\\u0026"),
+            '\'' => escaped.push_str("\\u0027"),
+            _ => escaped.push(c),
+        }
+    }
+    Ok(minijinja::Value::from_safe_string(escaped))
 }
 
 #[cfg(test)]
