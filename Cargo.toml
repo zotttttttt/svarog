@@ -48,7 +48,7 @@ crossterm = "0.29"
 directories = "5"
 getrandom = "0.4"
 libc = "0.2"
-minijinja = { version = "2", features = ["json"] }
+minijinja = { version = "3", features = ["json", "serde"] }
 keyring = "4"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
 rusqlite = { version = "0.41", features = ["bundled", "chrono"] }
