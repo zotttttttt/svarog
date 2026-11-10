@@ -2,6 +2,13 @@
 
 Notable changes to Svarog are recorded here by the automated release process.
 
+## [0.10.9](https://github.com/zotttttttt/svarog/compare/v0.10.8...v0.10.9) (2026-11-10)
+
+
+### Fixes
+
+* bump rusqlite and auto-fix RustSec advisories ([#79](https://github.com/zotttttttt/svarog/issues/79)) ([e175f22](https://github.com/zotttttttt/svarog/commit/e175f22562d9fdd8210a07d2a80fc3027f77fea7))
+
 ## [0.10.8](https://github.com/zotttttttt/svarog/compare/v0.10.7...v0.10.8) (2026-11-06)
 
 
