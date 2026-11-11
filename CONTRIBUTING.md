@@ -63,6 +63,17 @@ not manage arbitrary roots or global installs. Ordinary direct Cargo commands
 remain supported; the runner is useful when you want captured logs and run
 results.
 
+### Bounded Rust build cache
+
+`scripts/sweep.sh` keeps `target/` bounded with
+[cargo-sweep](https://github.com/holmgr/cargo-sweep): it drops artifacts unused
+for `CARGO_SWEEP_DAYS` (default 3) days or built by uninstalled toolchains,
+trims the oldest until `target/` fits `CARGO_SWEEP_MAX_SIZE` (default `20GB`),
+and caps the incremental cache at `CARGO_INCREMENTAL_MAX_GB` (default 8). Unlike
+`dev-storage cleanup`, it also bounds the warm `target/debug` cache. Git hooks
+run it automatically after `brew install cargo-sweep lefthook && lefthook install`;
+it never blocks a commit.
+
 ## Update a development install
 
 The project launcher detects source changes and offers to rebuild before it

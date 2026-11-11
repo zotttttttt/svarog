@@ -1,0 +1,18 @@
+# Keeps the Rust build cache bounded (scripts/sweep.sh, cargo-sweep).
+# Install once per clone: `lefthook install` (brew install lefthook cargo-sweep).
+pre-commit:
+  commands:
+    cargo-sweep:
+      run: scripts/sweep.sh >/dev/null 2>&1 || true
+post-checkout:
+  commands:
+    cargo-sweep:
+      run: scripts/sweep.sh >/dev/null 2>&1 || true
+post-merge:
+  commands:
+    cargo-sweep:
+      run: scripts/sweep.sh >/dev/null 2>&1 || true
+post-rewrite:
+  commands:
+    cargo-sweep:
+      run: scripts/sweep.sh >/dev/null 2>&1 || true
