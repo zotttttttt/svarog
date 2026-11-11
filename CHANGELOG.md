@@ -2,6 +2,14 @@
 
 Notable changes to Svarog are recorded here by the automated release process.
 
+## [0.10.11](https://github.com/zotttttttt/svarog/compare/v0.10.10...v0.10.11) (2026-11-11)
+
+
+### Fixes
+
+* **deps:** bump minijinja ([#90](https://github.com/zotttttttt/svarog/issues/90)) ([c89182d](https://github.com/zotttttttt/svarog/commit/c89182d1a604073b0dee16c8b559425f86209aaf))
+* **deps:** update vulnerable dependencies ([#93](https://github.com/zotttttttt/svarog/issues/93)) ([d09f8da](https://github.com/zotttttttt/svarog/commit/d09f8da9ced5bcbc7a201851bf3740f3576b6479))
+
 ## [0.10.10](https://github.com/zotttttttt/svarog/compare/v0.10.9...v0.10.10) (2026-11-10)
 
 
