@@ -2,6 +2,13 @@
 
 Notable changes to Svarog are recorded here by the automated release process.
 
+## [0.10.12](https://github.com/zotttttttt/svarog/compare/v0.10.11...v0.10.12) (2026-11-20)
+
+
+### Fixes
+
+* **deps:** bump the cargo-compatible group with 2 updates ([#95](https://github.com/zotttttttt/svarog/issues/95)) ([f8b586f](https://github.com/zotttttttt/svarog/commit/f8b586f95afeea08c420709ab645c1d242e7dfde))
+
 ## [0.10.11](https://github.com/zotttttttt/svarog/compare/v0.10.10...v0.10.11) (2026-11-11)
 
 
